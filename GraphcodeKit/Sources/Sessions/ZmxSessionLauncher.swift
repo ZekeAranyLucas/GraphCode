@@ -1311,6 +1311,23 @@ public enum ZmxSessionLauncher {
     await runCollectingOutput(ZmxLocator.binaryURL, arguments)
   }
 
+  /// Windows environment names are case-insensitive, so an inherited key that differs from an
+  /// injected one only by case is removed first; otherwise the child could see either.
+  static func mergedEnvironment(
+    _ base: [String: String], adding extra: [String: String]
+  ) -> [String: String] {
+    var merged = base
+    for key in extra.keys {
+      #if os(Windows)
+        for existing in merged.keys where existing.caseInsensitiveCompare(key) == .orderedSame {
+          merged.removeValue(forKey: existing)
+        }
+      #endif
+      merged[key] = extra[key]
+    }
+    return merged
+  }
+
   /// Runs a process to its exit and returns its status and stdout, without parking a
   /// cooperative-pool thread on either. `readDataToEndOfFile` and `waitUntilExit` both
   /// block their thread, and with every presence read and send doing it at once on a
@@ -1318,10 +1335,16 @@ public enum ZmxSessionLauncher {
   /// The read runs on a GCD thread and the exit arrives through `terminationHandler`,
   /// set before `run` so it cannot be missed; the two are joined, not sequenced,
   /// because reading only after the exit deadlocks a child that filled the pipe.
-  static func runCollectingOutput(_ executable: URL, _ arguments: [String]) async -> ZmxResult? {
+  static func runCollectingOutput(
+    _ executable: URL, _ arguments: [String], extraEnvironment: [String: String]? = nil
+  ) async -> ZmxResult? {
     let process = Process()
     process.executableURL = executable
     process.arguments = arguments
+    if let extraEnvironment {
+      process.environment = mergedEnvironment(
+        ProcessInfo.processInfo.environment, adding: extraEnvironment)
+    }
     let output = Pipe()
     process.standardOutput = output
     process.standardError = DiscardedStream.handle()
