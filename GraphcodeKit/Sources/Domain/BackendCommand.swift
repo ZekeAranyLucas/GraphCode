@@ -320,7 +320,10 @@ extension CLISessionBackendKind {
       return hooksFile.map { ["--settings", $0.path] } ?? []
     case .copilotCLI:
       return sessionName.map { name in
-        ["--name", displayName.map { Self.copilotSessionName(title: $0, sessionName: name) } ?? name]
+        [
+          "--name",
+          displayName.map { Self.copilotSessionName(title: $0, sessionName: name) } ?? name,
+        ]
       } ?? []
     case .codex:
       // Codex reports only the *end* of a turn, through `notify`. Its other edge is
@@ -392,14 +395,16 @@ extension CLISessionBackendKind {
   /// the session graphcode runs as `sessionName` — under either naming.
   public static func isCopilotSessionName(_ recorded: String, for sessionName: String) -> Bool {
     if recorded == sessionName { return true }
-    let unquoted = recorded.count > 1 && recorded.first == recorded.last
-      && (recorded.first == "\"" || recorded.first == "'")
+    let unquoted =
+      recorded.count > 1 && recorded.first == recorded.last
+        && (recorded.first == "\"" || recorded.first == "'")
       ? String(recorded.dropFirst().dropLast()) : recorded
     return unquoted.hasSuffix(" · \(copilotNameSuffix(of: sessionName))")
   }
 
   private static func copilotNameSuffix(of sessionName: String) -> String {
-    let id = sessionName.hasPrefix("graphcode-")
+    let id =
+      sessionName.hasPrefix("graphcode-")
       ? sessionName.dropFirst("graphcode-".count) : Substring(sessionName)
     return String(id.prefix(8))
   }

@@ -12,7 +12,7 @@ import Testing
 /// launch flag at all.
 @Suite
 struct SessionNamingTests {
-  private let nodeID = UUID(uuidString: "11111111-2222-3333-4444-555555555555")!
+  private let nodeID = UUID(uuidString: "11111111-2222-3333-4444-555555555555") ?? UUID()
 
   private var sessionName: String {
     SurfaceRef(id: nodeID, launchesClaudeCode: true).zmxSessionName
@@ -44,7 +44,8 @@ struct SessionNamingTests {
     #expect(
       CLISessionBackendKind.pi.nameArguments(displayName: "Fix login", resuming: false)
         == ["--name", "Fix login"])
-    #expect(CLISessionBackendKind.pi.nameArguments(displayName: "Fix login", resuming: true).isEmpty)
+    #expect(
+      CLISessionBackendKind.pi.nameArguments(displayName: "Fix login", resuming: true).isEmpty)
   }
 
   @Test(arguments: [CLISessionBackendKind.copilotCLI, .codex, .openCode, .nod])
@@ -54,7 +55,8 @@ struct SessionNamingTests {
 
   @Test
   func aBlankOrMultilineTitleIsCleanedUp() {
-    #expect(CLISessionBackendKind.claudeCode.nameArguments(displayName: "  \n ", resuming: false).isEmpty)
+    #expect(
+      CLISessionBackendKind.claudeCode.nameArguments(displayName: "  \n ", resuming: false).isEmpty)
     #expect(
       CLISessionBackendKind.claudeCode.nameArguments(displayName: "Fix\nlogin", resuming: false)
         == ["--name", "Fix login"])
@@ -74,7 +76,8 @@ struct SessionNamingTests {
   func copilotsLookupAcceptsEitherNaming() {
     #expect(CLISessionBackendKind.isCopilotSessionName(sessionName, for: sessionName))
     #expect(CLISessionBackendKind.isCopilotSessionName("Fix login · 11111111", for: sessionName))
-    #expect(CLISessionBackendKind.isCopilotSessionName(#""Fix: login · 11111111""#, for: sessionName))
+    #expect(
+      CLISessionBackendKind.isCopilotSessionName(#""Fix: login · 11111111""#, for: sessionName))
     #expect(!CLISessionBackendKind.isCopilotSessionName("Fix login · 99999999", for: sessionName))
     #expect(!CLISessionBackendKind.isCopilotSessionName("Fix login", for: sessionName))
   }
@@ -105,7 +108,9 @@ struct SessionNamingTests {
   @Test
   func theDaemonNamesAFreshSessionAfterItsLoop() {
     SessionNaming.$rampOverride.withValue(true) {
-      #expect(nameValue(in: ZmxSessionLauncher.arguments(forNode: node(.claudeCode)) ?? []) == "Fix login")
+      #expect(
+        nameValue(in: ZmxSessionLauncher.arguments(forNode: node(.claudeCode)) ?? []) == "Fix login"
+      )
       #expect(nameValue(in: ZmxSessionLauncher.arguments(forNode: node(.pi)) ?? []) == "Fix login")
       #expect(
         nameValue(in: ZmxSessionLauncher.arguments(forNode: node(.copilotCLI)) ?? [])
@@ -135,7 +140,8 @@ struct SessionNamingTests {
         workingDirectory: nil, onProcessExited: { _ in })
       let command = pane.agentCommand(settings: GraphcodeSettings())?.last ?? ""
       #expect(command.contains("'--name' 'Fix login'"))
-      let resume = pane.resumeCommand(settings: GraphcodeSettings(), remoteSettingsPath: nil)?.last ?? ""
+      let resume =
+        pane.resumeCommand(settings: GraphcodeSettings(), remoteSettingsPath: nil)?.last ?? ""
       #expect(resume.contains("'--name' 'Fix login'"))
     }
   }
@@ -146,7 +152,8 @@ struct SessionNamingTests {
     SessionNaming.$rampOverride.withValue(true) {
       let arguments = ZmxSessionLauncher.arguments(forNode: node(.openCode)) ?? []
       #expect(!arguments.contains("--title"))
-      #expect(arguments.contains { $0.contains("GRAPHCODE_SESSION_TITLE=") && $0.contains("Fix login") })
+      #expect(
+        arguments.contains { $0.contains("GRAPHCODE_SESSION_TITLE=") && $0.contains("Fix login") })
     }
     SessionNaming.$rampOverride.withValue(false) {
       let arguments = ZmxSessionLauncher.arguments(forNode: node(.openCode)) ?? []
@@ -159,7 +166,8 @@ struct SessionNamingTests {
   func openCodesPluginTitlesOnlyTheSessionItCreated() {
     let source = OpenCodePresencePlugin.source(zmxPath: "/z", sessionsDirectory: "/s")
     #expect(source.contains("process.env.GRAPHCODE_SESSION_TITLE"))
-    #expect(source.contains("client.session.update({ path: { id: main }, body: { title: TITLE } })"))
+    #expect(
+      source.contains("client.session.update({ path: { id: main }, body: { title: TITLE } })"))
   }
 
   @Test

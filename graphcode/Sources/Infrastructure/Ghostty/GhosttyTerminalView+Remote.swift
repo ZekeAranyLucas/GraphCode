@@ -271,7 +271,7 @@ extension GhosttyTerminalView {
         sessionsDirectory: isRemote ? PresenceHooks.remoteSessionsExpression : nil
       ) + backend.nameArguments(displayName: sessionDisplayName, resuming: true))
       .map(PresenceHooks.singleQuoted)
-    .joined(separator: " ")
+      .joined(separator: " ")
     if !presence.isEmpty { parts.append(presence) }
     addRemotePresenceSettings(remoteSettingsPath, to: &parts)
     addBriefingEnvironment(briefingPath, to: &parts)
