@@ -360,6 +360,19 @@ extension CLISessionBackendKind {
     }
   }
 
+  /// OpenCode's TUI has no title flag (`--title` is `opencode run`'s alone), so the title
+  /// rides to graphcode's plugin, which sets it when the session is created
+  /// (`OpenCodePresencePlugin`). A resumed session keeps the title it already has.
+  public func nameEnvironment(displayName: String?) -> [String: String] {
+    // Every launch path pastes environment values inside double quotes in a shell string,
+    // where these would expand or end the quote — and a title is anyone's to write.
+    let inert = displayName.map { $0.filter { !"\"$`\\!".contains($0) } }
+    guard self == .openCode, let name = inert.flatMap(Self.sessionLabel) else { return [:] }
+    return [Self.sessionTitleVariable: name]
+  }
+
+  public static let sessionTitleVariable = "GRAPHCODE_SESSION_TITLE"
+
   /// A loop's title as one line a session picker can show, or `nil` when nothing is left.
   static func sessionLabel(_ title: String) -> String? {
     let line = title.components(separatedBy: .newlines).joined(separator: " ")

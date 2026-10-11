@@ -139,4 +139,33 @@ struct SessionNamingTests {
       #expect(resume.contains("'--name' 'Fix login'"))
     }
   }
+
+  /// OpenCode's TUI rejects `--title`, so the title reaches graphcode's plugin instead.
+  @Test
+  func openCodesTitleRidesInTheEnvironmentToItsPlugin() {
+    SessionNaming.$rampOverride.withValue(true) {
+      let arguments = ZmxSessionLauncher.arguments(forNode: node(.openCode)) ?? []
+      #expect(!arguments.contains("--title"))
+      #expect(arguments.contains { $0.contains("GRAPHCODE_SESSION_TITLE=") && $0.contains("Fix login") })
+    }
+    SessionNaming.$rampOverride.withValue(false) {
+      let arguments = ZmxSessionLauncher.arguments(forNode: node(.openCode)) ?? []
+      #expect(!arguments.contains { $0.contains("GRAPHCODE_SESSION_TITLE") })
+    }
+    #expect(CLISessionBackendKind.claudeCode.nameEnvironment(displayName: "Fix login").isEmpty)
+  }
+
+  @Test
+  func openCodesPluginTitlesOnlyTheSessionItCreated() {
+    let source = OpenCodePresencePlugin.source(zmxPath: "/z", sessionsDirectory: "/s")
+    #expect(source.contains("process.env.GRAPHCODE_SESSION_TITLE"))
+    #expect(source.contains("client.session.update({ path: { id: main }, body: { title: TITLE } })"))
+  }
+
+  @Test
+  func aTitleCannotRunCodeThroughTheEnvironment() {
+    let environment = CLISessionBackendKind.openCode.nameEnvironment(
+      displayName: #"Fix "$(touch /tmp/x)" `id` \ now!"#)
+    #expect(environment["GRAPHCODE_SESSION_TITLE"] == "Fix (touch /tmp/x) id  now")
+  }
 }

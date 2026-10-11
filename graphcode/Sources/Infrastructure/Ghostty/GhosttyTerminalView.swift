@@ -314,6 +314,7 @@ struct GhosttyTerminalView: NSViewRepresentable {
   /// prompt stays untouched: its briefing arrives via `--append-system-prompt-file`.
   func sessionEnvironment(briefingPath: String?, hooksFile: URL? = nil) -> [String: String] {
     var environment = backend.presenceEnvironment(hooksFile: hooksFile)
+      .merging(backend.nameEnvironment(displayName: sessionDisplayName)) { $1 }
     guard var prompt = initialPrompt else { return environment }
     if backend != .claudeCode, backend != .nod,
       backend.briefingEnvironment(briefingPath: briefingPath).isEmpty, let briefingPath
