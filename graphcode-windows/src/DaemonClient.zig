@@ -175,8 +175,11 @@ pub const DaemonClient = struct {
     outbound_count: usize = 0,
     worker_busy: bool = false,
     inbound: [inbound_capacity][]u8 = undefined,
+    inbound_generations: [inbound_capacity]u64 = [_]u64{0} ** inbound_capacity,
     inbound_head: usize = 0,
     inbound_count: usize = 0,
+    connection_generation: u64 = 0,
+    delivering_generation: u64 = 0,
     pipe: c.HANDLE = c.INVALID_HANDLE_VALUE,
     pipe_name: []u8 = &.{},
     client_id: [36]u8 = undefined,
@@ -441,10 +444,7 @@ pub const DaemonClient = struct {
         if (self.protocolMode() == .v1 and !self.v1OpenReady()) return null;
         const command = Wire.commandOpenProject(self.allocator, path) catch return null;
         var request_id: [36]u8 = undefined;
-        self.mutex.lock();
-        makeRequestID(&request_id, self.next_request);
-        self.next_request +%= 1;
-        self.mutex.unlock();
+        _ = self.allocateRequestID(&request_id);
         if (!self.sendCommandWithRequestID(command, request_id)) return null;
         return request_id;
     }
@@ -721,6 +721,7 @@ pub const DaemonClient = struct {
                 return;
             }
             const frame = self.inbound[self.inbound_head];
+            self.delivering_generation = self.inbound_generations[self.inbound_head];
             self.inbound_head = (self.inbound_head + 1) % inbound_capacity;
             self.inbound_count -= 1;
             self.mutex.unlock();
@@ -969,19 +970,16 @@ pub const DaemonClient = struct {
         requested_id: ?[36]u8,
         expectation: V1Expectation,
     ) void {
+        var tracked_id: ?[36]u8 = null;
         const frame = if (self.mode == .v2) blk: {
             var request_id: [36]u8 = undefined;
             if (requested_id) |value| {
                 request_id = value;
             } else {
-                makeRequestID(&request_id, self.next_request);
-                self.next_request +%= 1;
+                _ = self.allocateRequestID(&request_id);
             }
-            if (!self.trackRequest(&request_id)) {
-                self.publishState(self.state, "too many outstanding daemon requests");
-                return;
-            }
-            break :blk Wire.v2Request(
+            // Encode first: a request that cannot be encoded must leave nothing pending.
+            const encoded = Wire.v2Request(
                 self.allocator,
                 &request_id,
                 command_json,
@@ -989,17 +987,20 @@ pub const DaemonClient = struct {
                 self.publishState(self.state, "request encoding failed");
                 return;
             };
+            if (!self.trackRequest(&request_id)) {
+                self.allocator.free(encoded);
+                self.publishState(self.state, "too many outstanding daemon requests");
+                return;
+            }
+            tracked_id = request_id;
+            break :blk encoded;
         } else Wire.v1Command(self.allocator, command_json) catch {
             self.publishState(self.state, "request encoding failed");
             return;
         };
         defer self.allocator.free(frame);
         self.writeFrame(frame) catch {
-            if (self.mode == .v2) {
-                if (Wire.responseRequestID(frame)) |request_id| {
-                    _ = self.completeRequest(request_id);
-                }
-            }
+            if (tracked_id) |request_id| _ = self.completeRequest(&request_id);
             self.markTransportFailure("daemon write failed");
             return;
         };
@@ -1194,7 +1195,7 @@ pub const DaemonClient = struct {
             return true;
         }
         if (self.mode == .v2) {
-            if (Wire.responseRequestID(frame)) |request_id| {
+            if (Wire.correlatedRequestID(frame)) |request_id| {
                 if (!self.completeRequest(request_id)) {
                     self.markProtocolFailure("unmatched daemon response");
                     return false;
@@ -1234,6 +1235,7 @@ pub const DaemonClient = struct {
         }
         const index = (self.inbound_head + self.inbound_count) % inbound_capacity;
         self.inbound[index] = copy;
+        self.inbound_generations[index] = self.connection_generation;
         self.inbound_count += 1;
         self.condition.signal();
         self.mutex.unlock();
@@ -1281,6 +1283,242 @@ test "open project returns the request ID used by the v2 envelope" {
     try std.testing.expectEqualStrings(&request_id, Wire.responseRequestID(frame).?);
 }
 
+const ReadCapture = struct {
+    var frames: [8][512]u8 = undefined;
+    var lengths: [8]usize = [_]usize{0} ** 8;
+    var generations: [8]u64 = [_]u64{0} ** 8;
+    var count: usize = 0;
+    var client: ?*DaemonClient = null;
+
+    fn reset(target: *DaemonClient) void {
+        count = 0;
+        client = target;
+        target.setCallback(onFrame, null);
+    }
+
+    fn onFrame(_: ?*anyopaque, frame: [*]const u8, length: usize) callconv(.c) void {
+        if (count == frames.len) return;
+        @memcpy(frames[count][0..length], frame[0..length]);
+        lengths[count] = length;
+        generations[count] = client.?.deliveringGeneration();
+        count += 1;
+    }
+
+    fn at(index: usize) []const u8 {
+        return frames[index][0..lengths[index]];
+    }
+};
+
+test "read project graph is v2 and connected only, and sends the read-only command" {
+    var client = try DaemonClient.initForTesting(std.testing.allocator);
+    defer client.deinit();
+    try std.testing.expect(client.sendReadProjectGraph("C:\\work\\A") == null);
+    try std.testing.expectEqual(@as(usize, 0), client.outbound_count);
+    client.publishState(.connected, "");
+    client.mode = .v1;
+    try std.testing.expect(client.sendReadProjectGraph("C:\\work\\A") == null);
+    try std.testing.expectEqual(@as(usize, 0), client.outbound_count);
+    client.mode = .v2;
+    const read = client.sendReadProjectGraph("C:\\work\\A").?;
+    try std.testing.expectEqual(client.connectionGeneration(), read.generation);
+    try std.testing.expectEqual(@as(usize, 1), client.outbound_count);
+    try std.testing.expectEqualStrings(
+        "{\"readProjectGraph\":{\"path\":\"C:\\\\work\\\\A\"}}",
+        client.outbound[client.outbound_head],
+    );
+    try std.testing.expectEqualSlices(u8, &read.request_id, &client.outbound_request_ids[client.outbound_head].?);
+    const second = client.sendReadProjectGraph("C:\\work\\A").?;
+    try std.testing.expect(!std.mem.eql(u8, &read.request_id, &second.request_id));
+}
+
+test "read project graph reports a full outbound queue as not sent" {
+    var client = try DaemonClient.initForTesting(std.testing.allocator);
+    defer client.deinit();
+    client.publishState(.connected, "");
+    for (&client.outbound) |*slot| slot.* = try std.testing.allocator.dupe(u8, "");
+    client.outbound_count = outbound_capacity;
+    try std.testing.expect(client.sendReadProjectGraph("C:\\work\\A") == null);
+}
+
+test "connection generation changes on every entry to connected and only then" {
+    var client = try DaemonClient.initForTesting(std.testing.allocator);
+    defer client.deinit();
+    try std.testing.expectEqual(@as(u64, 0), client.connectionGeneration());
+    client.publishState(.connected, "");
+    const first = client.connectionGeneration();
+    client.publishState(.connected, "");
+    try std.testing.expectEqual(first, client.connectionGeneration());
+    client.publishState(.reconnecting, "");
+    try std.testing.expectEqual(first, client.connectionGeneration());
+    client.publishState(.connected, "");
+    try std.testing.expect(client.connectionGeneration() != first);
+}
+
+test "a correlated response and an uncorrelated snapshot are told apart on real envelopes" {
+    var client = try DaemonClient.initForTesting(std.testing.allocator);
+    defer client.deinit();
+    client.publishState(.connected, "");
+    ReadCapture.reset(&client);
+    const read = client.sendReadProjectGraph("C:\\work\\A").?;
+    try std.testing.expect(client.trackRequest(&read.request_id));
+    const graph = "{\"graphChanged\":{\"project\":{\"path\":\"C:/work/A\"},\"nodes\":[" ++
+        "{\"title\":\"\\\"kind\\\":\\\"response\\\",\\\"requestID\\\":\\\"x\\\"\",\"kind\":\"response\"}]}}";
+    try std.testing.expect(client.handleFrame("{\"version\":2,\"kind\":\"event\",\"sequence\":7,\"event\":" ++ graph ++ "}"));
+    const response = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"version\":2,\"kind\":\"response\",\"requestID\":\"{s}\",\"event\":{s}}}",
+        .{ read.request_id, graph },
+    );
+    defer std.testing.allocator.free(response);
+    try std.testing.expect(client.handleFrame(response));
+    client.poll();
+    try std.testing.expectEqual(@as(usize, 2), ReadCapture.count);
+    try std.testing.expectEqual(Wire.FrameKind.event, Wire.frameKind(ReadCapture.at(0)));
+    try std.testing.expect(Wire.correlatedRequestID(ReadCapture.at(0)) == null);
+    try std.testing.expectEqual(Wire.FrameKind.response, Wire.frameKind(ReadCapture.at(1)));
+    try std.testing.expectEqualStrings(&read.request_id, Wire.correlatedRequestID(ReadCapture.at(1)).?);
+    try std.testing.expectEqual(read.generation, ReadCapture.generations[1]);
+    try std.testing.expectEqual(@as(usize, 0), client.pending_request_count);
+}
+
+test "request ids minted by concurrent producers are all distinct" {
+    var client = try DaemonClient.initForTesting(std.testing.allocator);
+    defer client.deinit();
+    const threads = 4;
+    const each = 250;
+    const Worker = struct {
+        fn run(owner: *DaemonClient, out: *[each][36]u8) void {
+            for (out) |*slot| _ = owner.allocateRequestID(slot);
+        }
+    };
+    var ids: [threads][each][36]u8 = undefined;
+    var handles: [threads]std.Thread = undefined;
+    for (&handles, 0..) |*handle, index| handle.* = try std.Thread.spawn(.{}, Worker.run, .{ &client, &ids[index] });
+    for (handles) |handle| handle.join();
+    var seen = std.StringHashMap(void).init(std.testing.allocator);
+    defer seen.deinit();
+    for (&ids) |*group| {
+        for (group) |*id| {
+            const entry = try seen.getOrPut(id);
+            try std.testing.expect(!entry.found_existing);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, threads * each), seen.count());
+}
+
+test "public producers and the worker allocation never draw the same request id" {
+    var client = try DaemonClient.initForTesting(std.testing.allocator);
+    defer client.deinit();
+    client.publishState(.connected, "");
+    client.mode = .v2;
+    const producers = 2;
+    const sends = 20;
+    const worker_draws = 200;
+    const Shared = struct {
+        client: *DaemonClient,
+        ready: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        go: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        fn arrive(self: *@This()) void {
+            _ = self.ready.fetchAdd(1, .acq_rel);
+            while (!self.go.load(.acquire)) std.Thread.yield() catch {};
+        }
+        fn produce(self: *@This()) void {
+            self.arrive();
+            for (0..sends) |index| {
+                var path_buffer: [16]u8 = undefined;
+                const path = std.fmt.bufPrint(&path_buffer, "C:\\p{d}", .{index}) catch return;
+                _ = self.client.sendReadProjectGraph(path);
+            }
+        }
+    };
+    var shared: Shared = .{ .client = &client };
+    var handles: [producers]std.Thread = undefined;
+    for (&handles) |*handle| handle.* = try std.Thread.spawn(.{}, Shared.produce, .{&shared});
+    while (shared.ready.load(.acquire) != producers) std.Thread.yield() catch {};
+    shared.go.store(true, .release);
+    var drawn: [worker_draws][36]u8 = undefined;
+    for (&drawn) |*slot| _ = client.allocateRequestID(slot);
+    for (handles) |handle| handle.join();
+
+    var seen = std.StringHashMap(void).init(std.testing.allocator);
+    defer seen.deinit();
+    for (&drawn) |*id| try std.testing.expect(!(try seen.getOrPut(id)).found_existing);
+    try std.testing.expectEqual(@as(usize, producers * sends), client.outbound_count);
+    for (client.outbound_request_ids[0..client.outbound_count]) |*maybe| {
+        try std.testing.expect(!(try seen.getOrPut(&maybe.*.?)).found_existing);
+    }
+}
+test "a request that cannot be encoded leaves nothing pending" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var client = try DaemonClient.initForTesting(failing.allocator());
+    defer client.deinit();
+    client.publishState(.connected, "");
+    client.mode = .v2;
+    failing.fail_index = failing.alloc_index;
+    client.sendCommandOnWorker("{\"listRecentProjects\":{}}", null, .graph_changed);
+    try std.testing.expectEqual(@as(usize, 0), client.pending_request_count);
+}
+
+test "an event that merely carries a requestID does not complete a pending request" {
+    var client = try DaemonClient.initForTesting(std.testing.allocator);
+    defer client.deinit();
+    client.publishState(.connected, "");
+    const read = client.sendReadProjectGraph("C:\\work\\A").?;
+    try std.testing.expect(client.trackRequest(&read.request_id));
+    const spoof = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"version\":2,\"kind\":\"event\",\"sequence\":3,\"requestID\":\"{s}\",\"event\":{{\"graphChanged\":{{\"project\":{{\"path\":\"C:/work/A\"}},\"nodes\":[]}}}}}}",
+        .{read.request_id},
+    );
+    defer std.testing.allocator.free(spoof);
+    try std.testing.expect(client.handleFrame(spoof));
+    try std.testing.expectEqual(@as(usize, 1), client.pending_request_count);
+    const response = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"version\":2,\"kind\":\"response\",\"requestID\":\"{s}\",\"event\":{{\"graphChanged\":{{\"project\":{{\"path\":\"C:/work/A\"}},\"nodes\":[]}}}}}}",
+        .{read.request_id},
+    );
+    defer std.testing.allocator.free(response);
+    try std.testing.expect(client.handleFrame(response));
+    try std.testing.expectEqual(@as(usize, 0), client.pending_request_count);
+}
+
+test "an error envelope for the request correlates and an unknown-command error is not a response" {
+    var client = try DaemonClient.initForTesting(std.testing.allocator);
+    defer client.deinit();
+    client.publishState(.connected, "");
+    ReadCapture.reset(&client);
+    const read = client.sendReadProjectGraph("C:\\work\\A").?;
+    try std.testing.expect(client.trackRequest(&read.request_id));
+    const failure = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"version\":2,\"kind\":\"error\",\"requestID\":\"{s}\",\"error\":" ++
+            "{{\"code\":\"malformedEnvelope\",\"message\":\"unknown command\"}}}}",
+        .{read.request_id},
+    );
+    defer std.testing.allocator.free(failure);
+    try std.testing.expect(client.handleFrame(failure));
+    client.poll();
+    try std.testing.expectEqual(@as(usize, 1), ReadCapture.count);
+    try std.testing.expectEqual(Wire.FrameKind.@"error", Wire.frameKind(ReadCapture.at(0)));
+    try std.testing.expectEqualStrings(&read.request_id, Wire.correlatedRequestID(ReadCapture.at(0)).?);
+}
+
+test "a frame is stamped with the generation it arrived on even if polled after a reconnect" {
+    var client = try DaemonClient.initForTesting(std.testing.allocator);
+    defer client.deinit();
+    client.publishState(.connected, "");
+    ReadCapture.reset(&client);
+    const arrived = client.connectionGeneration();
+    try std.testing.expect(client.handleFrame("{\"version\":2,\"kind\":\"event\",\"sequence\":1,\"event\":{\"graphChanged\":{}}}"));
+    client.publishState(.reconnecting, "");
+    client.publishState(.connected, "");
+    client.poll();
+    try std.testing.expectEqual(@as(usize, 1), ReadCapture.count);
+    try std.testing.expectEqual(arrived, ReadCapture.generations[0]);
+    try std.testing.expect(client.connectionGeneration() != arrived);
+}
+
 test "v1 open waits for all earlier commands and retains retry on full queue" {
     var client = try DaemonClient.init(std.testing.allocator);
     defer client.deinit();
@@ -1318,9 +1556,75 @@ test "v1 response accounting ignores unsolicited events before the expected resu
 
     fn publishState(self: *DaemonClient, state: Wire.ConnectionState, message: []const u8) void {
         self.mutex.lock();
+        if (state == .connected and self.state != .connected) self.connection_generation +%= 1;
         self.state = state;
         self.last_error = message;
         self.mutex.unlock();
+    }
+
+    /// Identifies one established connection: it changes every time the client enters
+    /// `.connected`, so anything that must not outlive a disconnect (a reply awaited, a
+    /// look at the daemon's graph) can be fenced against it.
+    pub fn connectionGeneration(self: *DaemonClient) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.connection_generation;
+    }
+
+    /// The generation the frame being delivered by `poll` was received on. Only
+    /// meaningful inside the event callback.
+    pub fn deliveringGeneration(self: *DaemonClient) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.delivering_generation;
+    }
+
+    pub const GraphRead = struct {
+        request_id: [36]u8,
+        generation: u64,
+    };
+
+    /// Asks the daemon for the current graph of a project this connection has already
+    /// opened (`readProjectGraph`): one correlated response, no side effect, no event.
+    /// Null when it cannot be sent as such — not v2, not connected, or the queue is
+    /// full — and then nothing was queued. The caller keeps the returned id and
+    /// generation and accepts only a reply that matches both.
+    pub fn sendReadProjectGraph(self: *DaemonClient, path: []const u8) ?GraphRead {
+        const command = Wire.commandReadProjectGraph(self.allocator, path) catch return null;
+        var request_id: [36]u8 = undefined;
+        var generation: u64 = 0;
+        if (!self.allocateRequestIDIfConnected(&request_id, &generation)) {
+            self.allocator.free(command);
+            return null;
+        }
+        if (!self.sendCommandWithRequestID(command, request_id)) return null;
+        return .{ .request_id = request_id, .generation = generation };
+    }
+
+    /// Request ids are only ever minted by these two helpers, under the queue mutex, so a
+    /// caller's thread and the writer thread can never draw the same counter value.
+    fn allocateRequestID(self: *DaemonClient, buffer: *[36]u8) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.mintLocked(buffer);
+    }
+
+    /// Mints an id only for a connected v2 client, and reports the connection generation
+    /// it was minted on, in the same critical section.
+    fn allocateRequestIDIfConnected(self: *DaemonClient, buffer: *[36]u8, generation: *u64) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.mode != .v2 or self.state != .connected) return false;
+        generation.* = self.connection_generation;
+        _ = self.mintLocked(buffer);
+        return true;
+    }
+
+    fn mintLocked(self: *DaemonClient, buffer: *[36]u8) u64 {
+        const value = self.next_request;
+        makeRequestID(buffer, value);
+        self.next_request +%= 1;
+        return value;
     }
 
     fn trackRequest(self: *DaemonClient, request_id: *const [36]u8) bool {

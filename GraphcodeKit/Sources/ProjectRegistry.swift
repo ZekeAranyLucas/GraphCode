@@ -539,6 +539,44 @@ public actor ProjectRegistry {
         error = reason
       }
 
+    case .readProjectGraph(let path):
+      // Read-only by construction: no `open`, no `routing` (which would redirect a nested
+      // path to its container), no persistence, no sidebar join. Only a project this very
+      // connection already joined, spelled canonically, is answered.
+      guard case .v2 = channel.mode else {
+        error = "readProjectGraph requires daemon protocol v2."
+        break
+      }
+      // Refused before any membership or store lookup: the global graph and ssh:// remote
+      // projects are joined by other means and are not this command's to serve.
+      guard path != LoopGraphScope.globalPath,
+        RemoteProjectLocation.parse(projectPath: path) == nil,
+        Self.isWellFormedProjectPath(path, platformPaths: platformPaths)
+      else {
+        error = "\(path) isn't a local project path."
+        break
+      }
+      let canonicalPath = Self.canonicalize(path, platformPaths: platformPaths)
+      guard path == canonicalPath, !closingProjectPaths.contains(canonicalPath),
+        connectionProjectPaths[connectionID]?.contains(canonicalPath) == true,
+        let store = stores[canonicalPath]
+      else {
+        error = "\(path) isn't open on this connection — open it first."
+        break
+      }
+      let result = await store.readSnapshot(connectionID: connectionID, channel: channel)
+      guard !closingProjectPaths.contains(canonicalPath), stores[canonicalPath] === store,
+        connectionProjectPaths[connectionID]?.contains(canonicalPath) == true,
+        connections[connectionID] === channel
+      else {
+        error = "The project changed while reading its graph."
+        break
+      }
+      switch result {
+      case .applied(let graph): response = .graphChanged(graph)
+      case .rejected(let message, _): error = message
+      }
+
     case .projectSnapshot(let path, let token):
       switch transferPath(path, connectionID: connectionID, channel: channel) {
       case .project(let root):
@@ -875,7 +913,7 @@ public actor ProjectRegistry {
         return nil
       }
       return .graphChanged(await store.graph)
-    case .announce, .mailbox, .projectSnapshot, .validateProjectTransfer,
+    case .announce, .mailbox, .readProjectGraph, .projectSnapshot, .validateProjectTransfer,
       .importProjectChecked:
       return nil
     }
