@@ -1514,7 +1514,8 @@ public enum ZmxSessionLauncher {
         hooksFile: hooksFile,
         sessionName: SurfaceRef(id: node.id, launchesClaudeCode: true).zmxSessionName,
         zmxPath: reportingPath,
-        sessionsDirectory: sessionsDirectory)
+        sessionsDirectory: sessionsDirectory,
+        displayName: SessionNaming.displayName(forTitle: node.title))
     let command =
       [
         "run", SurfaceRef(id: node.id, launchesClaudeCode: true).zmxSessionName, "-d",
@@ -1548,7 +1549,8 @@ public enum ZmxSessionLauncher {
             hooksFile: hooksFile,
             sessionName: SurfaceRef(id: node.id, launchesClaudeCode: true).zmxSessionName,
             zmxPath: reportingPath,
-            sessionsDirectory: sessionsDirectory)
+            sessionsDirectory: sessionsDirectory,
+            displayName: SessionNaming.displayName(forTitle: node.title))
         return [
           "run", SurfaceRef(id: node.id, launchesClaudeCode: true).zmxSessionName, "-d",
         ]
@@ -1685,7 +1687,8 @@ public enum ZmxSessionLauncher {
         hooksFile: hooksFile,
         sessionName: sessionName,
         zmxPath: reportingPath,
-        sessionsDirectory: sessionsDirectory)
+        sessionsDirectory: sessionsDirectory,
+        displayName: SessionNaming.displayName(forTitle: node.title), resuming: true)
       + node.backend.resumeArguments(sessionID: sessionID)
     return [
       "run", SurfaceRef(id: node.id, launchesClaudeCode: true).zmxSessionName, "-d",

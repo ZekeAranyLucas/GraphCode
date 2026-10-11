@@ -45,6 +45,8 @@ struct GhosttyTerminalView: NSViewRepresentable {
   /// entirely and just joins the live one — so this is the fallback path for a node
   /// opened before the daemon got to it, or with `zmx` not installed.
   var initialPrompt: String?
+  /// The loop's title, which names the agent's session while `SessionNaming` is ramped on.
+  var loopTitle: String?
   let workingDirectory: String?
   /// The project whose graph this loop belongs to — what the session's briefing tells it
   /// to create further loops *in*. Distinct from `workingDirectory`, which is the
@@ -181,11 +183,12 @@ struct GhosttyTerminalView: NSViewRepresentable {
     // because this one carries a path and the support directory can be relocated
     // (`GRAPHCODE_SUPPORT_DIR`) somewhere with a space in it.
     let presence =
-      backend.presenceArguments(
+      (backend.presenceArguments(
         hooksFile: hooksFile, sessionName: sessionName,
         zmxPath: isRemote ? "zmx" : (ZmxLocator.isInstalled ? ZmxLocator.binaryURL.path : nil),
-        sessionsDirectory: isRemote ? PresenceHooks.remoteSessionsExpression : nil
-      )
+        sessionsDirectory: isRemote ? PresenceHooks.remoteSessionsExpression : nil,
+        displayName: sessionDisplayName
+      ) + backend.nameArguments(displayName: sessionDisplayName, resuming: false))
       .map(PresenceHooks.singleQuoted)
       .joined(separator: " ")
     if !presence.isEmpty { parts.append(presence) }
