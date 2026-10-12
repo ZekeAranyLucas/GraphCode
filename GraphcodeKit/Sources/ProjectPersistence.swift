@@ -29,6 +29,59 @@ public struct ProjectPersistence: Sendable {
       at: projectsDirectory, withIntermediateDirectories: true)
   }
 
+  // MARK: - Abandoned atomic-write temp files
+
+  /// The temp name Foundation's `.atomic` write mints beside its destination:
+  /// `.dat.nosync<pid in uppercase hex>.<6 random characters>`. The write goes
+  /// create(O_EXCL) -> write -> commit -> rename-over-destination, so a process killed
+  /// before the rename leaves this file behind while the destination still holds the last
+  /// completed version. Nothing here ever reads one back as a graph (readers only take
+  /// `.json`), and `saveGraph` returns only after the rename, so an unrenamed temp was never
+  /// acknowledged and is always discarded rather than recovered: even a complete one is a
+  /// write nobody was told landed, and a torn one cannot be told from a complete one.
+  /// Returns the owning pid, or nil for any name that is not exactly this pattern.
+  static func atomicWriteTempFileOwner(_ name: String) -> Int32? {
+    let prefix = ".dat.nosync"
+    guard name.hasPrefix(prefix) else { return nil }
+    let parts = name.dropFirst(prefix.count).split(
+      separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
+    guard parts.count == 2, !parts[0].isEmpty, parts[0].count <= 8,
+      parts[0].allSatisfy({ $0.isASCII && ($0.isNumber || ("A"..."F").contains($0)) }),
+      parts[1].count == 6, parts[1].allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber) }),
+      let raw = UInt32(parts[0], radix: 16)
+    else { return nil }
+    return Int32(bitPattern: raw)
+  }
+
+  /// Removes temp files abandoned by a writer that died mid-write. A file goes only when its
+  /// name matches the Windows temp pattern (uppercase-hex pid), it is a regular file, and
+  /// its owning pid is *definitively* dead. No age floor: the pid in the name is the
+  /// process that created the file, and a dead process has no writer, so a fresh leftover
+  /// from a just-killed daemon is removed at the next start. A live or unknown owner
+  /// (access denied, query failure, reused pid) keeps its file however old: deleting a
+  /// live writer's temp would make its rename fail silently. A reused pid therefore pins
+  /// a stale file; that conservative ambiguity is left alone. The scan is synchronous and
+  /// unbounded; `projects/` holds one json per project plus a few temps.
+  /// Returns the names removed.
+  @discardableResult
+  public func sweepAbandonedTempFiles(
+    liveness: ((Int32) -> ProcessLiveness)? = nil
+  ) -> [String] {
+    let liveness = liveness ?? { WorkspaceLock.liveness(of: $0) }
+    let fileManager = FileManager.default
+    var removed: [String] = []
+    for name in (try? fileManager.contentsOfDirectory(atPath: projectsDirectory.path)) ?? [] {
+      guard let pid = Self.atomicWriteTempFileOwner(name) else { continue }
+      let url = projectsDirectory.appendingPathComponent(name)
+      guard let attributes = try? fileManager.attributesOfItem(atPath: url.path),
+        attributes[.type] as? FileAttributeType == .typeRegular
+      else { continue }
+      guard liveness(pid) == .dead else { continue }
+      if (try? fileManager.removeItem(at: url)) != nil { removed.append(name) }
+    }
+    return removed
+  }
+
   // MARK: - Per-project graph
 
   public func loadGraph(path: String) -> LoopGraph? {
