@@ -220,11 +220,16 @@ struct SessionNamingTests {
     #expect(result.memory.isEmpty)
   }
 
+  /// A finished loop's session often stays up for follow-up questions.
+  @Test(arguments: [LoopState.succeeded, .failed])
+  func aFinishedLoopsOpenSessionIsRenamedToo(_ state: LoopState) async {
+    #expect(await typedAfterRenaming(.claudeCode, state: state).typed == ["/rename Fix login"])
+  }
+
   @Test
   func aRenameReachesNoSessionItCannotName() async {
     #expect(await typedAfterRenaming(.claudeCode, ramp: false).typed.isEmpty)
     #expect(await typedAfterRenaming(.copilotCLI).typed.isEmpty)
-    #expect(await typedAfterRenaming(.claudeCode, state: .succeeded).typed.isEmpty)
     #expect(
       await typedAfterRenaming(.claudeCode, to: NodeDraft.untitledFallback).typed.isEmpty)
   }

@@ -2034,10 +2034,12 @@ public actor GraphStore {
   /// Carries a new title into a live Claude Code session as `/rename`, which takes effect
   /// even mid-turn without interrupting it. Without this, a blank-titled loop's session
   /// kept its launch-time name for good: the title is suggested only after the session
-  /// has started. Never staged to memory — a name a resume will pass anyway (`--name`) is
-  /// not something the loop should read at its next wake.
+  /// has started. A resolved loop is renamed too: its session often stays up for
+  /// follow-up questions, and the send's own liveness gate skips one that is gone. Never
+  /// staged to memory — a name a resume will pass anyway (`--name`) is not something the
+  /// loop should read at its next wake.
   private func renameSession(of node: LoopNode) {
-    guard node.backend == .claudeCode, !node.isResolved, let onDeliverMessage,
+    guard node.backend == .claudeCode, let onDeliverMessage,
       let name = SessionNaming.displayName(forTitle: node.title)
         .flatMap(CLISessionBackendKind.sessionLabel)
     else { return }
