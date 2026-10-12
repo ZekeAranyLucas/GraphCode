@@ -377,7 +377,7 @@ extension CLISessionBackendKind {
   public static let sessionTitleVariable = "GRAPHCODE_SESSION_TITLE"
 
   /// A loop's title as one line a session picker can show, or `nil` when nothing is left.
-  static func sessionLabel(_ title: String) -> String? {
+  public static func sessionLabel(_ title: String) -> String? {
     let line = title.components(separatedBy: .newlines).joined(separator: " ")
       .trimmingCharacters(in: .whitespaces)
     return line.isEmpty ? nil : line

@@ -17,8 +17,9 @@ public enum SessionNaming {
       ?? (!NodRuntimeLocator.isTestHost && FileManager.default.fileExists(atPath: rampFlag.path))
   }
 
-  /// The name a session for `title` launches under, or `nil` while the ramp is off.
+  /// The name a session for `title` launches under, or `nil` while the ramp is off. The
+  /// untitled fallback is no name: a suggested title replaces it moments after launch.
   public static func displayName(forTitle title: String) -> String? {
-    isRampedOn ? title : nil
+    isRampedOn && title != NodeDraft.untitledFallback ? title : nil
   }
 }
