@@ -1280,7 +1280,9 @@ public actor GraphStore {
       mailroomWatch(on: on, topic: topic, from: from)
 
     case .renameNode(let nodeID, let title):
+      let before = graph.nodes[id: nodeID]?.title
       renameNode(nodeID, to: title)
+      if let node = graph.nodes[id: nodeID], node.title != before { renameSession(of: node) }
 
     case .updateNode(let nodeID, let update):
       updateNode(nodeID, with: update)
@@ -2027,6 +2029,34 @@ public actor GraphStore {
     let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty, graph.nodes[id: nodeID] != nil else { return }
     graph.nodes[id: nodeID]?.title = trimmed
+  }
+
+  /// Carries a new title into a live Claude Code session as `/rename`, which takes effect
+  /// even mid-turn without interrupting it. Without this, a blank-titled loop's session
+  /// kept its launch-time name for good: the title is suggested only after the session
+  /// has started. Never staged to memory — a name a resume will pass anyway (`--name`) is
+  /// not something the loop should read at its next wake.
+  private func renameSession(of node: LoopNode) {
+    guard node.backend == .claudeCode, !node.isResolved, let onDeliverMessage,
+      let name = SessionNaming.displayName(forTitle: node.title)
+        .flatMap(CLISessionBackendKind.sessionLabel)
+    else { return }
+    let command = "/rename \(name)"
+    let path = graph.project.path
+    guard subGraphDepth == 0 else {
+      Task { _ = await onDeliverMessage(node, command, path) }
+      return
+    }
+    let previous = sessionTyping[node.id]?.task
+    let token = UUID()
+    let task = Task { [self] in
+      await previous?.value
+      _ = await withDeadline(deliveryDeadline) { await onDeliverMessage(node, command, path) }
+      if sessionTyping[node.id]?.token == token {
+        sessionTyping.removeValue(forKey: node.id)
+      }
+    }
+    sessionTyping[node.id] = (token, task)
   }
 
   // MARK: - Updating a live loop

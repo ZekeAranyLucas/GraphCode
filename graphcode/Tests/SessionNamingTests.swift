@@ -1,3 +1,4 @@
+import ComposableArchitecture
 import Foundation
 import Testing
 
@@ -175,5 +176,56 @@ struct SessionNamingTests {
     let environment = CLISessionBackendKind.openCode.nameEnvironment(
       displayName: #"Fix "$(touch /tmp/x)" `id` \ now!"#)
     #expect(environment["GRAPHCODE_SESSION_TITLE"] == "Fix (touch /tmp/x) id  now")
+  }
+
+  @Test
+  func theUntitledPlaceholderIsNeverASessionName() {
+    SessionNaming.$rampOverride.withValue(true) {
+      #expect(SessionNaming.displayName(forTitle: NodeDraft.untitledFallback) == nil)
+      let claude =
+        ZmxSessionLauncher.arguments(
+          forNode: node(.claudeCode, title: NodeDraft.untitledFallback)) ?? []
+      #expect(!claude.contains("--name"))
+    }
+  }
+
+  private func typedAfterRenaming(
+    _ backend: CLISessionBackendKind, to title: String = "Fix login",
+    state: LoopState = .running, ramp: Bool = true
+  ) async -> (typed: [String], memory: [String]) {
+    let typed = LockIsolated<[String]>([])
+    let memory = LockIsolated<[String]>([])
+    var loop = node(backend, title: NodeDraft.untitledFallback)
+    loop.state = state
+    let store = GraphStore(
+      graph: LoopGraph(project: ProjectRef(path: "/tmp/naming", name: "naming"), nodes: [loop]),
+      onDeliverMessage: { _, text, _ in
+        typed.withValue { $0.append(text) }
+        return true
+      },
+      onAppendMemory: { _, note in memory.withValue { $0.append(note) } })
+    await SessionNaming.$rampOverride.withValue(ramp) {
+      await store.handle(.renameNode(nodeID, title: title))
+      await store.finishSessionTyping()
+    }
+    return (typed.value, memory.value)
+  }
+
+  /// The suggested title lands after the session started, so it goes in as `/rename`,
+  /// which Claude Code 2.1.296 applies even mid-turn.
+  @Test
+  func aRenamedClaudeLoopRenamesItsLiveSession() async {
+    let result = await typedAfterRenaming(.claudeCode)
+    #expect(result.typed == ["/rename Fix login"])
+    #expect(result.memory.isEmpty)
+  }
+
+  @Test
+  func aRenameReachesNoSessionItCannotName() async {
+    #expect(await typedAfterRenaming(.claudeCode, ramp: false).typed.isEmpty)
+    #expect(await typedAfterRenaming(.copilotCLI).typed.isEmpty)
+    #expect(await typedAfterRenaming(.claudeCode, state: .succeeded).typed.isEmpty)
+    #expect(
+      await typedAfterRenaming(.claudeCode, to: NodeDraft.untitledFallback).typed.isEmpty)
   }
 }
