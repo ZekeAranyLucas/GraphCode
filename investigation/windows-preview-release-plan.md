@@ -80,7 +80,8 @@ The release notes are the tester packet. They cover:
 
 - download and checksum, install, uninstall, and reinstall-to-update;
 - known limits: unsigned and SmartScreen, the tested profile, Copilot CLI
-  1.0.91 only, no screen-reader claim, 57/41 parity, out-of-scope features,
+  1.0.96 as tested (the version is not fixed for testing), no screen-reader
+  claim, parity, out-of-scope features,
   and #712;
 - the bug-report route.
 
@@ -133,7 +134,8 @@ were rerun; the bundle discloses them.
 
 - All input was injected (`SendInput` and UIA), not a physical keyboard or
   mouse.
-- 150% scaling was not executed.
+- 150% scaling was not executed. It is no longer part of Dev Box plans; see
+  #749.
 - The harness did not drive a real AltGr layout, Ctrl+Shift+F10, Terminal >
   Close Tab, UIA `ElementFromPoint`/`ScrollIntoView`, or closing a pane with a
   mouse button held.
@@ -2145,8 +2147,9 @@ The first audience is technical **Windows x64** testers using their own or
 disposable **local** projects and an already installed, authenticated agent CLI.
 Propose Windows 11 x64 as the first client qualification profile; record the
 actual OS build, display work area, scaling, graphics adapter, shell and agent
-CLI version before advertising support. Qualify at least 100% and 150% scaling
-and a declared minimum viewport. Other OS/display/input profiles are not
+CLI version before advertising support. Qualify 100% scaling and a declared
+minimum viewport on the Dev Box; other scaling and mixed-DPI monitors need
+physical hardware and are tracked in [#749](https://github.com/scgopi/GraphCode/issues/749). Other OS/display/input profiles are not
 implicitly covered by server CI.
 
 The useful minimum is: install without developer toolchains; open a local
@@ -2366,7 +2369,7 @@ proof gap, not PASS; hosted server evidence must not be relabelled client proof.
   pixels after unsupported-cell rejection, a parser snapshot, or queued input
   counts cannot satisfy this gate.
 - [ ] **Reachability and lifecycle:** at the declared minimum viewport and
-  supported 100%/150% profiles, actually reach every required form control,
+  supported 100% profile, actually reach every required form control,
   validation/error, menu and terminal action with native input. Confirm exact
   supported non-ASCII/dead-key entry and any relied-on clipboard paste without
   loss or unintended execution. Exercise close-to-tray, explicit app Exit,
@@ -2396,7 +2399,8 @@ The **Exact artifact** gate is complete for `0.1.78-windows.beta26`.
   - **Clean installation and recovery** stays open: install, uninstall
     refusal, uninstall and preserved data passed, but upgrade and rollback were
     not executed.
-  - **Reachability and lifecycle** stays open: injected input only, no 150%.
+  - **Reachability and lifecycle** stays open: injected input only, no
+    physical keyboard or mouse.
   - **Safe mutations** stays open: workspace deletion was not exercised live.
 
   These gates require evidence that source, hosted CI and hidden-window tests
@@ -2405,7 +2409,7 @@ The **Exact artifact** gate is complete for `0.1.78-windows.beta26`.
 | Required external capability | Exact permission/evidence needed |
 |---|---|
 | Packaged install and recovery | An authorized owned Windows 11 x64 client; permission to install the unsigned candidate, create/remove its scheduled task, run upgrade/rollback/uninstall, and preserve before/after user-data hashes plus package/source/provenance records. |
-| Owned desktop and native input | An exclusive or otherwise controlled interactive desktop at the declared 100%/150% profiles; permission to foreground the app, send physical/native keyboard and pointer input, exercise relied-on clipboard/IME paths, and retain screenshots/logs without exposing unrelated user data. Posted messages and hosted server UIA are not substitutes. |
+| Owned desktop and native input | An exclusive or otherwise controlled interactive desktop at the declared 100% profile; permission to foreground the app, send physical/native keyboard and pointer input, exercise relied-on clipboard/IME paths, and retain screenshots/logs without exposing unrelated user data. Posted messages and hosted server UIA are not substitutes. |
 | Named authenticated backend and credits | Authorization to use one explicitly named supported backend/version with a test account, valid authentication, and sufficient credits/quota; retained prompts/output markers and billing-safe stop criteria. Selector presence does not grant this permission. |
 | Destructive fixture lifecycle | Permission to create disposable local projects/workspaces/sessions, delete or recycle named fixtures, stop the fixture daemon/session processes, inspect the Recycle Bin/recovery result, and compare exact untouched sentinels outside the captured target. |
 | Publication | Maintainer approval for the exact qualified SHA/version/tag and permission to upload the unsigned ZIP plus checksum to the intended prerelease. Build permission, local-package mode, and an existing release-upload capability are not publication approval. |
@@ -2544,7 +2548,7 @@ permission-bound; it should not start with another parity-row sweep:
    `0.1.78-windows.beta26`, and publication is done with operator approval.
    From the reviewed beta25 Dev Box return, Production core flow and Useful
    agent terminal are checked. Installation and recovery (upgrade/rollback),
-   reachability (physical input, 150%) and safe mutations (workspace delete)
+   reachability (physical input) and safe mutations (workspace delete)
    stay open. The installed production-core result,
    native input and destructive fixture permission, named authenticated backend
    authorization, handoff transfer and execution, Approval B, and publication

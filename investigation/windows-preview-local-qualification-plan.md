@@ -55,13 +55,14 @@ Stop before creating the candidate unless these values are filled:
 - Local unpushed annotated tag:
 - Microsoft Dev Box definition/image and Windows build:
 - Remote client/version:
-- Minimum viewport and 100%/150% scaling method:
+- Minimum viewport at 100% scaling (no other scaling on a Dev Box; see #749):
 - Screenshot permission; video permission:
 - Accessibility scope: UIA + keyboard, or named screen reader/version:
 - Keyboard layouts/IME:
 - Clipboard mutation/restoration:
 - Named disposable fixture roots and destructive/Recycling permission:
-- Backend kind/version/hash/model/attended permission mode:
+- Backend kind/model/attended permission mode (version: whatever the Dev Box
+  has installed, recorded with its hash at run time):
 - Backend credentials provisioned outside chat:
 - Hard ceiling: exactly two turns / USD 5 equivalent:
 - Build a distinct predecessor package for upgrade/rollback: yes / no:

@@ -310,7 +310,10 @@ changed outside sentinel.
 
 ## Phase D7 — one real backend terminal
 
-Use Approval A's backend/version/model/account. Credentials are entered through
+Use Approval A's backend, model and account. The backend version is not fixed:
+use the version installed on the Dev Box, and record its exact version, path and
+hash. A different version from an earlier run is recorded, not a failure.
+Credentials are entered through
 the backend's normal flow outside chat and evidence.
 
 1. Verify executable path/version/hash.
@@ -363,9 +366,12 @@ to make Stop pass.
 
 ## Phase D8 — native reachability and input
 
-Run separate fixed-geometry profiles for 100% and 150%.
+Run one fixed-geometry profile at 100% scaling. Do not test 150% or any other
+scaling on a Dev Box: a remote session cannot provide a faithful high-DPI or
+mixed-DPI desktop. Non-100% scaling and multi-monitor DPI need physical hardware
+and are tracked in [#749](https://github.com/scgopi/GraphCode/issues/749).
 
-For each profile:
+For the profile:
 
 1. Record resolution, Windows scaling, app/client bounds, remote client/version,
    and graphics adapter.
@@ -495,7 +501,7 @@ Recommend tester invitation only if:
 - install/start/onboarding/connected Welcome passed;
 - core CRUD/reopen and safe mutation passed;
 - exactly two backend turns passed within budget;
-- required native/UIA/input profiles passed at 100% and 150%;
+- the required native/UIA/input profile passed at 100%;
 - lifecycle/uninstall-reinstall passed;
 - no required gate step failed;
 - every `NotExecuted` behavior is explicitly excluded from support;
@@ -517,7 +523,6 @@ The Dev Box agent does not publish. It returns evidence to the local plan.
 - [ ] safe mutations passed
 - [ ] two-turn backend terminal passed
 - [ ] 100% native/UIA/input profile passed
-- [ ] 150% native/UIA/input profile passed
 - [ ] #560 decision executed or NotExecuted honestly
 - [ ] uninstall/reinstall lifecycle passed
 - [ ] cleanup passed
