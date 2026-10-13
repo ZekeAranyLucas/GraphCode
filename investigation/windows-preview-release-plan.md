@@ -22,8 +22,8 @@ flight, followed by fixes for any reproduced core bugs. It is not closing all
 
 **Relationship to beta25.** The Dev Box qualification ran on
 `0.1.78-windows.beta25`. The operator reported that the Dev Box agent passed
-the plan and recommended publishing, with two caveats. That return bundle has
-not been reviewed or recorded in this ledger. The only product change since
+the plan and recommended publishing, with two caveats. The return bundle was
+reviewed on 2026-10-13; see "beta25 Dev Box return" below. The only product change since
 beta25 is #717 (`graphcode-windows/src/WindowsUpdates.zig`); the operator
 approved shipping it without a new Dev Box run.
 
@@ -83,6 +83,110 @@ The release notes are the tester packet. They cover:
   1.0.91 only, no screen-reader claim, 57/41 parity, out-of-scope features,
   and #712;
 - the bug-report route.
+
+#### beta25 Dev Box return (reviewed 2026-10-13)
+
+**Bundle.** `C:\GraphCode-DevBox-Return` (kept outside the repository), with
+1,998 files. All 1,996 entries in its `hashes.sha256` verified; the two
+unlisted files are a nested harness hash list and a rendezvous secret, which
+was not read or copied.
+
+**Run conditions.** Dev Box `CPC-conei-4E74D` ran Windows 11 25H2 (build
+26200) at 2560x1440 and 100%. The identities matched beta25 exactly: tag
+object, ZIP `c65523b4…`, payload manifest, custody `37ee5d5f…`, handoff
+`38cba4db…`, and the installed shell, daemon, CLI and zmx hashes. Run mode was
+the operator's "run every gate".
+
+**Result.** No required gate failed. Harness-invalid first attempts are kept and
+were rerun; the bundle discloses them.
+
+- **Identity and setup:** handoff, custody (43/43 LFS, no network), package and
+  install.
+- **Startup:** startup in 4 cases from a scrubbed 11-key environment, Ctrl+O
+  Core, and 6A.0 (loop start from an empty zmx, plus installed-layout loop
+  open).
+- **Terminal and loops:**
+  - 6A readability and the Stop contract;
+  - 7A activation and Show in Graph, expanded and collapsed, at the default
+    width and 960 px;
+  - 6F layouts, keys, Close Pane, clipboard and mouse forwarding;
+  - TerminalPaste.
+- **zmx and cleanup:**
+  - 6G deterministic freeze: `err=Timeout` observed and treated as unknown,
+    with no kill or relaunch;
+  - 6H deleted-loop cleanup, including the #707 reconnect case (the victim
+    session ended 7.5 s after the replacement daemon appeared);
+  - 6I planted controls.
+- **6D:** live updates passed 5 of 5 attempts plus the 2 original rounds, and
+  Needs-you presence, stale surface, open after delete, node IDs and Rename
+  focus passed.
+- **Other gates:** 6E, 6B, 6C Worktrees on the disposable fixture (9 steps,
+  including locked-row reclaim, dirty-row protection and recovery from the
+  logged tip), and Section 7 (D5 onboarding, D6 core and destructive CRUD, D8
+  menus, tray/Exit/daemon recovery).
+- **Backend and uninstall:** D7 ran a real Copilot CLI loop for 2 turns (about
+  USD 0.10), and after Stop it read `stopped` in the shell, the daemon and
+  `graphcode status`. D10 showed uninstall refusal with nothing changed, then
+  a complete uninstall with the support directory preserved.
+
+**Not executed or not proven.**
+
+- All input was injected (`SendInput` and UIA), not a physical keyboard or
+  mouse.
+- 150% scaling was not executed.
+- The harness did not drive a real AltGr layout, Ctrl+Shift+F10, Terminal >
+  Close Tab, UIA `ElementFromPoint`/`ScrollIntoView`, or closing a pane with a
+  mouse button held.
+- 6G load alone again produced no `err=Timeout`, so the result is
+  InsufficientStress.
+- 6I's runbook phase exercised nothing, because no leftover existed.
+- Upgrade/rollback, Nod, dumps, video and publication were out of scope.
+- The 6D 5/5 result does not show that #715 fixed the intermittent failure.
+  The shell log has no connection-state record, so a reconnect is unproven for
+  the Ctrl+R and daemon-kill attempts, and there is no beta24 baseline.
+- Copilot CLI on the Dev Box was **1.0.96**, not the 1.0.91 named in Approval A.
+
+**Findings for follow-up.**
+
+- **A stopped loop listed in Needs you.** The bundle's summary does not report
+  this; the release builder found it in `media/s6b-w960-collapsed-after.png`
+  and `readbacks/s6b-show-in-graph.json`.
+  - In 6b, the harness stopped a loop through the CLI and then set its zmx
+    presence to `awaitingInput`. The shell then listed that loop under Needs you
+    ("Awaiting your input", with a Stop button), while its sidebar row and
+    canvas card read `stopped`.
+  - The bundle classified the related timing as "shell ignores nodesChanged
+    presence deltas": the row appeared only after an unrelated graph change.
+    But 6D needsYouPresence, on a loop that was not stopped, showed the shell
+    following the daemon within 0.04 s.
+  - This is the state that closed PR #706 / issue #708 described. It was
+    produced with synthetic presence, not a real agent; D7's Copilot loop did
+    not reach it.
+  - It is recorded as an open product question, not a confirmed user-visible
+    defect.
+- **Atomic-write temp files in the support root.** `.dat.nosync*` files were
+  left there by daemons that were still running. The #705 sweep covers
+  `projects\` only.
+- **Uninstall leaves an empty `%LOCALAPPDATA%\GraphCode` folder.**
+- **Overlapping text.** The canvas Worktrees notice ("1 worktree; sizes
+  complete.") is partly drawn under the Needs-you banner in the same
+  screenshot.
+- **#712 was not observed.**
+
+**Parity.** On this evidence, six rows move to `Validated`: Tab pills, Worktree
+sweep sheet, Workspace detail screen, Right loop panel, Loop bar and Loop row
+presentation. The ledger now counts **98 surfaces: 63 Validated and 35
+Partial**.
+
+- Loop delete (already Validated) gains live D6 evidence.
+- Show in Graph, File/Loop/Terminal menus and Four-page onboarding record the
+  new evidence and stay `Partial`. The reasons:
+  - the Loop menu invocation was not exercised;
+  - menu enablement in each context was not read;
+  - onboarding was not driven by keyboard, so #556 stays open.
+- The promotion screenshots were reviewed by the Dev Box agent and
+  independently by the release builder. All promotions are at 100% with
+  injected input.
 
 ### Historical beta25 candidate
 
@@ -2244,7 +2348,7 @@ proof gap, not PASS; hosted server evidence must not be relabelled client proof.
   refusal and rollback are NotExecuted for this pass, remain unsupported, and
   keep the broader recovery gate open. Existing CI supports, but does not
   replace, this chosen-package check.
-- [ ] **Production core flow:** with production `graphcoded`, not the protocol
+- [x] **Production core flow:** with production `graphcoded`, not the protocol
   stub or gate-seeded model, open an owned fixture project; create exactly one
   intended loop, render/select it, rename and edit basic fields, then reopen
   and read the persisted state. Use exact typed sentinels such as
@@ -2252,7 +2356,7 @@ proof gap, not PASS; hosted server evidence must not be relabelled client proof.
   and stable ID. A changed editor cancellation must leave configuration
   unchanged. A driver failure requires attribution or an independently
   qualified manual flight, not an inferred product cause.
-- [ ] **Useful agent terminal:** run one named supported agent CLI/version in
+- [x] **Useful agent terminal:** run one named supported agent CLI/version in
   that project. Observe real readable prompts/output, type and receive exact
   expected input/output markers, interact with its required controls and stop
   the intended loop without freezing the app or losing unrelated output.
@@ -2286,11 +2390,17 @@ The **Exact artifact** gate is complete for `0.1.78-windows.beta26`.
 - **Publication** was approved by the operator and done on 2026-10-13.
 - **Honest tester handoff:** the release notes cover the required content;
   inviting testers is the operator's step.
-- **The five runtime gates** (installation and recovery, production core,
-  agent terminal, reachability and lifecycle, safe mutations) were reported
-  passed on the beta25 Dev Box run. They stay unchecked here until that return
-  bundle is reviewed and recorded. These gates require evidence that source,
-  hosted CI and hidden-window tests cannot manufacture:
+- **Runtime gates, from the reviewed beta25 Dev Box return.**
+  - **Production core flow** and **Useful agent terminal** are now checked
+    (D6, and D7 with Copilot CLI 1.0.96, 6A).
+  - **Clean installation and recovery** stays open: install, uninstall
+    refusal, uninstall and preserved data passed, but upgrade and rollback were
+    not executed.
+  - **Reachability and lifecycle** stays open: injected input only, no 150%.
+  - **Safe mutations** stays open: workspace deletion was not exercised live.
+
+  These gates require evidence that source, hosted CI and hidden-window tests
+  cannot manufacture:
 
 | Required external capability | Exact permission/evidence needed |
 |---|---|
@@ -2409,8 +2519,8 @@ permission-bound; it should not start with another parity-row sweep:
    `64c5dc52297d08051adde93aea099e9c41abde63` was built through
    [#578](https://github.com/scgopi/GraphCode/pull/578)'s supported route
    (the #604 release-candidate guard was retired by #649) and includes #624,
-   #626, #628, #630, #633, #635, #638, #640-#643, #647, #649-#651, #654, #656, #658, #659, #662-#665, #667-#671, #674-#677, #679-#685, #687-#694, #696-#701, #703-#705, #707 and #715. Its Dev Box run was reported passing by the operator on
-   2026-10-13 (return bundle not yet recorded here), and `0.1.78-windows.beta26`
+   #626, #628, #630, #633, #635, #638, #640-#643, #647, #649-#651, #654, #656, #658, #659, #662-#665, #667-#671, #674-#677, #679-#685, #687-#694, #696-#701, #703-#705, #707 and #715. Its Dev Box run passed and its return bundle was
+   reviewed on 2026-10-13 (see the beta26 section), and `0.1.78-windows.beta26`
    (beta25 plus #717) is published as an invitation-only prerelease. After authorization, use the included
    restore script and the exact candidate Dev Box plan to run
    install → first launch → onboarding → connected Welcome → local project →
@@ -2425,14 +2535,17 @@ permission-bound; it should not start with another parity-row sweep:
    #604 establishes the safety contract retained by beta3:
    release-candidate builds report `deferred`, show
    `Worktrees are deferred for this preview`, and do not invoke inspection.
-   Local native UIA responsiveness remains NotExecuted, and no Dev Box runtime
-   evidence exists. Approval A authorizes no full dump and keeps #560 open. A
+   The beta25 Dev Box section 6C ran installed Worktrees inspection on a
+   five-worktree fixture: 61 UI pings, at most 17 ms, none hung, and the File
+   menu opened during inspection. It then ran fixture-only reclaim. Approval A authorizes no full dump and keeps #560 open. A
    future dump-backed diagnosis requires separate authorization and a new
    candidate if product code changes.
 3. **Keep the release gates honest:** **Exact artifact** is complete for
    `0.1.78-windows.beta26`, and publication is done with operator approval.
-   The runtime gates stay unchecked until the beta25 Dev Box return bundle is
-   recorded. The installed production-core result,
+   From the reviewed beta25 Dev Box return, Production core flow and Useful
+   agent terminal are checked. Installation and recovery (upgrade/rollback),
+   reachability (physical input, 150%) and safe mutations (workspace delete)
+   stay open. The installed production-core result,
    native input and destructive fixture permission, named authenticated backend
    authorization, handoff transfer and execution, Approval B, and publication
    permission are independent. A green
