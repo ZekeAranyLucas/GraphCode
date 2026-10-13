@@ -10,7 +10,81 @@ The critical path is terminal correctness plus a packaged production-daemon
 flight, followed by fixes for any reproduced core bugs. It is not closing all
 36 Partial rows, and it is not just visual polish.
 
-### 2026-10-13 replacement Windows candidate (beta25)
+### 2026-10-13 published Windows preview (beta26)
+
+**`0.1.78-windows.beta26` is published** as an unsigned, invitation-only GitHub prerelease:
+<https://github.com/scgopi/GraphCode/releases/tag/0.1.78-windows.beta26>. The operator approved publication on 2026-10-13.
+
+**Source.** `09eda11abb6a876bad82cd9eb4103d81abc1fa3e`, the squash merge of
+[#717](https://github.com/scgopi/GraphCode/pull/717), with parent
+`190d1598e98e39c5d4ce045b60743641a26e0df7`. The annotated tag object is
+`0475c3818982110f4a502307dc9e0ec86f8b7d10`; it peels exactly to the source and is pushed.
+
+**Relationship to beta25.** The Dev Box qualification ran on
+`0.1.78-windows.beta25`. The operator reported that the Dev Box agent passed
+the plan and recommended publishing, with two caveats. That return bundle has
+not been reviewed or recorded in this ledger. The only product change since
+beta25 is #717 (`graphcode-windows/src/WindowsUpdates.zig`); the operator
+approved shipping it without a new Dev Box run.
+
+The two caveats:
+
+- **zmx hash.** zmx was rebuilt from the same pin `785b3fd1…`. It is not
+  byte-reproducible: comparing beta24 and beta25, only 104 bytes differ, and
+  they are the PE TimeDateStamp and the random `zmx-package-cache-<GUID>`
+  directory embedded twice in debug paths. No code or data bytes differ.
+- **"Update available v0.1.80" banner.** The feed is shared with macOS, so the
+  Windows shell offered the macOS-only stable `v0.1.80`. #717 offers only
+  releases that publish `graphcode-windows-x86_64.zip`, and reads 100 releases
+  per page. It was rubber-ducked; the blocking finding (a stale live gate) and
+  two non-blocking findings were fixed before merge.
+
+**Validation of the published bytes.**
+
+- `validate.ps1 -Task windows-shell -SkipTrayLive` on the identical tree
+  exited `VALIDATE_EXIT=0`: **55/55** sections, App **1170/1170**, scrubbed
+  startup **5/5**, real-daemon round trip, and the live UIA gate. That gate's
+  Check for Updates against the real feed now presents no offer.
+- `WindowsUpdateInstall.Live.Tests.ps1` passed against the real feed.
+- Targeted packaged check against the live feed, run twice each:
+  - Check for Updates in packaged beta25 opened the "GraphCode Update
+    Available" offer.
+  - Packaged beta26 reported "Stable updates up to date" with no offer.
+- The daemon, CLI and generated Setup script are byte-identical to beta25.
+- Repository and extracted setup verification each reported one PASS, and
+  packaged scrubbed startup passed **5/5**.
+- Source custody `f154d6f2c48a249d62902e2f976a27f3d21186faf4e6e03cb82067d5c2d2edae` was verified and restored offline with 43/43 LFS
+  objects.
+
+**Package.** `graphcode-windows-x86_64.zip` is 48,818,176 bytes, with
+SHA-256 `740d08dd1f1fd634cf976e1cef3d173598befb0f032b3f3ea6dbbf6cb8a11e38` and 50 files. Its payload-manifest SHA-256 is
+`d8946e93aaed928f99ec057008b8b5ba1b49c732cb6cb8666ffd562cf638130d`.
+
+| Executable | SHA-256 |
+| --- | --- |
+| shell | `71e549300ce6ea3e330b279c660d420642af4c54b465fdc2afd68d2a79f48f43` |
+| daemon | `1e0c3c8431349ad17f4ec543dc6e5d5e6455a3212e080102e19d359fd78f97a2` |
+| CLI | `4ba257d4841863b8a1ee956a069f4a7421ec7441d023725d91233b89ed32eb3c` |
+| zmx | `2fb9cfa2708483d890b7c0e17c5ae037deeaf8ddc8e87e07d56fe41379b76ca5` |
+
+**Publication check.**
+
+- The release is `prerelease=true`, and `releases/latest` remains `v0.1.80`.
+- GitHub's reported asset digest equals the qualified ZIP SHA-256.
+- A fresh `gh release download` hashed identically, and its extracted setup
+  verification passed.
+- The uploaded bytes are the ZIP verified locally. `release.ps1 -Publish` was
+  not used, because it rebuilds and zmx is not byte-reproducible.
+
+The release notes are the tester packet. They cover:
+
+- download and checksum, install, uninstall, and reinstall-to-update;
+- known limits: unsigned and SmartScreen, the tested profile, Copilot CLI
+  1.0.91 only, no screen-reader claim, 57/41 parity, out-of-scope features,
+  and #712;
+- the bug-report route.
+
+### Historical beta25 candidate
 
 The current replacement candidate is `64c5dc52297d08051adde93aea099e9c41abde63`. It is the squash merge of
 [#715](https://github.com/scgopi/GraphCode/pull/715), with parent
@@ -2143,14 +2217,14 @@ lease or equivalent authorized hosted evidence. No desktop available means a
 proof gap, not PASS; hosted server evidence must not be relabelled client proof.
 
 - [x] **Exact artifact:** candidate source
-  `64c5dc52297d08051adde93aea099e9c41abde63`, version/tag
-  `0.1.78-windows.beta25`, annotated tag object
-  `b7d6e73c8d5f27c4d2b7f7559b6ac38b63ebce97`, package SHA-256
-  `c65523b482ce3785a4d9f3dcef0d06207b9b7a0e4c8b1bf16f4008077ca88592`,
+  `09eda11abb6a876bad82cd9eb4103d81abc1fa3e`, version/tag
+  `0.1.78-windows.beta26`, annotated tag object
+  `0475c3818982110f4a502307dc9e0ec86f8b7d10`, package SHA-256
+  `740d08dd1f1fd634cf976e1cef3d173598befb0f032b3f3ea6dbbf6cb8a11e38`,
   50-file payload manifest SHA-256
-  `e7c051f737056940520ccca7ca2e2257522e3555cc00159d289bd7ba16cb4ce6`,
-  and provider provenance are recorded in
-  `GraphCode-DevBox-Handoff-0.1.78-windows.beta25`. Tag/source match. The
+  `d8946e93aaed928f99ec057008b8b5ba1b49c732cb6cb8666ffd562cf638130d`,
+  and provider provenance are recorded in the beta26 local record (no Dev Box
+  handoff was transferred for beta26; see its section). Tag/source match. The
   repository ZIP verifier and extracted standalone setup each reported exactly
   one PASS; the
   package explicitly declares `UNSIGNED (not code signed)`, records
@@ -2207,9 +2281,16 @@ proof gap, not PASS; hosted server evidence must not be relabelled client proof.
   steps, recovery locations and a bug-report route. Never ask testers to bypass
   security policy. Invite only after the core gates have actual evidence.
 
-The **Exact artifact** gate is complete for `0.1.78-windows.beta25`. The other **six** gates
-remain open and require evidence that source, hosted CI, and hidden-window
-tests cannot manufacture:
+The **Exact artifact** gate is complete for `0.1.78-windows.beta26`.
+
+- **Publication** was approved by the operator and done on 2026-10-13.
+- **Honest tester handoff:** the release notes cover the required content;
+  inviting testers is the operator's step.
+- **The five runtime gates** (installation and recovery, production core,
+  agent terminal, reachability and lifecycle, safe mutations) were reported
+  passed on the beta25 Dev Box run. They stay unchecked here until that return
+  bundle is reviewed and recorded. These gates require evidence that source,
+  hosted CI and hidden-window tests cannot manufacture:
 
 | Required external capability | Exact permission/evidence needed |
 |---|---|
@@ -2229,17 +2310,16 @@ is manual-dispatch only, checks out an **existing tag**, and defaults
 and produces `graphcode-windows-x86_64.zip` plus its `.sha256` sidecar.
 Checksums detect corruption; they do not authenticate the publisher.
 
-The completed local exact-artifact record is the unpublished Windows beta25
-candidate: source/tag `64c5dc52297d08051adde93aea099e9c41abde63` /
-`0.1.78-windows.beta25`, ZIP SHA-256
-`c65523b482ce3785a4d9f3dcef0d06207b9b7a0e4c8b1bf16f4008077ca88592`,
-source-custody ZIP SHA-256
-`37ee5d5f0fcd53c22dd37ffce4fcaacdcdc2a7d1c05c57ae9fea84ae8b4c7686`,
-and versioned handoff `GraphCode-DevBox-Handoff-0.1.78-windows.beta25`. The tag
-is local and unpushed, there is no matching release, and publication is false.
+The published Windows preview is `0.1.78-windows.beta26`: source/tag
+`09eda11abb6a876bad82cd9eb4103d81abc1fa3e`, ZIP SHA-256
+`740d08dd1f1fd634cf976e1cef3d173598befb0f032b3f3ea6dbbf6cb8a11e38`, source-custody ZIP SHA-256
+`f154d6f2c48a249d62902e2f976a27f3d21186faf4e6e03cb82067d5c2d2edae`. Its tag is pushed and its prerelease is
+<https://github.com/scgopi/GraphCode/releases/tag/0.1.78-windows.beta26>. It is the Dev Box-qualified beta25 plus #717 only.
+For the Dev Box-qualified beta25 and earlier candidates,
 README-FIRST requires restoration through the included
 `Restore-GraphCodeSource.ps1`; it forbids GitHub cloning and bare-bundle
-cloning for this custody path. The superseded beta1 through beta24 tags, ZIPs, handoffs and retained
+cloning for this custody path. The beta25 tag, ZIP and handoff stay as the Dev Box-qualified evidence for
+beta26 and remain unpublished. The superseded beta1 through beta24 tags, ZIPs, handoffs and retained
 failure evidence remain immutable; do not transfer or qualify them and do not
 delete or rewrite their records. The local Windows
 beta1 tag object remains retained unchanged, but its `0.1.78-beta1` name is
@@ -2329,9 +2409,9 @@ permission-bound; it should not start with another parity-row sweep:
    `64c5dc52297d08051adde93aea099e9c41abde63` was built through
    [#578](https://github.com/scgopi/GraphCode/pull/578)'s supported route
    (the #604 release-candidate guard was retired by #649) and includes #624,
-   #626, #628, #630, #633, #635, #638, #640-#643, #647, #649-#651, #654, #656, #658, #659, #662-#665, #667-#671, #674-#677, #679-#685, #687-#694, #696-#701, #703-#705, #707 and #715. Its independently reverified
-   LFS-aware custody ZIP and versioned handoff now exist; transfer and Dev Box
-   execution are still NotExecuted. After authorization, use the included
+   #626, #628, #630, #633, #635, #638, #640-#643, #647, #649-#651, #654, #656, #658, #659, #662-#665, #667-#671, #674-#677, #679-#685, #687-#694, #696-#701, #703-#705, #707 and #715. Its Dev Box run was reported passing by the operator on
+   2026-10-13 (return bundle not yet recorded here), and `0.1.78-windows.beta26`
+   (beta25 plus #717) is published as an invitation-only prerelease. After authorization, use the included
    restore script and the exact candidate Dev Box plan to run
    install → first launch → onboarding → connected Welcome → local project →
    one named authenticated backend → readable input/output → persisted reopen
@@ -2350,8 +2430,9 @@ permission-bound; it should not start with another parity-row sweep:
    future dump-backed diagnosis requires separate authorization and a new
    candidate if product code changes.
 3. **Keep the release gates honest:** **Exact artifact** is complete for
-   `0.1.78-windows.beta25`;
-   the other **six** gates remain open. The installed production-core result,
+   `0.1.78-windows.beta26`, and publication is done with operator approval.
+   The runtime gates stay unchecked until the beta25 Dev Box return bundle is
+   recorded. The installed production-core result,
    native input and destructive fixture permission, named authenticated backend
    authorization, handoff transfer and execution, Approval B, and publication
    permission are independent. A green
