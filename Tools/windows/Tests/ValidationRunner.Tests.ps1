@@ -783,6 +783,24 @@ function Test-MultiProjectProtocolContracts([string] $stubSource, [string] $gate
         nativeCalls=0;actualHistoricalALossReproduced=$false}
     }
   }
+  Invoke-MultiCase "prompt viewport resolved edit preserves actual FocusMouse ownership guard" {
+    $api=New-MultiSequencedEditMock
+    $null=$api.FocusMouse([IntPtr]42,[IntPtr]9904,@(100,110),4242,[long]0)
+    Assert-MultiCase ($api.PhaseState.focusClicks -eq 1 -and $api.hitReads -eq 1 -and
+      $api.state.hitRoot -eq [IntPtr]42 -and $api.state.hitPID -eq 4242) "resolved nested edit did not retain ownership/hit checks"
+    return "Actual FocusMouse ScriptMethod accepts an injected exact edit hit; no native focus/input"
+  }
+  foreach($viewportMiss in @("background","foreign-root")){
+    Invoke-MultiCase ("prompt viewport actual FocusMouse refuses " + $viewportMiss) -Negative {
+      $api=New-MultiSequencedEditMock
+      if($viewportMiss -ceq "background"){$api.state.hitChild=[IntPtr]9890}
+      else{$api.state.hitRoot=[IntPtr]99}
+      $caught=$null;try{$api.FocusMouse([IntPtr]42,[IntPtr]9904,@(100,110),4242,[long]0)|Out-Null}catch{$caught=$_}
+      Assert-MultiCase ($null -ne $caught -and $caught.Exception.ToString().Contains("MULTIPROJECT_EDIT_FOCUS:") -and
+        $api.PhaseState.focusClicks -eq 0) "viewport miss or foreign root became an edit input target"
+      return "Injected Hit refusal through actual FocusMouse ScriptMethod; no native WindowFromPoint or input"
+    }
+  }
   Invoke-MultiCase "already owned GUI edit focus uses zero focus input" {
     $api=New-MultiSequencedEditMock;$api.PhaseState.focus=[IntPtr]9904
     $null=Invoke-MultiProjectSequencedEdit ([IntPtr]42) 4242 "Alpha renamed" "Alpha renamed" -nativeApi $api
@@ -3943,6 +3961,172 @@ Start-Sleep -Seconds 60
     [System.Windows.Automation.AutomationElement].Assembly.Location,
     [System.Windows.Automation.AutomationEventArgs].Assembly.Location
   )
+  function Test-PromptControlLookup {
+  Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class PromptLookupFixture {
+  private delegate IntPtr WindowProc(IntPtr window, uint message, UIntPtr wparam, IntPtr lparam);
+  private static readonly WindowProc procedure = DefWindowProc;
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+  private struct WindowClass {
+    public uint Style;
+    public IntPtr Procedure;
+    public int ClassExtra, WindowExtra;
+    public IntPtr Instance, Icon, Cursor, Background;
+    public string Menu, Name;
+  }
+  [DllImport("user32.dll", EntryPoint = "DefWindowProcW")]
+  private static extern IntPtr DefWindowProc(IntPtr window, uint message, UIntPtr wparam, IntPtr lparam);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "RegisterClassW")]
+  private static extern ushort RegisterClass(ref WindowClass value);
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+  private static extern IntPtr GetModuleHandle(string name);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "CreateWindowExW")]
+  private static extern IntPtr CreateWindow(uint ex, string cls, string title, uint style,
+    int x, int y, int width, int height, IntPtr parent, IntPtr id, IntPtr instance, IntPtr parameter);
+  [DllImport("user32.dll")]
+  public static extern bool DestroyWindow(IntPtr window);
+  [DllImport("user32.dll")]
+  public static extern bool IsWindowVisible(IntPtr window);
+  [DllImport("user32.dll")]
+  private static extern bool SetWindowPos(IntPtr window, IntPtr after, int x, int y, int width, int height, uint flags);
+  public static void Place(IntPtr window, int x, int y, int width, int height) {
+    if (!SetWindowPos(window, IntPtr.Zero, x, y, width, height, 0x14))
+      throw new InvalidOperationException("Hidden lookup fixture placement failed.");
+  }
+  public static void Register(string name) {
+    var value = new WindowClass { Name = name, Instance = GetModuleHandle(null),
+      Procedure = Marshal.GetFunctionPointerForDelegate(procedure) };
+    if (RegisterClass(ref value) == 0)
+      throw new InvalidOperationException("Hidden lookup fixture class registration failed: " + Marshal.GetLastWin32Error());
+  }
+  public static IntPtr Create(string cls, IntPtr parent, int id) {
+    IntPtr result = CreateWindow(0, cls, "lookup fixture", parent == IntPtr.Zero ? 0u : 0x50000000u,
+      0, 0, 400, 300, parent, new IntPtr(id), GetModuleHandle(null), IntPtr.Zero);
+    if (result == IntPtr.Zero)
+      throw new InvalidOperationException("Hidden lookup fixture creation failed: " + Marshal.GetLastWin32Error());
+    return result;
+  }
+}
+'@
+  [PromptLookupFixture]::Register("GraphCodeWindowsDialog")
+  [PromptLookupFixture]::Register("GraphCodeWindowsDialogContent")
+  $lookupRoots = [Collections.Generic.List[IntPtr]]::new()
+  function New-PromptLookupRoot([string] $class) {
+    $window = [PromptLookupFixture]::Create($class, [IntPtr]::Zero, 0)
+    $lookupRoots.Add($window)
+    return $window
+  }
+  function Assert-PromptLookup([IntPtr] $parent, [int] $id, [IntPtr] $expected, [string] $name) {
+    $actual = [GraphCodeUiaGateState]::ControlById($parent, $id)
+    if ($actual -ne $expected) {
+      throw "RED: prompt lookup $name expected=$expected actual=$actual"
+    }
+    $script:promptLookupExecuted++
+  }
+  $script:promptLookupExecuted = 0
+  try {
+    $promptRoot = New-PromptLookupRoot "GraphCodeWindowsDialog"
+    $content = [PromptLookupFixture]::Create("GraphCodeWindowsDialogContent", $promptRoot, 0)
+    $edit = [PromptLookupFixture]::Create("EDIT", $content, 9904)
+    Assert-PromptLookup $promptRoot 9904 $edit "exact named direct viewport"
+    if ([PromptLookupFixture]::IsWindowVisible($promptRoot) -or
+        -not [GraphCodeUiaGateState]::SetEditTextById($promptRoot, 9904, "owned fixture") -or
+        [GraphCodeUiaGateState]::EditTextById($promptRoot, 9904) -cne "owned fixture") {
+      throw "RED: prompt lookup hidden nested write/read did not use the same control"
+    }
+    $script:promptLookupExecuted++
+    Assert-PromptLookup $promptRoot 9905 ([IntPtr]::Zero) "missing id"
+    if ([GraphCodeUiaGateState]::SetEditTextById($promptRoot, 9905, "wrong") -or
+        $null -ne [GraphCodeUiaGateState]::EditTextById($promptRoot, 9905)) {
+      throw "RED: prompt lookup missing id returned successful text"
+    }
+    $script:promptLookupExecuted++
+    $direct = [PromptLookupFixture]::Create("EDIT", $promptRoot, 9904)
+    Assert-PromptLookup $promptRoot 9904 $direct "direct-child precedence"
+    $wrongRoot = New-PromptLookupRoot "STATIC"
+    $wrongRootContent = [PromptLookupFixture]::Create("GraphCodeWindowsDialogContent", $wrongRoot, 0)
+    $null = [PromptLookupFixture]::Create("EDIT", $wrongRootContent, 9904)
+    Assert-PromptLookup $wrongRoot 9904 ([IntPtr]::Zero) "wrong root cannot opt in"
+    $wrongContainerRoot = New-PromptLookupRoot "GraphCodeWindowsDialog"
+    $wrongContainer = [PromptLookupFixture]::Create("STATIC", $wrongContainerRoot, 0)
+    $null = [PromptLookupFixture]::Create("EDIT", $wrongContainer, 9904)
+    Assert-PromptLookup $wrongContainerRoot 9904 ([IntPtr]::Zero) "wrong container ignored"
+    $namedContainer = [PromptLookupFixture]::Create("GraphCodeWindowsDialogContent", $wrongContainerRoot, 0)
+    Assert-PromptLookup $wrongContainerRoot 9904 ([IntPtr]::Zero) "same id in other sibling ignored"
+    $deeper = [PromptLookupFixture]::Create("STATIC", $namedContainer, 0)
+    $null = [PromptLookupFixture]::Create("EDIT", $deeper, 9904)
+    Assert-PromptLookup $wrongContainerRoot 9904 ([IntPtr]::Zero) "no deeper fallback"
+    $deepRoot = New-PromptLookupRoot "GraphCodeWindowsDialog"
+    $wrapper = [PromptLookupFixture]::Create("STATIC", $deepRoot, 0)
+    $deepContent = [PromptLookupFixture]::Create("GraphCodeWindowsDialogContent", $wrapper, 0)
+    $null = [PromptLookupFixture]::Create("EDIT", $deepContent, 9904)
+    Assert-PromptLookup $deepRoot 9904 ([IntPtr]::Zero) "named viewport must be direct"
+    Assert-PromptLookup ([IntPtr]::Zero) 9904 ([IntPtr]::Zero) "null parent"
+    if ($script:promptLookupExecuted -ne 11) { throw "RED: prompt lookup case count was not 11" }
+    Write-Host "Prompt lookup hidden native cases: $script:promptLookupExecuted passed"
+    $hitRoot = New-PromptLookupRoot "GraphCodeWindowsDialog"
+    $hitContent = [PromptLookupFixture]::Create("GraphCodeWindowsDialogContent", $hitRoot, 0)
+    [PromptLookupFixture]::Place($hitContent, 15, 20, 350, 250)
+    $hitEdit = [PromptLookupFixture]::Create("EDIT", $hitContent, 9904)
+    [PromptLookupFixture]::Place($hitEdit, 20, 25, 100, 24)
+    $editBounds = [GraphCodeUiaGateState]::WindowBounds($hitEdit)
+    $hitX = [int](($editBounds[0] + $editBounds[2])/2)
+    $hitY = [int](($editBounds[1] + $editBounds[3])/2)
+    if ([PromptLookupFixture]::IsWindowVisible($hitRoot) -or
+        [GraphCodeMultiProjectRenameNative]::ChildAt($hitRoot,$hitX,$hitY) -ne $hitEdit) {
+      throw "RED: prompt hit did not resolve nested edit in hidden named viewport"
+    }
+    $hitCases = 1
+    $contentBounds = [GraphCodeUiaGateState]::WindowBounds($hitContent)
+    if ([GraphCodeMultiProjectRenameNative]::ChildAt($hitRoot,$contentBounds[2]-10,$contentBounds[3]-10) -ne $hitContent) {
+      throw "RED: prompt viewport background became an edit hit"
+    }
+    $hitCases++
+    $plainRoot = New-PromptLookupRoot "STATIC"
+    $plainContent = [PromptLookupFixture]::Create("GraphCodeWindowsDialogContent", $plainRoot, 0)
+    $null = [PromptLookupFixture]::Create("EDIT", $plainContent, 9904)
+    $plainBounds = [GraphCodeUiaGateState]::WindowBounds($plainContent)
+    if ([GraphCodeMultiProjectRenameNative]::ChildAt($plainRoot,$plainBounds[0]+50,$plainBounds[1]+50) -ne $plainContent) {
+      throw "RED: prompt hit descended through wrong root class"
+    }
+    $hitCases++
+    $otherRoot = New-PromptLookupRoot "GraphCodeWindowsDialog"
+    $otherContent = [PromptLookupFixture]::Create("BUTTON", $otherRoot, 0)
+    $null = [PromptLookupFixture]::Create("EDIT", $otherContent, 9904)
+    $otherBounds = [GraphCodeUiaGateState]::WindowBounds($otherContent)
+    if ([GraphCodeMultiProjectRenameNative]::ChildAt($otherRoot,$otherBounds[0]+50,$otherBounds[1]+50) -ne $otherContent) {
+      throw "RED: prompt hit descended through wrong container class"
+    }
+    $hitCases++
+    $deepHitRoot = New-PromptLookupRoot "GraphCodeWindowsDialog"
+    $deepHitContent = [PromptLookupFixture]::Create("GraphCodeWindowsDialogContent", $deepHitRoot, 0)
+    $hitWrapper = [PromptLookupFixture]::Create("BUTTON", $deepHitContent, 0)
+    $null = [PromptLookupFixture]::Create("EDIT", $hitWrapper, 9904)
+    $deepBounds = [GraphCodeUiaGateState]::WindowBounds($hitWrapper)
+    if ([GraphCodeMultiProjectRenameNative]::ChildAt($deepHitRoot,$deepBounds[0]+50,$deepBounds[1]+50) -ne $hitWrapper) {
+      throw "RED: prompt hit recursively searched deeper descendants"
+    }
+    $hitCases++
+    $directRoot = New-PromptLookupRoot "GraphCodeWindowsDialog"
+    $directEdit = [PromptLookupFixture]::Create("EDIT", $directRoot, 9904)
+    $directBounds = [GraphCodeUiaGateState]::WindowBounds($directEdit)
+    if ([GraphCodeMultiProjectRenameNative]::ChildAt($directRoot,$directBounds[0]+50,$directBounds[1]+50) -ne $directEdit) {
+      throw "RED: prompt hit changed existing direct-child behavior"
+    }
+    $hitCases++
+    if ($hitCases -ne 6) { throw "RED: prompt hit case count was not 6" }
+    Write-Host "Prompt hit hidden native cases: $hitCases passed"
+  } finally {
+    foreach ($window in $lookupRoots) {
+      if (-not [PromptLookupFixture]::DestroyWindow($window)) {
+        throw "Prompt lookup fixture cleanup failed for $window"
+      }
+    }
+  }
+  }
+  Test-PromptControlLookup
   $goalCover = [int[][]]::new(1)
   $goalCover[0] = [int[]]@(84, 699, 763, 721)
   $goalRemainder = [GraphCodeUiaGateState]::SubtractCoveredRectangles(

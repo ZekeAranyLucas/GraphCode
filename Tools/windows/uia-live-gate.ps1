@@ -744,7 +744,7 @@ public static class GraphCodeUiaGateState {
     return true;
   }
   public static bool SetEditTextById(IntPtr parent, int controlId, string text) {
-    var edit = GetDlgItem(parent, controlId);
+    var edit = ControlById(parent, controlId);
     // Cross-process SetWindowText only updates the stored caption; WM_SETTEXT reaches the EDIT buffer.
     if (edit == IntPtr.Zero || SendMessageString(edit, 0x000C, UIntPtr.Zero, text) == IntPtr.Zero) return false;
     ulong command = ((ulong)0x0300 << 16) | (uint)controlId;
@@ -752,7 +752,7 @@ public static class GraphCodeUiaGateState {
     return true;
   }
   public static string EditTextById(IntPtr parent, int controlId) {
-    var edit = GetDlgItem(parent, controlId);
+    var edit = ControlById(parent, controlId);
     if (edit == IntPtr.Zero) return null;
     return EditBufferText(edit);
   }
@@ -881,7 +881,13 @@ public static class GraphCodeUiaGateState {
     return new[] { rect.Left, rect.Top, rect.Right, rect.Bottom };
   }
   public static IntPtr ControlById(IntPtr parent, int controlId) {
-    return parent == IntPtr.Zero ? IntPtr.Zero : GetDlgItem(parent, controlId);
+    if (parent == IntPtr.Zero) return IntPtr.Zero;
+    IntPtr direct = GetDlgItem(parent, controlId);
+    if (direct != IntPtr.Zero) return direct;
+    if (!String.Equals(ClassOf(parent), "GraphCodeWindowsDialog", StringComparison.Ordinal))
+      return IntPtr.Zero;
+    IntPtr content = FindWindowEx(parent, IntPtr.Zero, "GraphCodeWindowsDialogContent", null);
+    return content == IntPtr.Zero ? IntPtr.Zero : GetDlgItem(content, controlId);
   }
   public static ControlClick ClickScreenPoint(IntPtr target) {
     RECT rect;
@@ -1040,7 +1046,7 @@ public static class GraphCodeUiaGateState {
     LastEditClearExpected = LastEditClearSent = 0;
     LastEditTextExpected = LastEditTextSent = 0;
     LastEditUsedMessageFallback = false;
-    IntPtr edit = GetDlgItem(parent, controlId);
+    IntPtr edit = ControlById(parent, controlId);
     if (edit == IntPtr.Zero || !FocusControl(parent, edit)) return false;
     SendMessage(edit, 0x00B1, UIntPtr.Zero, new IntPtr(-1));
     var clear = new KeyInputRecord[2];
@@ -3914,6 +3920,8 @@ public static class GraphCodeMultiProjectRenameNative {
   [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr window, uint flags);
   [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(Point point);
   [DllImport("user32.dll")] private static extern IntPtr RealChildWindowFromPoint(IntPtr window, Point point);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode, EntryPoint="GetClassNameW")]
+  private static extern int GetClassName(IntPtr window, System.Text.StringBuilder name, int capacity);
   [DllImport("user32.dll", SetLastError=true)] private static extern bool GetClientRect(IntPtr window, out Rect rect);
   [DllImport("user32.dll", SetLastError=true)] private static extern bool ClientToScreen(IntPtr window, ref Point point);
   [DllImport("user32.dll", SetLastError=true)] private static extern bool ScreenToClient(IntPtr window, ref Point point);
@@ -3938,7 +3946,18 @@ public static class GraphCodeMultiProjectRenameNative {
   public static IntPtr ChildAt(IntPtr window, int x, int y) {
     var point = new Point { X=x, Y=y };
     if (!ScreenToClient(window, ref point)) throw new Win32Exception(Marshal.GetLastWin32Error(), "Rename ScreenToClient");
-    return RealChildWindowFromPoint(window, point);
+    IntPtr direct = RealChildWindowFromPoint(window, point);
+    var rootClass = new System.Text.StringBuilder(128);
+    var childClass = new System.Text.StringBuilder(128);
+    GetClassName(window, rootClass, rootClass.Capacity);
+    GetClassName(direct, childClass, childClass.Capacity);
+    if (!String.Equals(rootClass.ToString(), "GraphCodeWindowsDialog", StringComparison.Ordinal) ||
+        !String.Equals(childClass.ToString(), "GraphCodeWindowsDialogContent", StringComparison.Ordinal))
+      return direct;
+    var contentPoint = new Point { X=x, Y=y };
+    if (!ScreenToClient(direct, ref contentPoint))
+      throw new Win32Exception(Marshal.GetLastWin32Error(), "Rename content ScreenToClient");
+    return RealChildWindowFromPoint(direct, contentPoint);
   }
 }
 '@

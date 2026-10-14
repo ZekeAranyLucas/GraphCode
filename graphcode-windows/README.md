@@ -122,6 +122,15 @@ menu; Enter is not a standalone shortcut for it. Mutations are sent as
 correlated v2 daemon requests; daemon refusals remain visible as explicit status
 errors.
 
+Text prompts (`GraphCodeWindowsDialog`, including Rename, New Workspace and
+Save as Template) measure wrapped descriptions and labels with the current
+DPI font, fit their client area plus native frame within the monitor work area,
+and scroll only overflowing content above a fixed footer. Labels and the
+viewport paint opaque panel backgrounds when controls move. Hidden native tests
+cover geometry at injected 96/144/192 DPI, scroll/focus-notification routing and
+owned Unicode results; they do not establish rendered mixed-DPI, physical-keyboard
+or macOS visual parity. Other form and confirmation classes are unchanged.
+
 Edge editing queues one checked `updateEdge` command, never delete/recreate.
 The existing edge ID and endpoints stay fixed, and the daemon retains its current
 fire count. The editor owns the complete initial configuration across the modal,
