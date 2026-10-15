@@ -205,3 +205,113 @@ project root or lock, launches no product, changes no gate/workflow/TDD rule,
 and adds no screenshot pipeline. Literal canvas IDs observed under a future
 fixed project root are not portable across roots. Actual scenario authoring
 waits for independent production verification and human review.
+
+## G2-R1 capture-core repair and offline real-launch rehearsal
+
+`Tools\windows\UiCaptureDriver.psm1`, `Invoke-UiCapture.ps1`, and
+`Invoke-UiCaptureWorker.ps1` promote the **same A/cap driver lineage**, not a
+second capture engine. The module embeds only the required native fragments
+with source hashes and the repository's FSL-1.1-MIT provenance. Import compiles
+declarations; it does not invoke a desktop operation or the old live gate.
+Both real process-launch binders accept an empty argument array. The supervisor
+attempts `lease-release.json` from `finally`, including refused malformed leases,
+and preserves primary, cleanup, serialization, and write failures separately.
+A blocked receipt write remains a nonzero tooling failure, not successful release.
+
+Run the offline regression with existing PowerShell 7.5+ and installed MSVC:
+
+```powershell
+pwsh -NoProfile -File Tools\windows\Tests\UiCaptureDriver.Tests.ps1 `
+  -ScratchRoot C:\gcs\your-worker\capture-rehearsal
+```
+
+The scratch directory must be fresh and caller-owned. The test embeds the
+complete harmless console target source, uses the installed Visual Studio
+compiler without installing anything, and retains compiler/source/executable
+hashes, exact commands, logs, real process identities, and release receipts.
+`-LaunchContractOnly` selects the two real empty/nonempty argument tests;
+without it, the suite also checks offset-qualified UTC/90-second cleanup reserve,
+malformed/expired/future/overlong leases, target failure/timeout, guarded rollback,
+and real primary-plus-cleanup/receipt-write failures. The frozen five-scene,
+two-phase mocks remain **component regressions only**, with zero actual images.
+Their permissive app substitute is not launch evidence.
+
+The suite invokes this exact supervisor command shape in bounded child processes:
+
+```powershell
+pwsh -NoProfile -File Tools\windows\Invoke-UiCapture.ps1 `
+  -OwnedRoot C:\gcs\your-worker\case `
+  -OutputDirectory C:\gcs\your-worker\case\output `
+  -ExecutionMode NO_DESKTOP_REAL_LAUNCH_REHEARSAL `
+  -JobPath C:\gcs\your-worker\case\job.json -JobSha256 $jobHash `
+  -LeaseReceiptPath C:\gcs\your-worker\case\lease.json `
+  -LeaseReceiptSha256 $leaseHash
+```
+
+The generated job binds the harmless executable hash and exact argument vector;
+the separate rehearsal-only lease binds the job and control-source hashes.
+It explicitly denies desktop authorization. The same supervisor, worker,
+lease, real app-starter/wrapper/core, ownership, stream, and release paths run
+without mocks. Fresh output is initialized from explicit owned arguments
+**before** parsing lease data; an untrusted lease ID cannot choose a path.
+Refusal before a worker starts is `REFUSED_NO_WORKER`/`NO_WORKER_STARTED`,
+not an empty zero-survivor proof. Once launched, success requires actual kernel
+exit and bounded stdin/stdout/stderr completion. A failure preserves nonzero
+status even when cleanup succeeds.
+
+`ValidationRunner.Tests.ps1` registers exactly one child invocation and rejects
+missing/duplicate summaries, zero executed tests, mismatched pass counts, or
+nonzero failures before its final PASS. A run of that added block alone is
+**not** a run of the full ValidationRunner.
+
+This repair verifies no product UI, HWND/EDIT behavior, UIA, PrintWindow, pixels,
+input, native compatibility, WinApp tool, backend turn, parity claim, production
+scenario, or issue closure. Those paths are `NotExecuted` in the rehearsal.
+The existing live B capture guards remain separately lease/preflight-gated;
+these offline receipts grant no capture permission. Actual desktop use,
+broader G2 verification, and G3 replay remain separately approved work.
+
+The shared fixture-admission predicate derives the rewritten fixture hash from
+the exact lease-bound mapping and hashes the actual rewritten file. Both live
+callers retain the source hash, two-graph/ten-node contract, and per-graph owned
+project-path checks; copying the old fixture bytes to another root is not a
+relocation. Offline positive and negative data tests cover a fresh owned root,
+stale mapping hashes, mismatched fixture bytes, wrong mapping destinations,
+foreign embedded project paths, and refusal of preserved cap/lane roots.
+This does not create or approve a canonical production root.
+
+Only the harmless rehearsal target opts into redirected/closed stdin; live
+GraphCode, zmx seed, and peer launches keep their inherited stdin behavior.
+Trace-write I/O failures are retained as explicit errors, never successful
+evidence, and cannot bypass guarded cleanup or the final release attempt.
+
+The supervisor's real lease-deadline/worker-kill branch, its standalone
+`-TimeoutProbe`, and `Test-CapNativeBindings` (16 declared export bindings)
+remain `NotExecuted` by this offline suite. The target-timeout case proves a
+guarded target stop, not that distinct worker-deadline branch. The repaired
+report gate checks control hashes, case identities, and positive counts in
+lease-bound **report data**; it does not independently bind a product head or
+fixture, perform native compatibility checks, or establish approval. Those
+obligations remain with the separately authorized capture admission and
+WinApp/native-compatibility work. Existing hosted runner-contract step budgets
+are unchanged; the full runner plus child must fit those limits.
+
+The frozen B fixture's prefix must be rewritten at **every** JSON position,
+including node `worktreeBinding.path` values, not only the two project paths.
+Admission checks every drive-qualified string against the owned project root
+and compares the whole fixture with the source's complete prefix substitution.
+A partially rewritten witness is refused even if its mapping hash was supplied.
+
+Worker manifests and release receipts preserve separate cleanup failures and
+unreturned launch records (PID, creation time, executable, role and rollback
+errors). Missing, null, scalar, or nonempty worker cleanup/pending arrays make
+release `CLEANUP_UNPROVEN`; an empty returned-run list cannot prove zero
+survivors while an unreturned launch remains. The regression executes the
+actual release data guard, without creating an unsafe child or mocking the
+real launch path.
+
+A guarded termination waits on the retained kernel handle even when
+`TerminateProcess` fails because a process is already exiting. A positively
+signalled handle is distinguished from a requested termination. Normal guarded
+termination and genuinely exited handles run in the offline suite; the exact
+access-denied exit race is not forced and is not claimed as runtime-proven.
