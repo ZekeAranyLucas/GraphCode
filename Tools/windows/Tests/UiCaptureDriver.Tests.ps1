@@ -159,7 +159,8 @@ function Invoke-CapCaptureCommand {
         [string]$Name,
         [AllowEmptyCollection()][AllowEmptyString()][string[]]$Arguments = @(),
         [string]$Behavior = 'normal',
-        [string]$LeaseMutation = ''
+        [string]$LeaseMutation = '',
+        [string]$AdmissionMutation = ''
     )
     $owned = Join-Path $scratch "cases\$Name"
     $null = New-Item -ItemType Directory -Path $owned
@@ -174,6 +175,7 @@ function Invoke-CapCaptureCommand {
         rehearsalTarget = [ordered]@{ path = $exe; sha256 = $target.executableSha256
             arguments = @($Arguments); behavior = $Behavior; timeoutMilliseconds = 1000 }
     }
+    if ($AdmissionMutation) { $job = New-CapAdmissionJob -Owned $owned -Job $job -Mutation $AdmissionMutation }
     $job | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $jobPath -Encoding utf8NoBOM
     $jobHash = (Get-FileHash -LiteralPath $jobPath -Algorithm SHA256).Hash
     $now = [DateTime]::UtcNow
@@ -184,6 +186,20 @@ function Invoke-CapCaptureCommand {
         moduleSha256 = $sourceHashesBefore[$modulePath]; workerSha256 = $sourceHashesBefore[$workerPath]
         supervisorSha256 = $sourceHashesBefore[$supervisorPath]; preflightReceiptSha256 = $null
         grantedUtc = $now.AddSeconds(-1).ToString('o'); expiresUtc = $now.AddMinutes(5).ToString('o'); maxMinutes = 15
+    }
+    if ($AdmissionMutation) {
+        $lease.lane = $job.lane
+        $lease.base = $job.base
+        $lease.reviewedHead = $job.admission.reviewedHead
+        $lease.reviewAcceptanceSha256 = $job.admission.reviewAcceptance.sha256
+        $lease.equivalenceSha256 = $job.admission.equivalence.sha256
+        $lease.ciInventorySha256 = $job.admission.ci.sha256
+        $lease.ciRuns = $job.admission.ci.runs
+        foreach ($phase in @('before', 'after')) {
+            $lease["${phase}BuildReceiptSha256"] = $job.binaries[$phase].buildReceipt.sha256
+            $lease["${phase}BinarySha256"] = $job.binaries[$phase].sha256
+        }
+        if ($AdmissionMutation -eq 'lease-base') { $lease.base = '0' * 40 }
     }
     switch ($LeaseMutation) {
         'expired' { $lease.grantedUtc = $now.AddMinutes(-6).ToString('o'); $lease.expiresUtc = $now.AddSeconds(-1).ToString('o') }
@@ -216,6 +232,150 @@ function Invoke-CapCaptureCommand {
         receiptSha256 = if ($receipt) { (Get-FileHash -LiteralPath $receiptPath -Algorithm SHA256).Hash } else { $null }
         leaseSha256 = $leaseHash
     }
+}
+
+function Write-CapTestArtifact {
+    param([string]$Path, $Value)
+    $Value | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $Path -Encoding utf8NoBOM
+    return [ordered]@{ path = $Path; sha256 = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash }
+}
+
+function Invoke-CapTestGit {
+    param([string]$Repository, [string[]]$Arguments)
+    $output = @(& git -C $Repository @Arguments 2>&1)
+    if ($LASTEXITCODE -ne 0) { throw "Offline fixture Git failed: $($output -join [Environment]::NewLine)" }
+    return $output
+}
+
+function New-CapAdmissionJob {
+    param([string]$Owned, $Job, [string]$Mutation)
+    $repository = Join-Path $Owned 'source-repository'
+    $null = New-Item -ItemType Directory -Path $repository
+    $null = Invoke-CapTestGit $repository @('init', '--quiet')
+    $null = Invoke-CapTestGit $repository @('config', 'user.name', 'Offline capture fixture')
+    $null = Invoke-CapTestGit $repository @('config', 'user.email', 'fixture@example.invalid')
+    $null = Invoke-CapTestGit $repository @('config', 'core.autocrlf', 'false')
+    $null = New-Item -ItemType Directory -Path (Join-Path $repository 'graphcode-windows')
+    [IO.File]::WriteAllText((Join-Path $repository 'graphcode-windows\product.txt'), 'before')
+    $null = Invoke-CapTestGit $repository @('add', '.')
+    $null = Invoke-CapTestGit $repository @('commit', '--quiet', '-m', 'Offline before')
+    $base = [string](Invoke-CapTestGit $repository @('rev-parse', 'HEAD'))
+    [IO.File]::WriteAllText((Join-Path $repository 'graphcode-windows\product.txt'), 'reviewed after')
+    $null = Invoke-CapTestGit $repository @('commit', '--quiet', '-am', 'Offline reviewed product')
+    $reviewed = [string](Invoke-CapTestGit $repository @('rev-parse', 'HEAD'))
+    $null = New-Item -ItemType Directory -Path (Join-Path $repository 'Tools\windows') -Force
+    [IO.File]::WriteAllText((Join-Path $repository 'Tools\windows\Invoke-UiCapture.ps1'), '# Offline tooling-only delta')
+    if ($Mutation -in @('product-diff', 'omitted-product-diff')) {
+        [IO.File]::WriteAllText((Join-Path $repository 'graphcode-windows\product.txt'), 'UNREVIEWED product')
+    }
+    $null = Invoke-CapTestGit $repository @('add', '.')
+    $null = Invoke-CapTestGit $repository @('commit', '--quiet', '-m', 'Offline candidate')
+    $head = [string](Invoke-CapTestGit $repository @('rev-parse', 'HEAD'))
+    if ($Mutation -eq 'unrelated-base') {
+        $tree = [string](Invoke-CapTestGit $repository @('rev-parse', "$base`^{tree}"))
+        $base = [string](Invoke-CapTestGit $repository @('commit-tree', $tree, '-m', 'Offline unrelated base'))
+    }
+    $Job.head = $head
+    $Job.base = $base
+    if ($Mutation -eq 'lane-d') { $Job.lane = 'D' }
+    $Job.sourceRepository = $repository
+    $Job.binaries = [ordered]@{}
+    $buildInput = Join-Path $Owned 'build-input.c'
+    Copy-Item -LiteralPath $target.source -Destination $buildInput
+    foreach ($phase in @('before', 'after')) {
+        $commit = if ($phase -eq 'before') { $base } else { $head }
+        $archive = Join-Path $Owned "$phase.zip"
+        $sourceRoot = Join-Path $Owned "source-$phase"
+        $null = Invoke-CapTestGit $repository @('archive', '--format=zip', "--output=$archive", $commit)
+        Expand-Archive -LiteralPath $archive -DestinationPath $sourceRoot
+        $logPath = Join-Path $Owned "$phase-build.log"
+        [IO.File]::WriteAllText($logPath, 'OFFLINE_TEST_DATA: no product build was performed.')
+        $binary = Join-Path $Owned "$phase.exe"
+        Copy-Item -LiteralPath $target.executable -Destination $binary
+        [IO.File]::AppendAllText($binary, "OFFLINE_DATA_ONLY_PHASE_$phase")
+        $binaryHash = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash
+        $receipt = [ordered]@{
+            schemaVersion = 1; evidenceMode = 'OFFLINE_TEST_DATA_NOT_PRODUCT_BUILD'
+            sourceCommit = $commit; sourceTree = [string](Invoke-CapTestGit $repository @('rev-parse', "${commit}:graphcode-windows"))
+            sourceRoot = Join-Path $sourceRoot 'graphcode-windows'; sourceSubdirectory = 'graphcode-windows'
+            binaryBuiltAtSource = $commit
+            archive = [ordered]@{ path = $archive; sha256 = (Get-FileHash $archive -Algorithm SHA256).Hash }
+            log = [ordered]@{ path = $logPath; sha256 = (Get-FileHash $logPath -Algorithm SHA256).Hash }
+            executablePath = $binary; executableSha256 = $binaryHash
+            startedUtc = [DateTime]::UtcNow.AddSeconds(-5).ToString('o')
+            finishedUtc = [DateTime]::UtcNow.AddSeconds(-1).ToString('o')
+            exitCode = 0; command = 'OFFLINE_TEST_DATA: existing harmless fixture, not a product build'
+            inputs = @([ordered]@{ path = $buildInput; sha256 = $target.sourceSha256 })
+        }
+        $receipt.rawReceipt = Write-CapTestArtifact (Join-Path $Owned "$phase-raw-build.json") ([ordered]@{
+            sourceSha = $commit; builtAtSha = $commit; sourceTree = $receipt.sourceTree
+            sourceExportSha256 = $receipt.archive.sha256; executableSha256 = $receipt.executableSha256
+            exitCode = 0; startedUtc = $receipt.startedUtc; finishedUtc = $receipt.finishedUtc; command = $receipt.command
+        })
+        if ($phase -eq 'after' -and $Mutation -eq 'null-build') { $receipt.sourceCommit = $null }
+        if ($phase -eq 'after' -and $Mutation -eq 'stale-build') { $receipt.binaryBuiltAtSource = $base }
+        $Job.binaries[$phase] = [ordered]@{
+            path = $binary; sha256 = $binaryHash; source = $commit; binaryBuiltAtSource = $commit
+            buildReceipt = Write-CapTestArtifact (Join-Path $Owned "$phase-build.json") $receipt
+        }
+    }
+    $ci = [ordered]@{
+        schemaVersion = 1; evidenceMode = 'OFFLINE_TEST_DATA_NOT_LIVE_CI'
+        repository = 'scgopi/GraphCode'; head = $head
+        observedUtc = [DateTime]::UtcNow.ToString('o')
+        runs = @([ordered]@{
+            id = 123; run_attempt = 1; head_sha = $head; status = 'completed'; conclusion = 'success'
+            total_count = 1; jobs = @([ordered]@{
+                id = 456; run_id = 123; head_sha = $head; name = 'Offline synthetic context'
+                status = 'completed'; conclusion = 'success'; configuredSkip = $false
+            })
+        })
+    }
+    if ($Mutation -eq 'red-ci') {
+        $ci.runs[0].conclusion = 'failure'
+        $ci.runs[0].jobs[0].conclusion = 'failure'
+    }
+    if ($Mutation -eq 'ci-head') { $ci.runs[0].jobs[0].head_sha = $base }
+    if ($Mutation -eq 'empty-ci') { $ci.runs[0].jobs = @(); $ci.runs[0].total_count = 0 }
+    if ($Mutation -eq 'duplicate-ci') {
+        $ci.runs[0].jobs = @($ci.runs[0].jobs[0], $ci.runs[0].jobs[0])
+        $ci.runs[0].total_count = 2
+    }
+    if ($Mutation -eq 'source-bytes') { [IO.File]::AppendAllText((Join-Path $Owned 'source-after\graphcode-windows\product.txt'), 'DIRTY') }
+    if ($Mutation -eq 'binary-hash') { [IO.File]::AppendAllText($Job.binaries.after.path, 'MISMATCH') }
+    $Job.admission = [ordered]@{
+        schemaVersion = 1; reviewedHead = $reviewed
+        reviewAcceptance = Write-CapTestArtifact (Join-Path $Owned 'review.json') ([ordered]@{
+            schemaVersion = 1; verdict = 'ACCEPT'; reviewedHead = $reviewed; reviewedBase = $base
+            evidenceMode = 'OFFLINE_TEST_DATA_NOT_REVIEW'
+        })
+        equivalence = Write-CapTestArtifact (Join-Path $Owned 'equivalence.json') ([ordered]@{
+            schemaVersion = 1; reviewedHead = $reviewed; head = $head; reviewedBase = $base; base = $base
+            headDeltaPaths = @(Invoke-CapTestGit $repository @('diff', '--name-only', '--no-renames', $reviewed, $head))
+            baseDeltaPaths = @()
+        })
+        ci = Write-CapTestArtifact (Join-Path $Owned 'ci.json') $ci
+    }
+    $Job.admission.ci.runs = @([ordered]@{ id = 123; attempt = 1 })
+    if ($Mutation -eq 'omitted-product-diff') {
+        $proofPath = $Job.admission.equivalence.path
+        $proof = Get-Content -LiteralPath $proofPath -Raw | ConvertFrom-Json -DateKind String
+        $proof.headDeltaPaths = @($proof.headDeltaPaths | Where-Object { $_ -cne 'graphcode-windows/product.txt' })
+        $Job.admission.equivalence = Write-CapTestArtifact $proofPath $proof
+    }
+    if ($Mutation -eq 'phase-swap') {
+        Assert-CapTest ($Job.binaries.before.sha256 -cne $Job.binaries.after.sha256) 'Phase fixture binary hashes must differ.'
+        $before = [IO.File]::ReadAllBytes($Job.binaries.before.path)
+        $after = [IO.File]::ReadAllBytes($Job.binaries.after.path)
+        [IO.File]::WriteAllBytes($Job.binaries.before.path, $after)
+        [IO.File]::WriteAllBytes($Job.binaries.after.path, $before)
+    }
+    if ($Mutation -eq 'duplicate-json') {
+        $path = $Job.admission.ci.path
+        [IO.File]::WriteAllText($path, [IO.File]::ReadAllText($path).Insert(1, "`"head`":`"$head`","))
+        $Job.admission.ci.sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+    }
+    return $Job
 }
 
 function Assert-CapRehearsalSuccess {
@@ -252,6 +412,60 @@ function Assert-CapRehearsalSuccess {
 $target = $null
 try {
     $target = New-CapHarmlessTarget
+    if (-not $LaunchContractOnly) {
+        foreach ($mutation in @('accepted', 'lane-d', 'red-ci', 'binary-hash', 'product-diff',
+            'ci-head', 'empty-ci', 'source-bytes', 'lease-base', 'duplicate-ci', 'duplicate-json', 'null-build', 'stale-build',
+            'omitted-product-diff', 'phase-swap', 'unrelated-base')) {
+            Invoke-CapTest "lease-bound admission $mutation through actual capture command" {
+                $run = Invoke-CapCaptureCommand -Name "admission-$mutation" -AdmissionMutation $mutation
+                if ($mutation -in @('accepted', 'lane-d')) {
+                    $null = Assert-CapRehearsalSuccess -Run $run -Arguments @()
+                    foreach ($component in @('supervisor', 'worker')) {
+                        $trace = @(Get-Content (Join-Path $run.output "$component-calls.jsonl") |
+                            ForEach-Object { $_ | ConvertFrom-Json })
+                        Assert-CapTest (@($trace | Where-Object command -CEQ 'Assert-CapJobIdentity').Count -eq 1) `
+                            "Lease-bound identity was not checked by the actual $component."
+                    }
+                } else {
+                    $expected = switch ($mutation) {
+                        'red-ci' { 'CI run is not exact-head completed success' }
+                        'binary-hash' { 'binary hash mismatch' }
+                        'product-diff' { 'Non-equivalent product/provider/build input diff' }
+                        'ci-head' { 'CI context is not exact-head green' }
+                        'empty-ci' { 'CI inventory must contain a positive complete context count' }
+                        'source-bytes' { 'Fresh source bytes differ' }
+                        'lease-base' { 'Lease-bound job identity differs' }
+                        'duplicate-ci' { 'CI context is not exact-head green' }
+                        'duplicate-json' { 'Duplicate JSON field' }
+                        'null-build' { "field 'sourceCommit'" }
+                        'stale-build' { 'Fresh build provenance must name the exact phase source' }
+                        'omitted-product-diff' { 'Equivalence proof does not name the complete exact Git delta' }
+                        'phase-swap' { 'before binary hash mismatch' }
+                        'unrelated-base' { 'merge-base --is-ancestor' }
+                    }
+                    Assert-CapTest ($run.child.exitCode -ne 0 -and $null -ne $run.receipt -and
+                        $run.receipt.status -ceq 'REFUSED_NO_WORKER' -and -not $run.receipt.workerStarted -and
+                        $run.receipt.primaryFailure.Contains($expected) -and
+                        $run.receipt.leaseReceiptSha256 -ceq $run.leaseSha256 -and
+                        $run.receipt.cleanupState -ceq 'NO_WORKER_STARTED') `
+                        "Admission $mutation was not refused by the actual supervisor with its official release: $($run.child.stderr)"
+                }
+                return [ordered]@{ release = $run.receiptPath; sha256 = $run.receiptSha256
+                    status = $run.receipt.status; exit = $run.child.exitCode
+                    data = 'Synthetic CI/build/review controls; real Git, binaries, command, lease, worker and release; no product evidence' }
+            }
+        }
+    }
+    if (-not $LaunchContractOnly) {
+        Invoke-CapTest 'unsupported C D E scene adapters refuse independently of generic identity' {
+            foreach ($lane in @('C', 'D', 'E')) {
+                $null = Assert-CapRejects {
+                    Assert-CapSceneContract -Job ([pscustomobject]@{ lane = $lane; sceneAdapter = 'B_FIVE_SCENES_V1' })
+                } 'Unsupported scene adapter'
+            }
+            return 'Pure scene-contract refusal; no scene, UI, product or adapter ran.'
+        }
+    }
     Invoke-CapTest 'real capture command with nonempty arguments' {
         $arguments = [string[]]@('alpha', 'two words', 'quote"inside', 'trailing\')
         $run = Invoke-CapCaptureCommand -Name 'nonempty' -Arguments $arguments
@@ -452,6 +666,45 @@ try {
             $parameters.ExpectedMappingSha256 = (Get-FileHash -LiteralPath $mappingPath -Algorithm SHA256).Hash
             $null = Assert-CapRejects { Assert-CapFixtureMapping @parameters } 'owned project path'
             return 'Actual shared root/source/mapping predicates only; no product binary, HWND, native compatibility, or live capture was executed.'
+        }
+        Invoke-CapTest 'actual journal reader permits worker atomic replacement while retaining its snapshot' {
+            foreach ($definition in @(
+                @($supervisorPath, 'Open-CapJournalRead'),
+                @($workerPath, 'Write-CapJsonAtomic')
+            )) {
+                $ast = [Management.Automation.Language.Parser]::ParseInput(
+                    [IO.File]::ReadAllText($definition[0]), [ref]$null, [ref]$null)
+                $function = $ast.Find({ param($node)
+                    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $definition[1]
+                }, $true)
+                Assert-CapTest ($null -ne $function) "Actual journal function missing: $($definition[1])"
+                . ([scriptblock]::Create($function.Extent.Text))
+            }
+            $directory = Join-Path $scratch 'journal-sharing-component'
+            $null = New-Item -ItemType Directory -Path $directory
+            $path = Join-Path $directory 'process-journal.json'
+            Write-CapJsonAtomic -Path $path -Value ([ordered]@{ version = 1; componentOnly = $true; cleanupComplete = $false })
+            $stream = Open-CapJournalRead -Path $path
+            try {
+                Write-CapJsonAtomic -Path $path -Value ([ordered]@{
+                    version = 2; componentOnly = $true; cleanupComplete = $true
+                    ownedProcessSurvivors = @(); pendingLaunchesRemaining = @(); cleanupFailures = @()
+                })
+                $reader = [IO.StreamReader]::new($stream)
+                try { $snapshot = $reader.ReadToEnd() | ConvertFrom-Json }
+                finally { $reader.Dispose() }
+                $freshStream = Open-CapJournalRead -Path $path
+                try {
+                    $freshReader = [IO.StreamReader]::new($freshStream)
+                    try { $current = $freshReader.ReadToEnd() | ConvertFrom-Json }
+                    finally { $freshReader.Dispose() }
+                } finally { $freshStream.Dispose() }
+                Assert-CapTest ($snapshot.version -eq 1 -and -not $snapshot.cleanupComplete -and
+                    $current.version -eq 2 -and $current.cleanupComplete -and $current.ownedProcessSurvivors.Count -eq 0 -and
+                    $current.pendingLaunchesRemaining.Count -eq 0 -and $current.cleanupFailures.Count -eq 0) `
+                    'Atomic replacement lost the held snapshot or a fresh read mistook it for completed cleanup.'
+            } finally { $stream.Dispose() }
+            return 'Actual supervisor reader and actual worker atomic writer; held file I/O only, no process, lease or GUI mock.'
         }
         Invoke-CapTest 'actual rehearsal data satisfies the repaired report gate and refuses stale proof' {
             $source = [IO.File]::ReadAllText($supervisorPath)
