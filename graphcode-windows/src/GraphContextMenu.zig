@@ -18,8 +18,8 @@ pub const NodeTarget = struct {
 pub const BackgroundTarget = struct {
     project_path: []const u8,
     local_filesystem: bool,
-    can_create_edge: bool,
     worktrees_available: bool = true,
+    reclaimable_worktrees: ?usize = null,
 };
 
 pub const EdgeTarget = struct {
@@ -35,6 +35,7 @@ pub const ProjectTarget = struct {
     path: []const u8,
     remote: bool,
     worktrees_available: bool = true,
+    reclaimable_worktrees: ?usize = null,
 };
 
 pub const Target = union(enum) {
@@ -68,7 +69,6 @@ pub const Action = enum {
     mark_entry,
     edit_edge,
     delete_edge,
-    create_edge,
     open_quick_chat,
     rename_quick_chat,
     delete_quick_chat,
@@ -122,7 +122,6 @@ const ids = struct {
     const mark_entry = 5112;
     const edit_edge = 5110;
     const delete_edge = 5111;
-    const create_edge = 5120;
     const open_quick_chat = 5130;
     const rename_quick_chat = 5131;
     const delete_quick_chat = 5132;
@@ -156,13 +155,19 @@ pub fn moveProjectMenuItem() MoveProjectMenuItem {
     return .{ .enabled = Wire.supportsProjectRelocation() };
 }
 
-pub const NodeMenuItem = struct {
+pub const NodeMenuCommand = struct {
     id: usize = 0,
     text: []const u8 = "",
     enabled: bool = true,
 };
 
-pub fn newChildNodeMenuItem(node: NodeTarget) ?NodeMenuItem {
+pub const NodeMenuItem = union(enum) {
+    command: NodeMenuCommand,
+    separator,
+    promotion_submenu,
+};
+
+pub fn newChildNodeMenuItem(node: NodeTarget) ?NodeMenuCommand {
     if (node.resolved) return null;
     return .{ .id = ids.new_child_node, .text = "New Child Node...", .enabled = node.can_create_child };
 }
@@ -171,41 +176,53 @@ pub const NodeMenuPlan = struct {
     items: [15]NodeMenuItem = undefined,
     len: usize = 0,
 
-    fn add(self: *NodeMenuPlan, item: NodeMenuItem) void {
-        self.items[self.len] = item;
+    fn addCommand(self: *NodeMenuPlan, item: NodeMenuCommand) void {
+        self.items[self.len] = .{ .command = item };
+        self.len += 1;
+    }
+
+    fn addSeparator(self: *NodeMenuPlan) void {
+        self.items[self.len] = .separator;
+        self.len += 1;
+    }
+
+    fn addPromotionSubmenu(self: *NodeMenuPlan) void {
+        self.items[self.len] = .promotion_submenu;
         self.len += 1;
     }
 };
 
 pub fn nodeMenuPlan(node: NodeTarget) NodeMenuPlan {
     var plan = NodeMenuPlan{};
-    plan.add(.{ .id = ids.open_terminal, .text = "Open Terminal" });
-    if (newChildNodeMenuItem(node)) |item| plan.add(item);
-    if (node.unwired) {
-        plan.add(.{ .id = ids.wire_node, .text = "Wire it up" });
-        plan.add(.{ .id = ids.mark_entry, .text = "Mark as entry" });
-        plan.add(.{});
-    }
+    plan.addCommand(.{ .id = ids.open_terminal, .text = "Open Terminal" });
+    if (newChildNodeMenuItem(node)) |item| plan.addCommand(item);
     if (node.composite) {
-        plan.add(.{ .id = ids.open_composite, .text = "Open Group" });
-        plan.add(.{ .id = ids.pilot_composite, .text = "Pilot Once" });
-        plan.add(.{ .id = ids.arm_composite, .text = "Arm Schedule", .enabled = node.can_arm });
-        plan.add(.{});
+        plan.addCommand(.{ .id = ids.open_composite, .text = "Open Group" });
+        plan.addCommand(.{ .id = ids.pilot_composite, .text = "Pilot Once…" });
+        plan.addCommand(.{ .id = ids.arm_composite, .text = "Arm Schedule", .enabled = node.can_arm });
+    } else if (node.sketch) {
+        plan.addPromotionSubmenu();
     }
-    plan.add(.{ .id = ids.edit_node, .text = "Edit Details..." });
-    plan.add(.{ .id = ids.save_node_template, .text = "Save as Template..." });
-    if (node.follows_template) plan.add(.{ .id = ids.detach_template, .text = "Detach from Template" });
-    plan.add(.{ .id = ids.rename_node, .text = "Rename...\tF2" });
-    if (!node.resolved) plan.add(.{ .id = ids.stop_node, .text = "Stop\tCtrl+S" });
-    plan.add(.{ .id = ids.delete_node, .text = "Delete Loop...\tDelete" });
+    plan.addCommand(.{ .id = ids.rename_node, .text = "Rename...\tF2" });
+    plan.addCommand(.{ .id = ids.save_node_template, .text = "Save as Template..." });
+    if (node.follows_template) plan.addCommand(.{ .id = ids.detach_template, .text = "Detach from Template" });
+    if (!node.resolved) plan.addCommand(.{ .id = ids.stop_node, .text = "Stop Loop\tCtrl+S" });
+    plan.addSeparator();
+    plan.addCommand(.{ .id = ids.edit_node, .text = "Edit Details..." });
+    if (node.unwired) {
+        plan.addCommand(.{ .id = ids.wire_node, .text = "Wire it up" });
+        plan.addCommand(.{ .id = ids.mark_entry, .text = "Mark as entry" });
+    }
+    plan.addSeparator();
+    plan.addCommand(.{ .id = ids.delete_node, .text = "Delete Loop...\tDelete" });
     return plan;
 }
 
 pub const PromotionItem = struct { id: usize, text: []const u8, action: Action };
 const promotion_items = [_]PromotionItem{
-    .{ .id = ids.promote_goal, .text = "Goal - asks for a done check", .action = .promote_goal },
-    .{ .id = ids.promote_turn, .text = "Turn - asks where to pause", .action = .promote_turn },
-    .{ .id = ids.promote_timed, .text = "Timed - asks for a cadence", .action = .promote_timed },
+    .{ .id = ids.promote_goal, .text = "Goal — asks for a done check", .action = .promote_goal },
+    .{ .id = ids.promote_turn, .text = "Turn — asks where to pause", .action = .promote_turn },
+    .{ .id = ids.promote_timed, .text = "Timed — asks for a cadence", .action = .promote_timed },
 };
 
 pub fn promotionItems(node: NodeTarget) []const PromotionItem {
@@ -253,19 +270,27 @@ fn buildMenu(target: Target) c.HMENU {
     switch (target) {
         .background => |background| {
             if (!std.mem.eql(u8, background.project_path, "graphcode://global")) {
-                appendEnabled(menu, ids.inspect_project_worktrees, "Worktrees...", background.local_filesystem and background.worktrees_available);
+                if (!appendWorktreesMenuItem(
+                    menu,
+                    background.reclaimable_worktrees,
+                    background.local_filesystem and background.worktrees_available,
+                )) {
+                    _ = c.DestroyMenu(menu);
+                    return null;
+                }
                 appendEnabled(menu, ids.project_settings, "Project Settings...", background.local_filesystem and background.worktrees_available);
                 appendEnabled(menu, ids.reveal_project, "Show in Explorer", background.local_filesystem);
-                separator(menu);
             }
-            appendEnabled(menu, ids.create_edge, "Create Edge", background.can_create_edge);
         },
         .quick_chats => append(menu, ids.new_quick_chat, "New Chat"),
         .project => |project| {
             append(menu, ids.open_project, "Open Project");
             append(menu, ids.new_project_loop, "New Loop...\tCtrl+N");
             separator(menu);
-            appendEnabled(menu, ids.inspect_project_worktrees, "Worktrees...", project.worktrees_available);
+            if (!appendWorktreesMenuItem(menu, project.reclaimable_worktrees, project.worktrees_available)) {
+                _ = c.DestroyMenu(menu);
+                return null;
+            }
             appendEnabled(menu, ids.project_settings, "Project Settings...", project.worktrees_available);
             if (project.remote)
                 append(menu, ids.remote_project_info, "Remote Connection Info")
@@ -283,24 +308,34 @@ fn buildMenu(target: Target) c.HMENU {
         },
         .node => |node| {
             const plan = nodeMenuPlan(node);
-            for (plan.items[0..plan.len]) |item| {
-                if (item.id == 0) separator(menu) else appendEnabled(menu, item.id, item.text, item.enabled);
-                if (item.id == ids.edit_node) {
+            for (plan.items[0..plan.len]) |item| switch (item) {
+                .command => |command_item| appendEnabled(menu, command_item.id, command_item.text, command_item.enabled),
+                .separator => separator(menu),
+                .promotion_submenu => {
                     const items = promotionItems(node);
-                    if (items.len != 0) {
-                        const submenu = c.CreatePopupMenu() orelse {
-                            _ = c.DestroyMenu(menu);
-                            return null;
-                        };
-                        for (items) |promotion_item| appendEnabled(submenu, promotion_item.id, promotion_item.text, promotionEnabled(node));
-                        if (c.AppendMenuW(menu, c.MF_POPUP | c.MF_STRING, @intFromPtr(submenu), std.unicode.utf8ToUtf16LeStringLiteral("Promote to...").ptr) == 0) {
-                            _ = c.DestroyMenu(submenu);
-                            _ = c.DestroyMenu(menu);
-                            return null;
-                        }
+                    const submenu = c.CreatePopupMenu() orelse {
+                        _ = c.DestroyMenu(menu);
+                        return null;
+                    };
+                    if (!appendDisabledHeading(submenu, "Keep the session, add a shape")) {
+                        _ = c.DestroyMenu(submenu);
+                        _ = c.DestroyMenu(menu);
+                        return null;
+                    }
+                    for (items) |promotion_item| appendEnabled(submenu, promotion_item.id, promotion_item.text, promotionEnabled(node));
+                    const title = toWide("Promote to…") orelse {
+                        _ = c.DestroyMenu(submenu);
+                        _ = c.DestroyMenu(menu);
+                        return null;
+                    };
+                    defer std.heap.c_allocator.free(title);
+                    if (c.AppendMenuW(menu, c.MF_POPUP | c.MF_STRING, @intFromPtr(submenu), title.ptr) == 0) {
+                        _ = c.DestroyMenu(submenu);
+                        _ = c.DestroyMenu(menu);
+                        return null;
                     }
                 }
-            }
+            };
         },
         .edge => {
             append(menu, ids.edit_edge, "Edit Edge...");
@@ -311,6 +346,10 @@ fn buildMenu(target: Target) c.HMENU {
             append(menu, ids.rename_quick_chat, "Rename...\tCtrl+Shift+Q");
             append(menu, ids.delete_quick_chat, "Delete Chat...\tCtrl+Shift+Delete");
         },
+    }
+    if (c.GetMenuItemCount(menu) == 0) {
+        _ = c.DestroyMenu(menu);
+        return null;
     }
     return menu;
 }
@@ -343,7 +382,6 @@ fn actionForCommand(command: c_int) Action {
         ids.mark_entry => .mark_entry,
         ids.edit_edge => .edit_edge,
         ids.delete_edge => .delete_edge,
-        ids.create_edge => .create_edge,
         ids.open_quick_chat => .open_quick_chat,
         ids.rename_quick_chat => .rename_quick_chat,
         ids.delete_quick_chat => .delete_quick_chat,
@@ -375,6 +413,25 @@ fn appendEnabled(menu: c.HMENU, id: usize, text: []const u8, enabled: bool) void
     _ = c.AppendMenuW(menu, flags, id, wide.ptr);
 }
 
+fn appendWorktreesMenuItem(menu: c.HMENU, reclaimable: ?usize, enabled: bool) bool {
+    var buffer: [64]u8 = undefined;
+    const text = if (reclaimable) |count| blk: {
+        if (count == 0) break :blk "Worktrees...";
+        break :blk std.fmt.bufPrint(&buffer, "Worktrees... {d}", .{count}) catch return false;
+    } else "Worktrees...";
+    const wide = toWide(text) orelse return false;
+    defer std.heap.c_allocator.free(wide);
+    var flags: c.UINT = @intCast(c.MF_STRING);
+    if (!enabled) flags |= @intCast(c.MF_GRAYED);
+    return c.AppendMenuW(menu, flags, ids.inspect_project_worktrees, wide.ptr) != 0;
+}
+
+fn appendDisabledHeading(menu: c.HMENU, text: []const u8) bool {
+    const wide = toWide(text) orelse return false;
+    defer std.heap.c_allocator.free(wide);
+    return c.AppendMenuW(menu, c.MF_STRING | c.MF_GRAYED, 0, wide.ptr) != 0;
+}
+
 fn separator(menu: c.HMENU) void {
     _ = c.AppendMenuW(menu, c.MF_SEPARATOR, 0, null);
 }
@@ -393,6 +450,214 @@ fn toWide(text: []const u8) ?[]u16 {
 
 const std = @import("std");
 
+const ExpectedMenuItem = struct {
+    id: ?c.UINT = null,
+    text: []const u16 = &.{},
+    enabled: bool = true,
+    separator: bool = false,
+    submenu: bool = false,
+    record_raw_state: bool = false,
+    record_submenu_id: bool = false,
+};
+
+const NativeMenuItemSnapshot = struct {
+    id: c.UINT,
+    text: []const u16,
+    item_type: c.UINT,
+    state: c.UINT,
+    submenu: c.HMENU,
+    storage: []u16,
+};
+
+const max_native_menu_caption = 256;
+
+fn readNativeMenuItem(
+    menu: c.HMENU,
+    position: c.UINT,
+    allocator: std.mem.Allocator,
+) !NativeMenuItemSnapshot {
+    var query = std.mem.zeroes(c.MENUITEMINFOW);
+    query.cbSize = @intCast(@sizeOf(c.MENUITEMINFOW));
+    query.fMask = c.MIIM_STRING;
+    if (c.GetMenuItemInfoW(menu, position, c.TRUE, &query) == 0)
+        return error.MenuItemStringQueryFailed;
+
+    const text_len: usize = @intCast(query.cch);
+    if (text_len > max_native_menu_caption) return error.MenuCaptionTooLong;
+    const storage = try allocator.alloc(u16, text_len + 1);
+    errdefer allocator.free(storage);
+    @memset(storage, 0);
+
+    var item = std.mem.zeroes(c.MENUITEMINFOW);
+    item.cbSize = @intCast(@sizeOf(c.MENUITEMINFOW));
+    item.fMask = c.MIIM_ID | c.MIIM_FTYPE | c.MIIM_STATE | c.MIIM_SUBMENU | c.MIIM_STRING;
+    item.dwTypeData = storage.ptr;
+    item.cch = @intCast(storage.len);
+    if (c.GetMenuItemInfoW(menu, position, c.TRUE, &item) == 0)
+        return error.MenuItemReadFailed;
+    if (item.cch > text_len) return error.MenuCaptionTruncated;
+    if (item.cch != text_len) return error.MenuCaptionChangedDuringRead;
+
+    return .{
+        .id = item.wID,
+        .text = storage[0..text_len],
+        .item_type = item.fType,
+        .state = item.fState,
+        .submenu = item.hSubMenu,
+        .storage = storage,
+    };
+}
+
+fn expectNativeMenu(menu: c.HMENU, expected: []const ExpectedMenuItem) !void {
+    const count = c.GetMenuItemCount(menu);
+    if (count < 0) return error.MenuCountQueryFailed;
+    try std.testing.expectEqual(expected.len, @as(usize, @intCast(count)));
+    for (expected, 0..) |item, index| {
+        const native = try readNativeMenuItem(menu, @intCast(index), std.testing.allocator);
+        defer std.testing.allocator.free(native.storage);
+        const is_separator = native.item_type & c.MFT_SEPARATOR != 0;
+        try std.testing.expectEqual(item.separator, is_separator);
+        if (item.id) |expected_id| try std.testing.expectEqual(expected_id, native.id);
+        try std.testing.expectEqualSlices(u16, item.text, native.text);
+        const enabled = !is_separator and native.state & (c.MFS_GRAYED | c.MFS_DISABLED) == 0;
+        try std.testing.expectEqual(if (item.separator) false else item.enabled, enabled);
+        try std.testing.expectEqual(item.submenu, native.submenu != null);
+        if (item.record_raw_state) {
+            std.debug.print("semantic fallback separator position={d} raw-state=0x{x}\n", .{ index, native.state });
+        }
+        if (item.record_submenu_id) {
+            std.debug.print("semantic fallback submenu position={d} observed-native-id={d}\n", .{ index, native.id });
+        }
+    }
+}
+
+fn expectNativeMenuCounted(menu: c.HMENU, expected: []const ExpectedMenuItem, observations: *usize) !void {
+    try expectNativeMenu(menu, expected);
+    observations.* += expected.len;
+}
+
+const AttachedTestMenu = struct {
+    root: c.HMENU,
+    popup: c.HMENU,
+};
+
+fn attachTestPopup(hwnd: c.HWND, popup: c.HMENU) !AttachedTestMenu {
+    const root = c.CreateMenu() orelse {
+        _ = c.DestroyMenu(popup);
+        return error.MenuCreationFailed;
+    };
+    var root_owns_popup = false;
+    var attached_to_window = false;
+    errdefer {
+        if (attached_to_window) _ = c.SetMenu(hwnd, null);
+        if (root_owns_popup) {
+            if (c.RemoveMenu(root, 0, c.MF_BYPOSITION) != 0) {
+                _ = c.DestroyMenu(popup);
+            }
+            _ = c.DestroyMenu(root);
+        } else {
+            _ = c.DestroyMenu(root);
+            _ = c.DestroyMenu(popup);
+        }
+    }
+    if (c.AppendMenuW(root, c.MF_POPUP | c.MF_STRING, @intFromPtr(popup), std.unicode.utf8ToUtf16LeStringLiteral("Test").ptr) == 0)
+        return error.MenuInstallFailed;
+    root_owns_popup = true;
+    if (c.SetMenu(hwnd, root) == 0) return error.MenuInstallFailed;
+    attached_to_window = true;
+    const installed_root = c.GetMenu(hwnd) orelse return error.MenuLookupFailed;
+    const installed_popup = c.GetSubMenu(installed_root, 0) orelse return error.MenuLookupFailed;
+    if (installed_popup != popup) return error.MenuInstallMismatch;
+    return .{ .root = root, .popup = installed_popup };
+}
+
+fn detachTestPopup(hwnd: c.HWND, attached: AttachedTestMenu) bool {
+    var succeeded = c.SetMenu(hwnd, null) != 0;
+    if (c.RemoveMenu(attached.root, 0, c.MF_BYPOSITION) == 0) {
+        _ = c.DestroyMenu(attached.root);
+        return false;
+    }
+    if (c.DestroyMenu(attached.popup) == 0) succeeded = false;
+    if (c.DestroyMenu(attached.root) == 0) succeeded = false;
+    return succeeded;
+}
+
+fn expectBuiltMenuOnHiddenWindow(
+    hwnd: c.HWND,
+    target: Target,
+    expected: []const ExpectedMenuItem,
+    observations: *usize,
+) !void {
+    const popup = buildMenu(target) orelse return error.MenuCreationFailed;
+    const attached = try attachTestPopup(hwnd, popup);
+    defer std.debug.assert(detachTestPopup(hwnd, attached));
+    try expectNativeMenuCounted(attached.popup, expected, observations);
+}
+
+const DisposableMenuItem = struct {
+    id: c.UINT = 0,
+    caption: []const u8 = "",
+    enabled: bool = true,
+    separator: bool = false,
+};
+
+fn appendDisposableMenuItem(menu: c.HMENU, item: DisposableMenuItem) !void {
+    if (item.separator) {
+        if (c.AppendMenuW(menu, c.MF_SEPARATOR, 0, null) == 0) return error.MenuAppendFailed;
+        return;
+    }
+    const wide = toWide(item.caption) orelse return error.CaptionConversionFailed;
+    defer std.heap.c_allocator.free(wide);
+    const flags: c.UINT = if (item.enabled) c.MF_STRING else c.MF_STRING | c.MF_GRAYED;
+    if (c.AppendMenuW(menu, flags, item.id, wide.ptr) == 0) return error.MenuAppendFailed;
+}
+
+fn expectDisposableMenuRejected(
+    hwnd: c.HWND,
+    actual: []const DisposableMenuItem,
+    expected: []const ExpectedMenuItem,
+) !void {
+    const popup = c.CreatePopupMenu() orelse return error.MenuCreationFailed;
+    const attached = try attachTestPopup(hwnd, popup);
+    defer std.debug.assert(detachTestPopup(hwnd, attached));
+    for (actual) |item| try appendDisposableMenuItem(attached.popup, item);
+    try std.testing.expectError(error.TestExpectedEqual, expectNativeMenu(attached.popup, expected));
+}
+
+fn expectBuiltMenuRejected(
+    hwnd: c.HWND,
+    target: Target,
+    removed_command: c.UINT,
+    expected: []const ExpectedMenuItem,
+) !void {
+    const popup = buildMenu(target) orelse return error.MenuCreationFailed;
+    const attached = try attachTestPopup(hwnd, popup);
+    defer std.debug.assert(detachTestPopup(hwnd, attached));
+    if (c.RemoveMenu(attached.popup, removed_command, c.MF_BYCOMMAND) == 0)
+        return error.MenuMutationFailed;
+    try std.testing.expectError(error.TestExpectedEqual, expectNativeMenu(attached.popup, expected));
+}
+
+fn expectNativeMenuItem(menu: c.HMENU, id: c.UINT, text: []const u16, enabled: bool) !void {
+    const state = c.GetMenuState(menu, id, c.MF_BYCOMMAND);
+    try std.testing.expect(state != std.math.maxInt(c.UINT));
+    try std.testing.expectEqual(enabled, state & (c.MF_GRAYED | c.MF_DISABLED) == 0);
+    var caption: [128]u16 = undefined;
+    const length = c.GetMenuStringW(menu, id, &caption, caption.len, c.MF_BYCOMMAND);
+    try std.testing.expectEqualSlices(u16, text, caption[0..@intCast(length)]);
+}
+
+fn expectWorktreesMenuItem(menu: c.HMENU, count: usize, enabled: bool) !void {
+    var buffer: [64]u8 = undefined;
+    const caption = if (count == 0)
+        "Worktrees..."
+    else
+        try std.fmt.bufPrint(&buffer, "Worktrees... {d}", .{count});
+    const wide = toWide(caption) orelse return error.CaptionConversionFailed;
+    defer std.heap.c_allocator.free(wide);
+    try expectNativeMenuItem(menu, ids.inspect_project_worktrees, wide[0..caption.len], enabled);
+}
+
 test "custody child menu plan is unresolved-only and uses its reserved command" {
     const target = NodeTarget{ .project_path = "B", .id = "11111111-1111-4111-8111-111111111111" };
     const item = newChildNodeMenuItem(target).?;
@@ -407,8 +672,8 @@ test "custody child menu plan is unresolved-only and uses its reserved command" 
 }
 
 test "custody child node menu plan preserves existing items when creation is unavailable" {
-    const expected_unresolved = [_]usize{ 5104, 5119, 5109, 5112, 0, 5113, 5107, 5108, 0, 5100, 5114, 5115, 5101, 5102, 5103 };
-    const expected_resolved = [_]usize{ 5104, 5109, 5112, 0, 5113, 5107, 5108, 0, 5100, 5114, 5115, 5101, 5103 };
+    const expected_unresolved = [_]usize{ 5104, 5119, 5113, 5107, 5108, 5101, 5114, 5115, 5102, 0, 5100, 5109, 5112, 0, 5103 };
+    const expected_resolved = [_]usize{ 5104, 5113, 5107, 5108, 5101, 5114, 5115, 0, 5100, 5109, 5112, 0, 5103 };
     for ([_]bool{ false, true }) |resolved| {
         const plan = nodeMenuPlan(.{
             .project_path = "B",
@@ -422,12 +687,73 @@ test "custody child node menu plan preserves existing items when creation is una
         const expected: []const usize = if (resolved) &expected_resolved else &expected_unresolved;
         try std.testing.expectEqual(expected.len, plan.len);
         for (plan.items[0..plan.len], expected) |item, id| {
-            try std.testing.expectEqual(id, item.id);
-            try std.testing.expectEqual(id != 5119 and id != 5108, item.enabled);
+            switch (item) {
+                .command => |command_item| {
+                    try std.testing.expectEqual(id, command_item.id);
+                    try std.testing.expectEqual(id != 5119 and id != 5108, command_item.enabled);
+                },
+                .separator => try std.testing.expectEqual(@as(usize, 0), id),
+                .promotion_submenu => return error.UnexpectedPromotionSubmenu,
+            }
         }
-        try std.testing.expectEqualStrings("Open Terminal", plan.items[0].text);
-        try std.testing.expectEqualStrings("Delete Loop...\tDelete", plan.items[plan.len - 1].text);
+        try std.testing.expectEqualStrings("Open Terminal", plan.items[0].command.text);
+        try std.testing.expectEqualStrings("Delete Loop...\tDelete", plan.items[plan.len - 1].command.text);
     }
+}
+
+test "context parity node popup preserves supported macOS order and destructive boundary" {
+    @setEvalBranchQuota(10000);
+    const main = buildMenu(.{ .node = .{ .project_path = "C:\\fixture", .id = "main" } }) orelse return error.MenuCreationFailed;
+    defer _ = c.DestroyMenu(main);
+    try expectNativeMenu(main, &.{
+        .{ .id = 5104, .text = std.unicode.utf8ToUtf16LeStringLiteral("Open Terminal") },
+        .{ .id = 5119, .text = std.unicode.utf8ToUtf16LeStringLiteral("New Child Node...") },
+        .{ .id = 5101, .text = std.unicode.utf8ToUtf16LeStringLiteral("Rename...\tF2") },
+        .{ .id = 5114, .text = std.unicode.utf8ToUtf16LeStringLiteral("Save as Template...") },
+        .{ .id = 5102, .text = std.unicode.utf8ToUtf16LeStringLiteral("Stop Loop\tCtrl+S") },
+        .{ .separator = true },
+        .{ .id = 5100, .text = std.unicode.utf8ToUtf16LeStringLiteral("Edit Details...") },
+        .{ .separator = true },
+        .{ .id = 5103, .text = std.unicode.utf8ToUtf16LeStringLiteral("Delete Loop...\tDelete") },
+    });
+
+    const resolved = buildMenu(.{ .node = .{ .project_path = "C:\\fixture", .id = "resolved", .resolved = true } }) orelse return error.MenuCreationFailed;
+    defer _ = c.DestroyMenu(resolved);
+    try expectNativeMenu(resolved, &.{
+        .{ .id = 5104, .text = std.unicode.utf8ToUtf16LeStringLiteral("Open Terminal") },
+        .{ .id = 5101, .text = std.unicode.utf8ToUtf16LeStringLiteral("Rename...\tF2") },
+        .{ .id = 5114, .text = std.unicode.utf8ToUtf16LeStringLiteral("Save as Template...") },
+        .{ .separator = true },
+        .{ .id = 5100, .text = std.unicode.utf8ToUtf16LeStringLiteral("Edit Details...") },
+        .{ .separator = true },
+        .{ .id = 5103, .text = std.unicode.utf8ToUtf16LeStringLiteral("Delete Loop...\tDelete") },
+    });
+
+    const composite = buildMenu(.{ .node = .{
+        .project_path = "C:\\fixture",
+        .id = "composite",
+        .composite = true,
+        .unwired = true,
+        .follows_template = true,
+    } }) orelse return error.MenuCreationFailed;
+    defer _ = c.DestroyMenu(composite);
+    try expectNativeMenu(composite, &.{
+        .{ .id = 5104, .text = std.unicode.utf8ToUtf16LeStringLiteral("Open Terminal") },
+        .{ .id = 5119, .text = std.unicode.utf8ToUtf16LeStringLiteral("New Child Node...") },
+        .{ .id = 5113, .text = std.unicode.utf8ToUtf16LeStringLiteral("Open Group") },
+        .{ .id = 5107, .text = std.unicode.utf8ToUtf16LeStringLiteral("Pilot Once…") },
+        .{ .id = 5108, .text = std.unicode.utf8ToUtf16LeStringLiteral("Arm Schedule"), .enabled = false },
+        .{ .id = 5101, .text = std.unicode.utf8ToUtf16LeStringLiteral("Rename...\tF2") },
+        .{ .id = 5114, .text = std.unicode.utf8ToUtf16LeStringLiteral("Save as Template...") },
+        .{ .id = 5115, .text = std.unicode.utf8ToUtf16LeStringLiteral("Detach from Template") },
+        .{ .id = 5102, .text = std.unicode.utf8ToUtf16LeStringLiteral("Stop Loop\tCtrl+S") },
+        .{ .separator = true },
+        .{ .id = 5100, .text = std.unicode.utf8ToUtf16LeStringLiteral("Edit Details...") },
+        .{ .id = 5109, .text = std.unicode.utf8ToUtf16LeStringLiteral("Wire it up") },
+        .{ .id = 5112, .text = std.unicode.utf8ToUtf16LeStringLiteral("Mark as entry") },
+        .{ .separator = true },
+        .{ .id = 5103, .text = std.unicode.utf8ToUtf16LeStringLiteral("Delete Loop...\tDelete") },
+    });
 }
 
 test "sketch promotion real menu plan exposes only three eligible target actions" {
@@ -450,6 +776,7 @@ test "sketch promotion real menu plan exposes only three eligible target actions
 }
 
 test "sketch promotion production popup installs native Goal Turn Timed submenu on hidden HWND" {
+    @setEvalBranchQuota(10000);
     const hwnd = c.CreateWindowExW(
         0,
         std.unicode.utf8ToUtf16LeStringLiteral("STATIC"),
@@ -494,49 +821,311 @@ test "sketch promotion production popup installs native Goal Turn Timed submenu 
         if (c.SetMenu(hwnd, bar) == 0) return error.MenuInstallFailed;
         const menu = c.GetSubMenu(c.GetMenu(hwnd), 0);
         try std.testing.expect(menu != null);
-        var edit_position: c_int = 0;
-        while (edit_position < c.GetMenuItemCount(menu) and c.GetMenuItemID(menu, edit_position) != ids.edit_node) : (edit_position += 1) {}
-        try std.testing.expect(edit_position < c.GetMenuItemCount(menu));
-        const submenu = c.GetSubMenu(menu, edit_position + 1);
         if (!case.sketch) {
-            try std.testing.expect(submenu == null);
+            for (0..@intCast(c.GetMenuItemCount(menu))) |index| {
+                try std.testing.expect(c.GetSubMenu(menu, @intCast(index)) == null);
+            }
             for ([_]c.UINT{ 5116, 5117, 5118 }) |id|
                 try std.testing.expectEqual(std.math.maxInt(c.UINT), c.GetMenuState(menu, id, c.MF_BYCOMMAND));
             continue;
         }
+        try expectNativeMenu(menu, &.{
+            .{ .id = 5104, .text = std.unicode.utf8ToUtf16LeStringLiteral("Open Terminal") },
+            .{ .id = 5119, .text = std.unicode.utf8ToUtf16LeStringLiteral("New Child Node...") },
+            .{ .text = std.unicode.utf8ToUtf16LeStringLiteral("Promote to…"), .submenu = true },
+            .{ .id = 5101, .text = std.unicode.utf8ToUtf16LeStringLiteral("Rename...\tF2") },
+            .{ .id = 5114, .text = std.unicode.utf8ToUtf16LeStringLiteral("Save as Template...") },
+            .{ .id = 5102, .text = std.unicode.utf8ToUtf16LeStringLiteral("Stop Loop\tCtrl+S") },
+            .{ .separator = true },
+            .{ .id = 5100, .text = std.unicode.utf8ToUtf16LeStringLiteral("Edit Details...") },
+            .{ .separator = true },
+            .{ .id = 5103, .text = std.unicode.utf8ToUtf16LeStringLiteral("Delete Loop...\tDelete") },
+        });
+        const submenu = c.GetSubMenu(menu, 2);
         try std.testing.expect(submenu != null);
-        var title: [64]u16 = undefined;
-        const title_len = c.GetMenuStringW(menu, @intCast(edit_position + 1), &title, title.len, c.MF_BYPOSITION);
-        try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("Promote to..."), title[0..@intCast(title_len)]);
-        try std.testing.expectEqual(@as(c_int, 3), c.GetMenuItemCount(submenu));
-        for ([_]struct { id: c.UINT, label: []const u16, action: Action }{
-            .{ .id = 5116, .label = std.unicode.utf8ToUtf16LeStringLiteral("Goal - asks for a done check"), .action = .promote_goal },
-            .{ .id = 5117, .label = std.unicode.utf8ToUtf16LeStringLiteral("Turn - asks where to pause"), .action = .promote_turn },
-            .{ .id = 5118, .label = std.unicode.utf8ToUtf16LeStringLiteral("Timed - asks for a cadence"), .action = .promote_timed },
+        try expectNativeMenu(submenu, &.{
+            .{ .id = 0, .text = std.unicode.utf8ToUtf16LeStringLiteral("Keep the session, add a shape"), .enabled = false },
+            .{ .id = 5116, .text = std.unicode.utf8ToUtf16LeStringLiteral("Goal — asks for a done check"), .enabled = case.enabled },
+            .{ .id = 5117, .text = std.unicode.utf8ToUtf16LeStringLiteral("Turn — asks where to pause"), .enabled = case.enabled },
+            .{ .id = 5118, .text = std.unicode.utf8ToUtf16LeStringLiteral("Timed — asks for a cadence"), .enabled = case.enabled },
+        });
+        for ([_]struct { id: c.UINT, action: Action }{
+            .{ .id = 5116, .action = .promote_goal },
+            .{ .id = 5117, .action = .promote_turn },
+            .{ .id = 5118, .action = .promote_timed },
         }, 0..) |item, index| {
-            try std.testing.expectEqual(item.id, c.GetMenuItemID(submenu, @intCast(index)));
-            const state = c.GetMenuState(submenu, item.id, c.MF_BYCOMMAND);
-            try std.testing.expect(state != std.math.maxInt(c.UINT));
-            try std.testing.expectEqual(case.enabled, state & c.MF_GRAYED == 0);
-            var label: [64]u16 = undefined;
-            const length = c.GetMenuStringW(submenu, item.id, &label, label.len, c.MF_BYCOMMAND);
-            try std.testing.expectEqualSlices(u16, item.label, label[0..@intCast(length)]);
+            try std.testing.expectEqual(item.id, c.GetMenuItemID(submenu, @intCast(index + 1)));
             try std.testing.expectEqual(item.action, actionForCommand(@intCast(item.id)));
         }
     }
 }
 
-test "background menu exposes supported folder actions and gates edge creation" {
+test "semantic fallback six E menus expose exact native item info on hidden HWND" {
+    @setEvalBranchQuota(10000);
+    const hwnd = c.CreateWindowExW(
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral("STATIC"),
+        std.unicode.utf8ToUtf16LeStringLiteral("Semantic menu test"),
+        c.WS_OVERLAPPEDWINDOW,
+        0,
+        0,
+        0,
+        0,
+        null,
+        null,
+        c.GetModuleHandleW(null),
+        null,
+    ) orelse return error.WindowCreationFailed;
+    defer std.debug.assert(c.DestroyWindow(hwnd) != 0);
+
+    const background_expected = [_]ExpectedMenuItem{
+        .{ .id = 5142, .text = std.unicode.utf8ToUtf16LeStringLiteral("Worktrees...") },
+        .{ .id = 5143, .text = std.unicode.utf8ToUtf16LeStringLiteral("Project Settings...") },
+        .{ .id = 5144, .text = std.unicode.utf8ToUtf16LeStringLiteral("Show in Explorer") },
+    };
+    const resolved_expected = [_]ExpectedMenuItem{
+        .{ .id = 5104, .text = std.unicode.utf8ToUtf16LeStringLiteral("Open Terminal") },
+        .{ .id = 5101, .text = std.unicode.utf8ToUtf16LeStringLiteral("Rename...\tF2") },
+        .{ .id = 5114, .text = std.unicode.utf8ToUtf16LeStringLiteral("Save as Template...") },
+        .{ .id = 0, .text = &.{}, .enabled = false, .separator = true, .record_raw_state = true },
+        .{ .id = 5100, .text = std.unicode.utf8ToUtf16LeStringLiteral("Edit Details...") },
+        .{ .id = 0, .text = &.{}, .enabled = false, .separator = true, .record_raw_state = true },
+        .{ .id = 5103, .text = std.unicode.utf8ToUtf16LeStringLiteral("Delete Loop...\tDelete") },
+    };
+    const sketch_expected = [_]ExpectedMenuItem{
+        .{ .id = 5104, .text = std.unicode.utf8ToUtf16LeStringLiteral("Open Terminal") },
+        .{ .id = 5119, .text = std.unicode.utf8ToUtf16LeStringLiteral("New Child Node...") },
+        .{ .text = std.unicode.utf8ToUtf16LeStringLiteral("Promote to…"), .submenu = true, .record_submenu_id = true },
+        .{ .id = 5101, .text = std.unicode.utf8ToUtf16LeStringLiteral("Rename...\tF2") },
+        .{ .id = 5114, .text = std.unicode.utf8ToUtf16LeStringLiteral("Save as Template...") },
+        .{ .id = 5102, .text = std.unicode.utf8ToUtf16LeStringLiteral("Stop Loop\tCtrl+S") },
+        .{ .id = 0, .text = &.{}, .enabled = false, .separator = true, .record_raw_state = true },
+        .{ .id = 5100, .text = std.unicode.utf8ToUtf16LeStringLiteral("Edit Details...") },
+        .{ .id = 5109, .text = std.unicode.utf8ToUtf16LeStringLiteral("Wire it up") },
+        .{ .id = 5112, .text = std.unicode.utf8ToUtf16LeStringLiteral("Mark as entry") },
+        .{ .id = 0, .text = &.{}, .enabled = false, .separator = true, .record_raw_state = true },
+        .{ .id = 5103, .text = std.unicode.utf8ToUtf16LeStringLiteral("Delete Loop...\tDelete") },
+    };
+    const promote_child_expected = [_]ExpectedMenuItem{
+        .{ .id = 0, .text = std.unicode.utf8ToUtf16LeStringLiteral("Keep the session, add a shape"), .enabled = false },
+        .{ .id = 5116, .text = std.unicode.utf8ToUtf16LeStringLiteral("Goal — asks for a done check") },
+        .{ .id = 5117, .text = std.unicode.utf8ToUtf16LeStringLiteral("Turn — asks where to pause") },
+        .{ .id = 5118, .text = std.unicode.utf8ToUtf16LeStringLiteral("Timed — asks for a cadence") },
+    };
+    const post_goal_expected = [_]ExpectedMenuItem{
+        .{ .id = 5104, .text = std.unicode.utf8ToUtf16LeStringLiteral("Open Terminal") },
+        .{ .id = 5119, .text = std.unicode.utf8ToUtf16LeStringLiteral("New Child Node...") },
+        .{ .id = 5101, .text = std.unicode.utf8ToUtf16LeStringLiteral("Rename...\tF2") },
+        .{ .id = 5114, .text = std.unicode.utf8ToUtf16LeStringLiteral("Save as Template...") },
+        .{ .id = 5102, .text = std.unicode.utf8ToUtf16LeStringLiteral("Stop Loop\tCtrl+S") },
+        .{ .id = 0, .text = &.{}, .enabled = false, .separator = true, .record_raw_state = true },
+        .{ .id = 5100, .text = std.unicode.utf8ToUtf16LeStringLiteral("Edit Details...") },
+        .{ .id = 5109, .text = std.unicode.utf8ToUtf16LeStringLiteral("Wire it up") },
+        .{ .id = 5112, .text = std.unicode.utf8ToUtf16LeStringLiteral("Mark as entry") },
+        .{ .id = 0, .text = &.{}, .enabled = false, .separator = true, .record_raw_state = true },
+        .{ .id = 5103, .text = std.unicode.utf8ToUtf16LeStringLiteral("Delete Loop...\tDelete") },
+    };
+    const edge_expected = [_]ExpectedMenuItem{
+        .{ .id = 5110, .text = std.unicode.utf8ToUtf16LeStringLiteral("Edit Edge...") },
+        .{ .id = 5111, .text = std.unicode.utf8ToUtf16LeStringLiteral("Delete Edge") },
+    };
+
+    var observations: usize = 0;
+    try expectBuiltMenuOnHiddenWindow(hwnd, .{ .background = .{
+        .project_path = "C:\\fixture",
+        .local_filesystem = true,
+    } }, &background_expected, &observations);
+    try expectBuiltMenuOnHiddenWindow(hwnd, .{ .node = .{
+        .project_path = "C:\\fixture",
+        .id = "resolved-wired",
+        .resolved = true,
+    } }, &resolved_expected, &observations);
+
+    const promotion_context = SketchPromotion.Context{};
+    const sketch_node = NodeTarget{
+        .project_path = "C:\\fixture",
+        .id = "sketch-unwired",
+        .unwired = true,
+        .sketch = true,
+        .promotion_context = &promotion_context,
+    };
+    {
+        const sketch_popup = buildMenu(.{ .node = sketch_node }) orelse return error.MenuCreationFailed;
+        const sketch_attached = try attachTestPopup(hwnd, sketch_popup);
+        defer std.debug.assert(detachTestPopup(hwnd, sketch_attached));
+        try expectNativeMenuCounted(sketch_attached.popup, &sketch_expected, &observations);
+        const promote_child = c.GetSubMenu(sketch_attached.popup, 2) orelse return error.PromoteSubmenuMissing;
+        try expectNativeMenuCounted(promote_child, &promote_child_expected, &observations);
+    }
+
+    // This target checks post-Goal menu flags only; it does not run or persist a promotion.
+    try expectBuiltMenuOnHiddenWindow(hwnd, .{ .node = .{
+        .project_path = "C:\\fixture",
+        .id = "post-goal-idle-unresolved-unwired",
+        .unwired = true,
+    } }, &post_goal_expected, &observations);
+    try expectBuiltMenuOnHiddenWindow(hwnd, .{ .edge = .{
+        .project_path = "C:\\fixture",
+        .id = "edge-a",
+    } }, &edge_expected, &observations);
+    try std.testing.expectEqual(@as(usize, 39), observations);
+    std.debug.print(
+        "semantic fallback positive targets=6 observations={d} (background=3 resolved=7 sketch-unwired=12 promote-child=4 post-Goal=11 edge=2)\n",
+        .{observations},
+    );
+
+    try expectDisposableMenuRejected(hwnd, &.{
+        .{ .id = 5142, .caption = "Worktrees..." },
+        .{ .id = 5143, .caption = "Project Settings..." },
+        .{ .id = 5144, .caption = "Show in Explorer" },
+        .{ .id = 5150, .caption = "Unexpected" },
+    }, &background_expected);
+    try expectDisposableMenuRejected(hwnd, &.{
+        .{ .id = 5111, .caption = "Delete Edge" },
+        .{ .id = 5110, .caption = "Edit Edge..." },
+    }, &edge_expected);
+    try expectDisposableMenuRejected(hwnd, &.{
+        .{ .id = 0, .caption = "Keep the session, add a shape", .enabled = true },
+        .{ .id = 5116, .caption = "Goal — asks for a done check" },
+        .{ .id = 5117, .caption = "Turn — asks where to pause" },
+        .{ .id = 5118, .caption = "Timed — asks for a cadence" },
+    }, &promote_child_expected);
+    try expectDisposableMenuRejected(hwnd, &.{
+        .{ .separator = true, .enabled = false },
+        .{ .id = 5116, .caption = "Goal — asks for a done check" },
+        .{ .id = 5117, .caption = "Turn — asks where to pause" },
+        .{ .id = 5118, .caption = "Timed — asks for a cadence" },
+    }, &promote_child_expected);
+    try expectDisposableMenuRejected(hwnd, &.{
+        .{ .id = 0, .caption = "Keep the session, add a shape", .enabled = false },
+        .{ .id = 5116, .caption = "Goal — asks for a done check", .enabled = false },
+        .{ .id = 5117, .caption = "Turn — asks where to pause" },
+        .{ .id = 5118, .caption = "Timed — asks for a cadence" },
+    }, &promote_child_expected);
+    try expectDisposableMenuRejected(hwnd, &.{
+        .{ .id = 0, .caption = "Keep the session, add a shape", .enabled = false },
+        .{ .id = 5116, .caption = "Wrong caption" },
+        .{ .id = 5117, .caption = "Turn — asks where to pause" },
+        .{ .id = 5118, .caption = "Timed — asks for a cadence" },
+    }, &promote_child_expected);
+    try expectBuiltMenuRejected(hwnd, .{ .node = sketch_node }, 5109, &sketch_expected);
+    try expectBuiltMenuRejected(hwnd, .{ .node = sketch_node }, 5112, &sketch_expected);
+
+    {
+        const edge_popup = buildMenu(.{ .edge = .{ .project_path = "C:\\fixture", .id = "edge-extra-header" } }) orelse return error.MenuCreationFailed;
+        const edge_attached = try attachTestPopup(hwnd, edge_popup);
+        defer std.debug.assert(detachTestPopup(hwnd, edge_attached));
+        const edge_header = toWide("Edge") orelse return error.CaptionConversionFailed;
+        defer std.heap.c_allocator.free(edge_header);
+        if (c.InsertMenuW(edge_attached.popup, 0, c.MF_BYPOSITION | c.MF_STRING, 0, edge_header.ptr) == 0)
+            return error.MenuAppendFailed;
+        try std.testing.expectError(error.TestExpectedEqual, expectNativeMenu(edge_attached.popup, &edge_expected));
+    }
+
+    try std.testing.expectError(
+        error.MenuItemStringQueryFailed,
+        readNativeMenuItem(null, 0, std.testing.allocator),
+    );
+    try std.testing.expectError(error.MenuCountQueryFailed, expectNativeMenu(null, &.{}));
+
+    {
+        const one_item_popup = c.CreatePopupMenu() orelse return error.MenuCreationFailed;
+        const one_item_attached = try attachTestPopup(hwnd, one_item_popup);
+        defer std.debug.assert(detachTestPopup(hwnd, one_item_attached));
+        try appendDisposableMenuItem(one_item_attached.popup, .{ .id = 1, .caption = "One" });
+        try std.testing.expectError(
+            error.MenuItemStringQueryFailed,
+            readNativeMenuItem(one_item_attached.popup, 1, std.testing.allocator),
+        );
+    }
+    std.debug.print(
+        "semantic fallback negative controls=12: extra-item,reordered-actions,enabled-heading,separator-heading,disabled-action,wrong-caption,missing-5109,missing-5112,extra-edge-header,invalid-HMENU-item-read,invalid-HMENU-count-read,out-of-range-item-read\n",
+        .{},
+    );
+}
+
+test "context parity background omits duplicate edge creation and empty groups" {
     const menu = buildMenu(.{ .background = .{
         .project_path = "C:\\fixture",
         .local_filesystem = true,
-        .can_create_edge = false,
     } }) orelse return error.MenuCreationFailed;
     defer _ = c.DestroyMenu(menu);
-    try std.testing.expectEqual(@as(c.UINT, c.MF_ENABLED), c.GetMenuState(menu, ids.inspect_project_worktrees, c.MF_BYCOMMAND));
-    try std.testing.expectEqual(@as(c.UINT, c.MF_ENABLED), c.GetMenuState(menu, ids.project_settings, c.MF_BYCOMMAND));
-    try std.testing.expectEqual(@as(c.UINT, c.MF_ENABLED), c.GetMenuState(menu, ids.reveal_project, c.MF_BYCOMMAND));
-    try std.testing.expectEqual(@as(c.UINT, c.MF_GRAYED), c.GetMenuState(menu, ids.create_edge, c.MF_BYCOMMAND));
+    try expectNativeMenu(menu, &.{
+        .{ .id = 5142, .text = std.unicode.utf8ToUtf16LeStringLiteral("Worktrees...") },
+        .{ .id = 5143, .text = std.unicode.utf8ToUtf16LeStringLiteral("Project Settings...") },
+        .{ .id = 5144, .text = std.unicode.utf8ToUtf16LeStringLiteral("Show in Explorer") },
+    });
+    try std.testing.expectEqual(Action.none, actionForCommand(5120));
+
+    const remote = buildMenu(.{ .background = .{
+        .project_path = "ssh://builder/fixture",
+        .local_filesystem = false,
+    } }) orelse return error.MenuCreationFailed;
+    defer _ = c.DestroyMenu(remote);
+    try expectNativeMenu(remote, &.{
+        .{ .id = 5142, .text = std.unicode.utf8ToUtf16LeStringLiteral("Worktrees..."), .enabled = false },
+        .{ .id = 5143, .text = std.unicode.utf8ToUtf16LeStringLiteral("Project Settings..."), .enabled = false },
+        .{ .id = 5144, .text = std.unicode.utf8ToUtf16LeStringLiteral("Show in Explorer"), .enabled = false },
+    });
+
+    const global = buildMenu(.{ .background = .{
+        .project_path = "graphcode://global",
+        .local_filesystem = false,
+    } });
+    if (global) |handle| _ = c.DestroyMenu(handle);
+    try std.testing.expect(global == null);
+}
+
+test "context parity project Worktrees count renders independently from enabled state" {
+    const project = buildMenu(.{ .project = .{
+        .path = "C:\\fixture",
+        .remote = false,
+        .worktrees_available = false,
+        .reclaimable_worktrees = 3,
+    } }) orelse return error.MenuCreationFailed;
+    defer _ = c.DestroyMenu(project);
+    try expectWorktreesMenuItem(project, 3, false);
+
+    for ([_]usize{ 0, 1, 7, 8 }) |count| {
+        const disabled_project = buildMenu(.{ .project = .{
+            .path = "C:\\fixture",
+            .remote = false,
+            .worktrees_available = false,
+            .reclaimable_worktrees = count,
+        } }) orelse return error.MenuCreationFailed;
+        defer _ = c.DestroyMenu(disabled_project);
+        try expectWorktreesMenuItem(disabled_project, count, false);
+    }
+
+    const no_count = buildMenu(.{ .project = .{
+        .path = "C:\\fixture",
+        .remote = false,
+        .reclaimable_worktrees = 0,
+    } }) orelse return error.MenuCreationFailed;
+    defer _ = c.DestroyMenu(no_count);
+    try expectWorktreesMenuItem(no_count, 0, true);
+}
+
+test "context parity background Worktrees count renders independently from enabled state" {
+    const menu = buildMenu(.{ .background = .{
+        .project_path = "C:\\fixture",
+        .local_filesystem = false,
+        .worktrees_available = false,
+        .reclaimable_worktrees = 2,
+    } }) orelse return error.MenuCreationFailed;
+    defer _ = c.DestroyMenu(menu);
+    try expectWorktreesMenuItem(menu, 2, false);
+
+    for ([_]usize{ 0, 1, 7, 8 }) |count| {
+        const disabled_background = buildMenu(.{ .background = .{
+            .project_path = "C:\\fixture",
+            .local_filesystem = false,
+            .worktrees_available = false,
+            .reclaimable_worktrees = count,
+        } }) orelse return error.MenuCreationFailed;
+        defer _ = c.DestroyMenu(disabled_background);
+        try expectWorktreesMenuItem(disabled_background, count, false);
+    }
 }
 
 test "resolved node menu hides Stop but retains rename and edit details" {
@@ -586,10 +1175,10 @@ test "node shortcut captions keep Edit Details without the rename Ctrl E hint" {
     try std.testing.expectEqual(Action.rename_node, actionForCommand(ids.rename_node));
 
     const targets = [_]struct { node: NodeTarget, edit_position: c_int }{
-        .{ .node = .{ .project_path = "C:\\fixture", .id = "ordinary" }, .edit_position = 2 },
-        .{ .node = .{ .project_path = "C:\\fixture", .id = "resolved", .resolved = true }, .edit_position = 1 },
-        .{ .node = .{ .project_path = "C:\\fixture", .id = "composite", .composite = true }, .edit_position = 6 },
-        .{ .node = .{ .project_path = "C:\\fixture", .id = "unwired", .unwired = true }, .edit_position = 5 },
+        .{ .node = .{ .project_path = "C:\\fixture", .id = "ordinary" }, .edit_position = 6 },
+        .{ .node = .{ .project_path = "C:\\fixture", .id = "resolved", .resolved = true }, .edit_position = 4 },
+        .{ .node = .{ .project_path = "C:\\fixture", .id = "composite", .composite = true }, .edit_position = 9 },
+        .{ .node = .{ .project_path = "C:\\fixture", .id = "unwired", .unwired = true }, .edit_position = 6 },
     };
     for (targets) |target| {
         const menu = buildMenu(.{ .node = target.node }) orelse return error.MenuCreationFailed;
@@ -607,21 +1196,18 @@ test "background menu disables unavailable folder actions and omits them for glo
     const remote = buildMenu(.{ .background = .{
         .project_path = "ssh://builder/fixture",
         .local_filesystem = false,
-        .can_create_edge = true,
     } }) orelse return error.MenuCreationFailed;
     defer _ = c.DestroyMenu(remote);
     for ([_]c.UINT{ ids.inspect_project_worktrees, ids.project_settings, ids.reveal_project }) |id|
         try std.testing.expectEqual(@as(c.UINT, c.MF_GRAYED), c.GetMenuState(remote, id, c.MF_BYCOMMAND));
-    try std.testing.expectEqual(@as(c.UINT, c.MF_ENABLED), c.GetMenuState(remote, ids.create_edge, c.MF_BYCOMMAND));
+    try std.testing.expectEqual(Action.none, actionForCommand(5120));
 
     const global = buildMenu(.{ .background = .{
         .project_path = "graphcode://global",
         .local_filesystem = false,
-        .can_create_edge = false,
-    } }) orelse return error.MenuCreationFailed;
-    defer _ = c.DestroyMenu(global);
-    try std.testing.expectEqual(@as(c_int, 1), c.GetMenuItemCount(global));
-    try std.testing.expectEqual(@as(c.UINT, ids.create_edge), c.GetMenuItemID(global, 0));
+    } });
+    if (global) |handle| _ = c.DestroyMenu(handle);
+    try std.testing.expect(global == null);
 }
 
 test "native node menu variants expose only eligible actions" {
@@ -653,9 +1239,10 @@ test "native node menu variants expose only eligible actions" {
 test "edge menu preserves edit and delete command ordering" {
     const menu = buildMenu(.{ .edge = .{ .project_path = "C:\\fixture", .id = "edge-a" } }) orelse return error.MenuCreationFailed;
     defer _ = c.DestroyMenu(menu);
-    try std.testing.expectEqual(@as(c_int, 2), c.GetMenuItemCount(menu));
-    try std.testing.expectEqual(@as(c.UINT, ids.edit_edge), c.GetMenuItemID(menu, 0));
-    try std.testing.expectEqual(@as(c.UINT, ids.delete_edge), c.GetMenuItemID(menu, 1));
+    try expectNativeMenu(menu, &.{
+        .{ .id = ids.edit_edge, .text = std.unicode.utf8ToUtf16LeStringLiteral("Edit Edge...") },
+        .{ .id = ids.delete_edge, .text = std.unicode.utf8ToUtf16LeStringLiteral("Delete Edge") },
+    });
 }
 
 test "context actions remain stable when graph IDs are reordered" {
