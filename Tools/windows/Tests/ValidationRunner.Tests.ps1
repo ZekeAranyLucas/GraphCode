@@ -1604,6 +1604,56 @@ function Test-MultiProjectProtocolContracts([string] $stubSource, [string] $gate
     return "Actual surface predicate rejects workspace chrome under a project expectation"
   }
   $rosterOwners = @($workspaceOwner, @{ path = "B"; node = $b; name = "Beta"; title = "Beta loop" })
+  Invoke-MultiCase "matching project surface selects its parent and selected loop" {
+    Assert-MultiCase (Test-MultiProjectOwnerSelection "project" $workspaceOwner $workspaceOwner $true $true) `
+      "matching project parent/loop selection rejected"
+    return "Matching project surface selects its owner and selected loop"
+  }
+  Invoke-MultiCase "other project owner stays unselected on project surface" {
+    Assert-MultiCase (Test-MultiProjectOwnerSelection "project" $rosterOwners[1] $workspaceOwner $false $false) `
+      "nonmatching project owner expected unselected"
+    return "Only the matching project owner and loop are selected"
+  }
+  Invoke-MultiCase "workspace keeps selected loop without parent-project selection" {
+    Assert-MultiCase (Test-MultiProjectOwnerSelection "workspace" $workspaceOwner $workspaceOwner $false $true) `
+      "workspace parent/loop selection expectation rejected"
+    return "Workspace preserves selected loop without selecting its parent project"
+  }
+  Invoke-MultiCase "overview keeps selected loop without parent-project selection" {
+    Assert-MultiCase (Test-MultiProjectOwnerSelection "overview" $workspaceOwner $workspaceOwner $false $true) `
+      "overview parent/loop selection expectation rejected"
+    return "Overview preserves selected loop without selecting its parent project"
+  }
+  Invoke-MultiCase "Quick Chats keeps selected loop without parent-project selection" {
+    Assert-MultiCase (Test-MultiProjectOwnerSelection "quick_chats" $workspaceOwner $workspaceOwner $false $true) `
+      "Quick Chats parent/loop selection expectation rejected"
+    return "Quick Chats does not select a stale parent project"
+  }
+  Invoke-MultiCase "workspace rejects selected parent project row" -Negative {
+    Assert-MultiCase (-not (Test-MultiProjectOwnerSelection "workspace" $workspaceOwner $workspaceOwner $true $true)) `
+      "workspace accepted selected parent project row"
+    return "Stale workspace parent-project selection rejected"
+  }
+  Invoke-MultiCase "project surface rejects missing selected parent row" -Negative {
+    Assert-MultiCase (-not (Test-MultiProjectOwnerSelection "project" $workspaceOwner $workspaceOwner $false $true)) `
+      "project surface accepted missing selected parent row"
+    return "Missing matching project selection rejected"
+  }
+  Invoke-MultiCase "overview rejects stale selected parent project row" -Negative {
+    Assert-MultiCase (-not (Test-MultiProjectOwnerSelection "overview" $workspaceOwner $workspaceOwner $true $true)) `
+      "overview accepted stale selected parent project row"
+    return "Stale overview parent-project selection rejected"
+  }
+  Invoke-MultiCase "Quick Chats rejects stale selected parent project row" -Negative {
+    Assert-MultiCase (-not (Test-MultiProjectOwnerSelection "quick_chats" $workspaceOwner $workspaceOwner $true $true)) `
+      "Quick Chats accepted stale selected parent project row"
+    return "Stale Quick Chats parent-project selection rejected"
+  }
+  Invoke-MultiCase "workspace rejects loss of selected loop owner" -Negative {
+    Assert-MultiCase (-not (Test-MultiProjectOwnerSelection "workspace" $workspaceOwner $workspaceOwner $false $false)) `
+      "workspace accepted loss of expected loop selection"
+    return "Missing selected loop-owner state rejected"
+  }
   function New-MultiRosterProjection {
     return [ordered]@{
       projectRows = @(
@@ -3217,6 +3267,141 @@ try {
   if ($uiaParseErrors.Count -ne 0) {
     throw "RED: UIA live gate no longer parses after startup diagnostic changes"
   }
+  $sidebarOracleHelper = $uiaAst.Find({
+      param($node)
+      $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ceq "Get-SidebarNavigationSnapshot"
+    }, $true)
+  if ($null -eq $sidebarOracleHelper) {
+    throw "RED: UIA live gate is missing its functional sidebar navigation snapshot oracle"
+  }
+  . ([scriptblock]::Create($sidebarOracleHelper.Extent.Text))
+  & {
+    $sidebarFixtureCount = 0
+    $sidebarPositiveCount = 0
+    $sidebarNegativeCount = 0
+    function New-SidebarNavigationElement(
+      [string] $automationId,
+      [string] $name,
+      [double] $left,
+      [double] $top,
+      [double] $right,
+      [double] $bottom
+    ) {
+      return [pscustomobject]@{
+        Current = [pscustomobject]@{
+          AutomationId = $automationId
+          Name = $name
+          BoundingRectangle = [pscustomobject]@{
+            Left = $left; Top = $top; Right = $right; Bottom = $bottom
+            Width = $right - $left; Height = $bottom - $top
+          }
+        }
+      }
+    }
+    $sidebarFixture = @(
+      (New-SidebarNavigationElement "overview-destination:graph" "Graph" 12 20 220 52),
+      (New-SidebarNavigationElement "quick-chats-destination:quick-chats" "Quick Chats" 12 56 220 88),
+      (New-SidebarNavigationElement "sidebar-section-1" "Local Projects" 12 100 220 121),
+      (New-SidebarNavigationElement "open-project-1" "UIA project" 12 121 220 153),
+      (New-SidebarNavigationElement "sidebar-section-2" "Remote Repositories" 12 168 220 189),
+      (New-SidebarNavigationElement "open-project-2" "Temporary remote" 12 192 220 224),
+      (New-SidebarNavigationElement "overview-destination" "Graph" 12 17 220 49),
+      (New-SidebarNavigationElement "quick-chats-destination" "Quick Chats" 12 53 220 85),
+      (New-SidebarNavigationElement "project-new-loop-1" "New Loop" 174 17 198 49),
+      (New-SidebarNavigationElement "project-disclosure-2" "Collapse project" 198 17 220 49),
+      (New-SidebarNavigationElement "quick-chat-new-3" "New Chat" 174 53 198 85),
+      (New-SidebarNavigationElement "quick-chats-disclosure-4" "Collapse Quick Chats" 198 53 220 85),
+      (New-SidebarNavigationElement "project-new-loop-5" "New Loop" 174 121 198 153),
+      (New-SidebarNavigationElement "project-disclosure-6" "Collapse project" 198 121 220 153)
+    )
+    $initial = Get-SidebarNavigationSnapshot $sidebarFixture
+    if (($initial.destinationIds -join "|") -cne "overview-destination|quick-chats-destination" -or
+        ($initial.destinationNames -join "|") -cne "Graph|Quick Chats" -or
+        $initial.ownerNames.Count -ne 2 -or
+        ($initial.ownerNames -join "|") -cne "UIA project|Temporary remote" -or
+        ($initial.sectionNames -join "|") -cne "Local Projects|Remote Repositories" -or
+        $initial.recentRowIds.Count -ne 0 -or
+        -not $initial.rowBoundsValid -or -not $initial.controlsValid -or
+        $initial.controlsChecked -ne 6) {
+      throw "RED: Sidebar navigation oracle missed destination order, open owners, section names, or contained controls"
+    }
+    $sidebarFixtureCount++
+    $sidebarPositiveCount++
+    $localCollapsed = @($sidebarFixture | Where-Object {
+      $_.Current.AutomationId -notin @(
+        "open-project-1",
+        "project-new-loop-5",
+        "project-disclosure-6"
+      )
+    })
+    $afterLocalCollapse = Get-SidebarNavigationSnapshot $localCollapsed
+    if (($afterLocalCollapse.ownerNames -join "|") -cne "Temporary remote") {
+      throw "RED: Sidebar navigation oracle did not isolate local owner collapse"
+    }
+    $sidebarFixtureCount++
+    $sidebarPositiveCount++
+    $remoteCollapsed = @($sidebarFixture | Where-Object {
+      $_.Current.AutomationId -ne "open-project-2"
+    })
+    $afterRemoteCollapse = Get-SidebarNavigationSnapshot $remoteCollapsed
+    if (($afterRemoteCollapse.ownerNames -join "|") -cne "UIA project") {
+      throw "RED: Sidebar navigation oracle did not isolate remote owner collapse"
+    }
+    $sidebarFixtureCount++
+    $sidebarPositiveCount++
+    $restoredFixture = @($sidebarFixture | Where-Object {
+      $_.Current.AutomationId -notin @(
+        "sidebar-section-2",
+        "open-project-2"
+      )
+    })
+    $restored = Get-SidebarNavigationSnapshot $restoredFixture
+    if (($restored.ownerNames -join "|") -cne "UIA project" -or
+        ($restored.sectionNames -join "|") -cne "Local Projects" -or
+        $restored.recentRowIds.Count -ne 0) {
+      throw "RED: Sidebar navigation oracle accepted a temporary remote owner after fixture restore"
+    }
+    $sidebarFixtureCount++
+    $sidebarPositiveCount++
+    $recentMutation = Get-SidebarNavigationSnapshot @(
+      $sidebarFixture + (New-SidebarNavigationElement "project-row-recent" "Recent folder" 12 228 220 260)
+    )
+    if ($recentMutation.recentRowIds.Count -ne 1) {
+      throw "RED: Sidebar navigation oracle failed to detect a projected unopened recent folder"
+    }
+    $sidebarFixtureCount++
+    $sidebarNegativeCount++
+    $clippedMutation = @($sidebarFixture | Where-Object {
+      $_.Current.AutomationId -ne "project-new-loop-5"
+    }) + (New-SidebarNavigationElement "project-new-loop-5" "New Loop" 174 121 228 153)
+    $clipped = Get-SidebarNavigationSnapshot $clippedMutation
+    if ($clipped.controlsValid) {
+      throw "RED: Sidebar navigation oracle accepted a row control extending beyond its owner"
+    }
+    $sidebarFixtureCount++
+    $sidebarNegativeCount++
+    $reorderedOwners = @($sidebarFixture | Where-Object {
+      $_.Current.AutomationId -notin @(
+        "open-project-1",
+        "open-project-2"
+      )
+    }) + @(
+      (New-SidebarNavigationElement "open-project-2" "Temporary remote" 12 124 220 156),
+      (New-SidebarNavigationElement "open-project-1" "UIA project" 12 192 220 224)
+    )
+    $reordered = Get-SidebarNavigationSnapshot $reorderedOwners
+    if (($reordered.ownerNames -join "|") -cne "Temporary remote|UIA project") {
+      throw "RED: Sidebar navigation oracle failed to preserve the owner order evidence"
+    }
+    $sidebarFixtureCount++
+    $sidebarPositiveCount++
+    if ($sidebarFixtureCount -ne 7 -or $sidebarPositiveCount -ne 5 -or $sidebarNegativeCount -ne 2) {
+      throw "RED: Sidebar navigation fixture execution count changed unexpectedly"
+    }
+    Write-Host ("SIDEBAR_NAVIGATION_FIXTURES={0} ({1} positive, {2} negative; App 22->20 restoration has a separate hidden test)" -f `
+      $sidebarFixtureCount, $sidebarPositiveCount, $sidebarNegativeCount)
+  }
   foreach ($helperName in @(
       "Protect-UiaStartupDiagnosticText",
       "Get-UiaStartupDiagnosticValue",
@@ -3464,8 +3649,10 @@ Start-Sleep -Seconds 60
   if (-not $metadataObserver -or $metadataObserver.Extent.Text.Contains(".StartsWith(") -or
       -not $metadataObserver.Extent.Text.Contains("Test-MultiProjectMetadataBatch") -or
       -not $metadataObserver.Extent.Text.Contains("unresolvedMetadataCount") -or
+      -not $metadataObserver.Extent.Text.Contains("Test-MultiProjectOwnerSelection `$surface `$owner `$selectedOwner `$projectSelected `$loopSelected") -or
+      $metadataObserver.Extent.Text.Contains("`$projectSelected -eq `$selected") -or
       -not $uiaLiveGateSource.Contains("UIA_MULTIPROJECT_METADATA_REACQUIRE=")) {
-    throw "RED: new observer prefix/typed metadata boundary remains unguarded or silently omitted"
+    throw "RED: new observer prefix/typed metadata/active-surface selection boundary remains unguarded or silently omitted"
   }
   foreach ($required in @("function Complete-MultiProjectCapture", "function Wait-MultiProjectCapture",
       "function Initialize-MultiProjectProcessJob", "StandaloneProcessJob", "rootStartUtcTicks", "targetStartUtcTicks",

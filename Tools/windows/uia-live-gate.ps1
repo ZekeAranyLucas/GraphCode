@@ -2006,6 +2006,69 @@ function Get-DirectChildren(
   }
 }
 
+function Get-SidebarNavigationSnapshot([object[]] $children) {
+  $destinations = @($children | Where-Object {
+    $_.Current.AutomationId -in @("overview-destination", "quick-chats-destination")
+  } | Sort-Object { $_.Current.BoundingRectangle.Top })
+  $recentRows = @($children | Where-Object { $_.Current.AutomationId -match '^project-row-' })
+  $owners = @($children | Where-Object { $_.Current.AutomationId -match '^open-project-' } |
+    Sort-Object { $_.Current.BoundingRectangle.Top })
+  $sections = @($children | Where-Object { $_.Current.AutomationId -match '^sidebar-section-' } |
+    Sort-Object { $_.Current.BoundingRectangle.Top })
+  $controls = @($children | Where-Object {
+    $_.Current.AutomationId -match '^(project-new-loop-|project-disclosure-|quick-chat-new-|quick-chats-disclosure-)'
+  })
+  $rowBoundsValid = $true
+  foreach ($element in @($destinations + $owners + $sections)) {
+    $bounds = $element.Current.BoundingRectangle
+    if (($bounds.Width -le 0) -or ($bounds.Height -le 0)) {
+      $rowBoundsValid = $false
+      break
+    }
+  }
+  $controlsValid = $true
+  foreach ($control in $controls) {
+    $automationId = [string]$control.Current.AutomationId
+    $ownerCandidates = if ($automationId -match '^(quick-chat-new-|quick-chats-disclosure-)') {
+      @($destinations | Where-Object { $_.Current.AutomationId -eq "quick-chats-destination" })
+    } else {
+      @($destinations | Where-Object { $_.Current.AutomationId -eq "overview-destination" }) + $owners
+    }
+    $controlBounds = $control.Current.BoundingRectangle
+    if (($ownerCandidates.Count -eq 0) -or ($controlBounds.Width -le 0) -or ($controlBounds.Height -le 0)) {
+      $controlsValid = $false
+      break
+    }
+    $contained = $false
+    foreach ($owner in $ownerCandidates) {
+      $ownerBounds = $owner.Current.BoundingRectangle
+      if (($controlBounds.Left -ge $ownerBounds.Left) -and
+          ($controlBounds.Top -ge $ownerBounds.Top) -and
+          ($controlBounds.Right -le $ownerBounds.Right) -and
+          ($controlBounds.Bottom -le $ownerBounds.Bottom)) {
+        $contained = $true
+        break
+      }
+    }
+    if (-not $contained) {
+      $controlsValid = $false
+      break
+    }
+  }
+  return [pscustomobject]@{
+    destinationIds = @($destinations | ForEach-Object { [string]$_.Current.AutomationId })
+    destinationNames = @($destinations | ForEach-Object { [string]$_.Current.Name })
+    recentRowIds = @($recentRows | ForEach-Object { [string]$_.Current.AutomationId })
+    ownerIds = @($owners | ForEach-Object { [string]$_.Current.AutomationId })
+    ownerNames = @($owners | ForEach-Object { [string]$_.Current.Name })
+    sectionIds = @($sections | ForEach-Object { [string]$_.Current.AutomationId })
+    sectionNames = @($sections | ForEach-Object { [string]$_.Current.Name })
+    rowBoundsValid = $rowBoundsValid
+    controlsValid = $controlsValid
+    controlsChecked = $controls.Count
+  }
+}
+
 function Assert-Ids([string[]] $actual, [string[]] $expected, [string] $label) {
   Require (@($actual).Count -eq @($expected).Count) "$label count expected $($expected.Count) but found $($actual.Count): $($actual -join ',')"
   Require ((@($actual) -join "|") -eq (@($expected) -join "|")) "$label expected $($expected -join ',') but found $($actual -join ',')"
@@ -3245,6 +3308,14 @@ function Get-MultiProjectExpectedCanvasRoster([string] $surface, $owners, $selec
   return ,@([ordered]@{ automationId = Get-MultiProjectAutomationId "project-card" $selectedOwner.path $selectedOwner.node
     name = $selectedOwner.title; classification = "node"; identityKind = "project-card"
     projectPath = $selectedOwner.path; nodeID = $selectedOwner.node })
+}
+
+function Test-MultiProjectOwnerSelection([string] $surface, $owner, $selectedOwner,
+    [bool] $projectSelected, [bool] $loopSelected) {
+  $selected = $false
+  if ($null -ne $selectedOwner) { $selected = $selectedOwner.path -ceq $owner.path }
+  $expectedProjectSelected = $surface -ceq "project" -and $selected
+  return $projectSelected -eq $expectedProjectSelected -and $loopSelected -eq $selected
 }
 
 function Test-MultiProjectObservedRoster([string] $surface, $projection, $expectedOwners, $selectedOwner, [int] $processId) {
@@ -4586,7 +4657,6 @@ function Invoke-MultiProjectRenamePhase {
       $cardId = Get-MultiProjectAutomationId $kind $owner.path $owner.node
       $card = @($ownedGraphMetadata | Where-Object { $_.automationID.value -ceq $cardId } | ForEach-Object { $_.element })
       $cardRequired = $surface -ceq "overview" -or ($null -ne $selectedOwner -and $selectedOwner.path -ceq $owner.path)
-      $selected = $null -ne $selectedOwner -and $selectedOwner.path -ceq $owner.path
       $projectSelected = $false; $loopSelected = $false
       if ($null -ne $project) { $projectSelected = $project.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Current.IsSelected }
       if ($null -ne $loop) { $loopSelected = $loop.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Current.IsSelected }
@@ -4597,7 +4667,9 @@ function Invoke-MultiProjectRenamePhase {
         $matches = $matches -and $projectEvidence.bounds[2] -gt $projectEvidence.bounds[0] -and
           $projectEvidence.bounds[3] -gt $projectEvidence.bounds[1] -and
           $loopEvidence.bounds[2] -gt $loopEvidence.bounds[0] -and $loopEvidence.bounds[3] -gt $loopEvidence.bounds[1]
-        if ($null -ne $selectedOwner) { $matches = $matches -and $projectSelected -eq $selected -and $loopSelected -eq $selected }
+        if ($null -ne $selectedOwner) {
+          $matches = $matches -and (Test-MultiProjectOwnerSelection $surface $owner $selectedOwner $projectSelected $loopSelected)
+        }
       }
       $cardEvidence = $null
       if ($cardRequired) {
@@ -5376,25 +5448,43 @@ try {
   Require (-not $process.HasExited) `
     "shell exited with code $($process.ExitCode) after a genuine click on the sidebar update banner"
 
+  Require ([GraphCodeUiaGateState]::PostFixtureMutation($process.MainWindowHandle, 22)) `
+    "temporary sidebar remote owner fixture mutation was rejected"
+  Start-Sleep -Milliseconds 150
   $navigationIds = @("overview-destination", "quick-chats-destination")
   $canvasActionIds = @("canvas-primary-action", "zoom-out", "actual-size", "zoom-in", "fit-canvas")
-  $projectRows = @(Get-DirectChildren $projects $rawWalker | Where-Object { $_.Current.AutomationId -match '^project-row-' })
-  $openProjectRows = @(Get-DirectChildren $projects $rawWalker | Where-Object { $_.Current.AutomationId -match '^open-project-' })
   $graphDestination = Find-FragmentById $root "overview-destination" $rawWalker
+  $quickChatsDestination = Find-FragmentById $root "quick-chats-destination" $rawWalker
+  Require ($null -ne $graphDestination) "Graph sidebar destination was not exposed"
+  Require ($null -ne $quickChatsDestination) "Quick Chats sidebar destination was not exposed"
+  $sidebarNavigationChildren = @(Get-DirectChildren $projects $rawWalker)
+  if (@($sidebarNavigationChildren | Where-Object { $_.Current.AutomationId -eq "overview-destination" }).Count -eq 0) {
+    $sidebarNavigationChildren += $graphDestination
+  }
+  if (@($sidebarNavigationChildren | Where-Object { $_.Current.AutomationId -eq "quick-chats-destination" }).Count -eq 0) {
+    $sidebarNavigationChildren += $quickChatsDestination
+  }
+  $sidebarNavigation = Get-SidebarNavigationSnapshot $sidebarNavigationChildren
   Require (($null -ne $graphDestination) -and ($graphDestination.Current.Name -eq "Graph")) `
     "global sidebar destination did not expose the pinned Graph identity"
-  Require ($projectRows.Count -eq 1) "Projects did not expose grouped recent rows"
-  Require ($openProjectRows.Count -eq 1) "Projects did not expose the separate open-project row"
-  Require ((@($projectRows | ForEach-Object { $_.Current.Name }) -join "|") -eq "Fixture remote") "recent project row names were not synchronized"
-  Require ($openProjectRows[0].Current.Name -eq "UIA project") "open project row name was not synchronized"
-  foreach ($projectRow in $projectRows) {
-    Require (($projectRow.Current.BoundingRectangle.Width -gt 0) -and
-             ($projectRow.Current.BoundingRectangle.Height -gt 0)) "dynamic project row has empty bounds"
-  }
-  foreach ($projectRow in $openProjectRows) {
-    Require (($projectRow.Current.BoundingRectangle.Width -gt 0) -and
-             ($projectRow.Current.BoundingRectangle.Height -gt 0)) "open project row has empty bounds"
-  }
+  Require ($quickChatsDestination.Current.Name -eq "Quick Chats") `
+    "Quick Chats sidebar destination did not expose its pinned identity"
+  Assert-Ids $sidebarNavigation.destinationIds $navigationIds "sidebar destinations"
+  Assert-Ids $sidebarNavigation.destinationNames @("Graph", "Quick Chats") "sidebar destination names"
+  Require ($sidebarNavigation.recentRowIds.Count -eq 0) `
+    "unopened recent folders were projected as sidebar destinations"
+  Assert-Ids $sidebarNavigation.ownerNames @("UIA project", "Temporary remote") "open sidebar owner order"
+  Assert-Ids $sidebarNavigation.sectionNames @("Local Projects", "Remote Repositories") "open sidebar sections"
+  Require ($sidebarNavigation.rowBoundsValid) "sidebar destinations, sections, or open owners had empty bounds"
+  Require ($sidebarNavigation.controlsValid -and $sidebarNavigation.controlsChecked -gt 0) `
+    "sidebar row controls were missing or outside their owner row"
+  $projectRows = @($sidebarNavigationChildren | Where-Object { $_.Current.AutomationId -match '^project-row-' })
+  $openProjectRows = @($sidebarNavigationChildren | Where-Object { $_.Current.AutomationId -match '^open-project-' } |
+    Sort-Object { $_.Current.BoundingRectangle.Top })
+  Require ($projectRows.Count -eq 0) "unopened recent folders appeared as project rows"
+  Require ($openProjectRows.Count -eq 2) "open sidebar owner rows were not both exposed"
+  Require (($openProjectRows | ForEach-Object { $_.Current.Name }) -join "|" -eq "UIA project|Temporary remote") `
+    "open owner names or navigation order were not synchronized"
   # The fixture's "UIA loop B" is awaitingInput, so Needs-you must be populated
   # here. Reaching the detail checks is mandatory: an empty set is a failure, not
   # a pass. Evidence is captured as values now, because the elements themselves
@@ -5432,35 +5522,46 @@ try {
   }
   Write-Host ("UIA_NEEDS_YOU_EVIDENCE=" + ($needsYouEvidence | ConvertTo-Json -Compress -Depth 4))
   $null = $projects.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern)
-  $null = $projectRows[0].GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
-  $projectRowInvoke = $projectRows[0].GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
-  $projectRowIds = @($projectRows | ForEach-Object { $_.Current.AutomationId })
+  $null = $openProjectRows[0].GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
+  $projectRowInvoke = $openProjectRows[0].GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+  $projectRowIds = @($openProjectRows | ForEach-Object { $_.Current.AutomationId })
   $projectChildIds = @(Get-DirectChildren $projects $rawWalker |
     ForEach-Object { $_.Current.AutomationId } | Where-Object { $_ })
   $null = Assert-FragmentLinks $projects $rawWalker $projectChildIds "RawView Projects"
   $null = Assert-FragmentLinks $projects $controlWalker $projectChildIds "ControlView Projects"
+  $localSection = @(Get-DirectChildren $projects $rawWalker | Where-Object {
+    $_.Current.AutomationId -match '^sidebar-section-' -and $_.Current.Name -eq "Local Projects"
+  }) | Select-Object -First 1
+  Require ($null -ne $localSection) "Local Projects section did not expose its section action"
+  $localSection.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+  Start-Sleep -Milliseconds 150
+  $afterLocalCollapse = Get-SidebarNavigationSnapshot @(Get-DirectChildren $projects $rawWalker)
+  Assert-Ids $afterLocalCollapse.ownerNames @("Temporary remote") "owners after local-section collapse"
+  $localSection = @(Get-DirectChildren $projects $rawWalker | Where-Object {
+    $_.Current.AutomationId -match '^sidebar-section-' -and $_.Current.Name -eq "Local Projects"
+  }) | Select-Object -First 1
+  $localSection.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+  Start-Sleep -Milliseconds 150
   $remoteSection = @(Get-DirectChildren $projects $rawWalker | Where-Object {
     $_.Current.AutomationId -match '^sidebar-section-' -and $_.Current.Name -eq "Remote Repositories"
   }) | Select-Object -First 1
-  Require ($null -ne $remoteSection) "Remote sidebar section did not expose its section action"
-  $remoteRowId = @($projectRows | Where-Object { $_.Current.Name -eq "Fixture remote" })[0].Current.AutomationId
+  Require ($null -ne $remoteSection) "Remote Repositories section did not expose its section action"
   $remoteSection.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
   Start-Sleep -Milliseconds 150
-  $collapsedProjectNames = @(Get-DirectChildren $projects $rawWalker |
-    Where-Object { $_.Current.AutomationId -match '^(project-row|open-project)-' } |
-    ForEach-Object { $_.Current.Name })
-  Require (("Fixture remote" -notin $collapsedProjectNames) -and
-           ("UIA project" -in $collapsedProjectNames)) `
-    "Remote section collapse did not hide only the unopened recent folder"
-  $openProjectAfterRemoteCollapse = @(Get-DirectChildren $projects $rawWalker | Where-Object {
-    $_.Current.AutomationId -match '^open-project-' -and $_.Current.Name -eq 'UIA project'
-  }) | Select-Object -First 1
-  Require ($null -ne $openProjectAfterRemoteCollapse) "open project row disappeared when collapsing recents"
+  $afterRemoteCollapse = Get-SidebarNavigationSnapshot @(Get-DirectChildren $projects $rawWalker)
+  Assert-Ids $afterRemoteCollapse.ownerNames @("UIA project") "owners after remote-section collapse"
   $remoteSection = @(Get-DirectChildren $projects $rawWalker | Where-Object {
     $_.Current.AutomationId -match '^sidebar-section-' -and $_.Current.Name -eq "Remote Repositories"
   }) | Select-Object -First 1
   $remoteSection.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
   Start-Sleep -Milliseconds 150
+  Require ([GraphCodeUiaGateState]::PostFixtureMutation($process.MainWindowHandle, 20)) `
+    "sidebar parity fixture restore was rejected"
+  Start-Sleep -Milliseconds 150
+  $restoredSidebar = Get-SidebarNavigationSnapshot @(Get-DirectChildren $projects $rawWalker)
+  Assert-Ids $restoredSidebar.ownerNames @("UIA project") "restored open sidebar owners"
+  Assert-Ids $restoredSidebar.sectionNames @("Local Projects") "restored sidebar sections"
+  Require ($restoredSidebar.recentRowIds.Count -eq 0) "restored sidebar fixture retained unopened recent rows"
 
   $loopRows = @(Get-DirectChildren $loops $rawWalker | Where-Object {
     $_.Current.AutomationId -match '^loop-row-'
