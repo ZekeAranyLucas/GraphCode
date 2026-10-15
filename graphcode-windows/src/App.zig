@@ -7868,7 +7868,7 @@ pub const App = struct {
                     const key = std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ graph.project.path, node.id }) catch return;
                     defer self.allocator.free(key);
                     self.appendAccessibilityElement(&elements, &owned_identities, "project-card", key, node.title, 4, .{ .logical = bounds }, self.model.selected_index == index, false) catch return;
-                    if (GraphCanvas.hitTestAttentionAction(graph.nodes.items, graph.edges.items, bounds.right - 20, bounds.bottom - 12, &self.canvas) != null) {
+                    if (GraphCanvas.attentionActionVisible(node, graph.nodes.items, graph.edges.items)) {
                         self.appendAccessibilityElement(&elements, &owned_identities, "attention-action", key, GraphCanvas.attentionActionLabel(node), 4, .{ .logical = GraphCanvas.attentionActionBounds(bounds, &self.canvas) }, false, false) catch return;
                     }
                     if (GraphCanvas.hasReclaimOffer(node, current_inspection, self.kept_worktree_paths.items)) {
@@ -19752,11 +19752,11 @@ test "DPI UIA logical cards headers sidebar and direct inserts scale once" {
         }, false);
     }
     try expectDpiAccessibility(.project, null, &.{
-        .{ .identity = "project-card:A:loop", .bounds = .{ .{ 252, 84, 502, 190 }, .{ 378, 126, 753, 285 }, .{ 504, 168, 1004, 380 } } },
+        .{ .identity = "project-card:A:loop", .bounds = .{ .{ 252, 84, 502, 180 }, .{ 378, 126, 753, 270 }, .{ 504, 168, 1004, 360 } } },
         .{ .identity = "canvas-alert:ingress", .bounds = .{ .{ 244, 556, 1176, 612 }, .{ 366, 834, 1764, 918 }, .{ 488, 1112, 2352, 1224 } } },
     }, false);
     try expectDpiAccessibility(.overview, null, &.{
-        .{ .identity = "overview-card:A:loop", .bounds = .{ .{ 262, 118, 482, 204 }, .{ 393, 177, 723, 306 }, .{ 524, 236, 964, 408 } } },
+        .{ .identity = "overview-card:A:loop", .bounds = .{ .{ 262, 118, 512, 214 }, .{ 393, 177, 768, 321 }, .{ 524, 236, 1024, 428 } } },
     }, false);
     try expectDpiAccessibility(.quick_chats, null, &.{
         .{ .identity = "quick-chat-card:chat", .bounds = .{ .{ 262, 88, 482, 152 }, .{ 393, 132, 723, 228 }, .{ 524, 176, 964, 304 } } },
@@ -19887,6 +19887,85 @@ fn overviewTestApp(dpi: u32) !App {
         null,
     ) orelse return error.TestWindowCreationFailed;
     return app;
+}
+
+test "loop card parity UIA actions share painted logical bounds and scale once" {
+    const Sink = struct {
+        app: *App,
+        seen: usize = 0,
+        checked: bool = false,
+        failure: ?anyerror = null,
+
+        fn syncCanvasBounds(_: *@This(), _: c.RECT) void {}
+
+        fn syncElements(self: *@This(), _: []const u8, elements: []const Accessibility.DynamicElement, _: WorktreeStatus.Policy, _: Accessibility.WorktreeCapabilities) void {
+            self.checked = true;
+            self.check(elements) catch |err| {
+                self.failure = err;
+            };
+        }
+
+        fn check(self: *@This(), elements: []const Accessibility.DynamicElement) !void {
+            self.seen = 0;
+            const app = self.app;
+            const graph = app.model.graph.?;
+            const attention = GraphCanvas.attentionActionBounds(GraphCanvas.nodeBounds(0, &app.canvas), &app.canvas);
+            const reclaim = GraphCanvas.reclaimOfferBounds(GraphCanvas.nodeBounds(1, &app.canvas));
+            const expected = [_]struct { identity: []const u8, bounds: c.RECT, present: bool }{
+                .{ .identity = "attention-action:C:\\notice-a:question", .bounds = attention, .present = true },
+                .{ .identity = "reclaim:C:\\notice-a:resolved", .bounds = reclaim.reclaim, .present = app.kept_worktree_paths.items.len == 0 },
+                .{ .identity = "keep:C:\\notice-a:resolved", .bounds = reclaim.keep, .present = app.kept_worktree_paths.items.len == 0 },
+                .{ .identity = "attention-action:C:\\notice-a:resolved", .bounds = .{}, .present = false },
+                .{ .identity = "attention-action:C:\\notice-a:ordinary", .bounds = .{}, .present = false },
+                .{ .identity = "reclaim:C:\\notice-a:unsafe", .bounds = .{}, .present = false },
+                .{ .identity = "keep:C:\\notice-a:unsafe", .bounds = .{}, .present = false },
+            };
+            try std.testing.expect(GraphCanvas.attentionActionVisible(graph.nodes.items[0], graph.nodes.items, graph.edges.items));
+            for (expected) |target| {
+                var matches: usize = 0;
+                for (elements) |element| {
+                    if (!std.mem.eql(u8, element.identity, target.identity)) continue;
+                    matches += 1;
+                    try std.testing.expect(target.present);
+                    try std.testing.expectEqualDeep([4]i32{
+                        physicalCoordinate(target.bounds.left, app.dpi),
+                        physicalCoordinate(target.bounds.top, app.dpi),
+                        physicalCoordinate(target.bounds.right, app.dpi),
+                        physicalCoordinate(target.bounds.bottom, app.dpi),
+                    }, [4]i32{ element.left, element.top, element.right, element.bottom });
+                }
+                try std.testing.expectEqual(@as(usize, if (target.present) 1 else 0), matches);
+                self.seen += matches;
+            }
+            try std.testing.expect(self.seen > 0);
+        }
+    };
+    for ([_]u32{ 96, 120, 144, 192 }) |dpi| {
+        var app = try overviewTestApp(dpi);
+        defer deinitOverviewTestApp(&app);
+        app.surface = .project;
+        app.canvas = .{ .zoom = 1.25, .pan_x = -37, .pan_y = 23 };
+        _ = try app.model.updateFromFrame(
+            \\{"version":2,"kind":"event","sequence":1,"event":{"graphChanged":{"project":{"path":"C:\\notice-a","name":"Card parity"},"nodes":[{"id":"question","title":"Named question","state":"running","presence":"awaitingInput"},{"id":"resolved","title":"Safe reclaim","state":"succeeded","worktreeBinding":{"path":"C:\\notice-a\\tree-1"}},{"id":"ordinary","title":"Ordinary idle","state":"idle"},{"id":"unsafe","title":"Primary checkout","state":"succeeded","worktreeBinding":{"path":"C:\\notice-a\\tree-0"}}],"edges":[]}}}
+        );
+        try std.testing.expect(app.model.selectProject("C:\\notice-a"));
+        try installNoticeTestInspection(&app, "C:\\notice-a", 2, 1024);
+        const question = GraphCanvas.attentionActionBounds(GraphCanvas.nodeBounds(0, &app.canvas), &app.canvas);
+        try std.testing.expectEqual(@as(?usize, 0), GraphCanvas.hitTestAttentionAction(app.model.graph.?.nodes.items, app.model.graph.?.edges.items, question.left + 1, question.top + 1, &app.canvas));
+        var sink = Sink{ .app = &app };
+        app.syncAccessibilityTo(&sink, .{ .left = 0, .top = 0, .right = 1200, .bottom = 900 });
+        try std.testing.expect(sink.checked);
+        if (sink.failure) |err| return err;
+        try std.testing.expectEqual(@as(usize, 3), sink.seen);
+        try app.kept_worktree_paths.append(try app.allocator.dupe(u8, "C:\\notice-a\\tree-1"));
+        sink.checked = false;
+        app.syncAccessibilityTo(&sink, .{ .left = 0, .top = 0, .right = 1200, .bottom = 900 });
+        try std.testing.expect(sink.checked);
+        if (sink.failure) |err| return err;
+        try std.testing.expectEqual(@as(usize, 1), sink.seen);
+        for (app.kept_worktree_paths.items) |path| app.allocator.free(path);
+        app.kept_worktree_paths.clearRetainingCapacity();
+    }
 }
 
 fn loadActivationTestFixture(app: *App) !void {
@@ -20052,9 +20131,9 @@ test "cross-project overview Open actions select exact projects and emit DPI sco
         app.openGlobalOverview();
         try expectOverviewSelection(&app, .overview, "A", "a4");
         const beta_bounds: [4]i32 = switch (dpi) {
-            96 => .{ 262, 442, 482, 528 },
-            144 => .{ 393, 663, 723, 792 },
-            else => .{ 524, 884, 964, 1056 },
+            96 => .{ 262, 442, 512, 538 },
+            144 => .{ 393, 663, 768, 807 },
+            else => .{ 524, 884, 1024, 1076 },
         };
         var overview = OverviewAccessibilitySink{ .card_count = 6, .expected = &.{
             .{ .identity = "open-project:A", .selected = true },
@@ -20139,11 +20218,11 @@ test "cross-project overview refresh emits both projects without changing the se
     var sink = OverviewAccessibilitySink{ .card_count = 6, .expected = &.{
         .{ .identity = "open-project:A" },
         .{ .identity = "open-project:B", .selected = true },
-        .{ .identity = "overview-card:A:a4", .name = "Alpha refreshed", .bounds = .{ 262, 118, 482, 204 } },
-        .{ .identity = "overview-card:A:a1", .name = "Alpha 1", .bounds = .{ 508, 118, 728, 204 } },
+        .{ .identity = "overview-card:A:a4", .name = "Alpha refreshed", .bounds = .{ 262, 118, 512, 214 } },
+        .{ .identity = "overview-card:A:a1", .name = "Alpha 1", .bounds = .{ 522, 118, 772, 214 } },
         .{ .identity = "overview-card:A:a2" },
         .{ .identity = "overview-card:A:a3" },
-        .{ .identity = "overview-card:B:b1", .bounds = .{ 262, 442, 482, 528 } },
+        .{ .identity = "overview-card:B:b1", .bounds = .{ 262, 442, 512, 538 } },
         .{ .identity = "overview-card:B:b2", .name = "Beta 2" },
     } };
     try sink.expect(&app);
