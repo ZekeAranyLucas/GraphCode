@@ -69,6 +69,59 @@ truth for status. The issues carry the acceptance criteria and the priority.
 
 ## Wave 2 (started 2026-10-14)
 
+**Runtime retrospective (2026-10-16):** PowerShell's `$name:` interpolation trap
+caused parser failures in both a capture worker and the zmx diagnostic worker.
+The canonical kickoff now says: "In PowerShell strings, use `${name}:` before a
+colon." Parse the saved script before any process launch; a parser failure is
+preflight evidence, not a failed product or diagnostic run.
+
+The card-paint slice's M2 reached 63 recorded tool execution starts against a
+40-call budget; a later 15-call review-correction box reached 26 despite an
+explicit "at 13 write the handoff and stop" instruction. Interactive mode and
+prompt-level counting did not enforce either limit within a single turn.
+The operator therefore corrected the policy: milestone call counts are advisory;
+binding boxes use wall-clock time plus the milestone outcome, with coordinator
+STOP at the deadline. Record overruns without penalising real progress or
+treating a harness limit as misconduct. Keep the hard lifetime backstops of
+400 calls, six hours and 60 AI credits. Preserve failed evidence and lifetime
+totals; only an explicit operator decision opens or extends a timed box.
+
+The operator also delegated recovery from test-harness or self-authored script
+mistakes within an active box to the coordinator: binding, StrictMode, parse and
+argument corrections do not need another operator round trip when production is
+untouched, assertions are not weakened, failures are reported before retry, and
+the same deadline still binds. Workers do not gain unreported self-retry authority.
+Scope, production, gate or policy changes, or an expired box missing its milestone,
+still go to the operator.
+
+**Job-scoped capture gates.** Foreign host builds and pre-existing outside-job
+`vctip` are nonblocking: record their identities without adopting or killing them.
+Host `zmx` still blocks admission; in-job `vctip` fails. Owned-job zero-process,
+kernel and actual EOF gates are unchanged. Do not generalise these gates to
+"no process or handle anywhere".
+
+**Timing instrumentation can perturb its budget.** The synchronous
+`CopyCompleted` append plus `Flush(true)` was removed from inside the 1000 ms
+read budget. Open/copy accumulators, failure diagnostics, existing failure-only
+observation and ReadVerified/flush/retry/deadline semantics were retained;
+no budget was widened. Gjp8 and the same-head `58a7723b` Windows 2025 diagnostic
+passed after removal, but attribution to a specific Defender or disk stall is
+**unobserved**. Historical Gjp5 E4B6 predates `CopyCompleted`, so that
+instrumentation cannot explain its older N1 failure. Actor-cleanup cause remains
+unobserved and tracked in [#846](https://github.com/scgopi/GraphCode/issues/846).
+Preserve failed attempts alongside the passing diagnostic.
+
+**PR-body edit coordination.** Before Ready, freeze one exact authoritative live
+body, retain raw API bytes and their hash, and use a conditional update guard
+against concurrent operator/agent edits. Stop and report actual content drift;
+do not edit blindly to chase a derived hash. Distinguish line-ending/terminal-LF
+transformations, sentence ordering and missing factual text. For
+[#845](https://github.com/scgopi/GraphCode/pull/845), the user's final explicit
+authoritative body `0FEB` superseded derived `522` after only a sentence-placement
+difference, not an encoding-only change. The worker's post-push tuple guard
+failed without retaining the offending field: no API race or eventual-consistency
+cause was observed. This is a coordination risk lesson, not causal attribution.
+
 Every worker uses `investigation/windows-parity-lane-kickoff.md`. Each issue goes
 through four steps:
 

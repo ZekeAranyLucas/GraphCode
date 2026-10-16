@@ -63,6 +63,8 @@ The coordinator's kickoff message adds only an issue block:
 - the lane letter and session id (for example `c4`);
 - the file lease;
 - the implementer and reviewer models;
+- the milestone outcome and binding wall-clock deadline, advisory call budget,
+  and hard lifetime backstops;
 - any decisions already made.
 
 Everything else is here, so lanes don't depend on hand-copied instructions.
@@ -159,6 +161,28 @@ separately gated stock-only real-window route.
 - **Edit only your lane's files.** For anything else, send the coordinator the exact file,
   function and reason, and wait for approval.
 - **`App.zig` is shared.** Keep edits narrow.
+
+## Milestone call counting
+
+Record primitive calls, parallel wrappers, failed calls and closeout operations.
+Milestone call budgets are **advisory** (operator correction, 2026-10-16):
+interactive mode and a prompt-level handoff number do not enforce a call cap
+within a single assistant turn. Record overruns as harness limits, not misconduct
+or an automatic reason to replace an owner making real progress.
+
+The **wall-clock deadline and milestone outcome are binding**. At that deadline,
+handoff and stop even if coverage is incomplete; the coordinator may send STOP.
+The hard lifetime backstops remain **400 calls, six hours and 60 AI credits**,
+with UNKNOWN credit telemetry disclosed rather than estimated. A completion
+reminder or "same box" instruction does not reset or extend those backstops or
+the wall-clock deadline; only an explicit operator decision does.
+
+Within an active box, the coordinator may approve a test-harness or self-authored
+script correction (binding, StrictMode, parse or argument typo) without another
+operator round trip only if production is untouched, assertions are not weakened,
+each failure is reported before retrying, and the same deadline remains binding.
+This is not permission for unreported worker retries. Escalate scope, production,
+gate or policy changes, and a box that ends without its milestone, to the operator.
 
 ## Environment: do exactly this
 
@@ -264,6 +288,8 @@ Replace `<id>` with your lane id, for example `c4`.
    - For Zig, pass `--cache-dir` and `--global-cache-dir` under `C:\gcs\<id>`.
    - Set `TEMP` and `TMP` process-only.
    - Pester 5.7.1 is at `C:\v5modules`; prepend it to `PSModulePath` for that process only.
+   - In PowerShell strings, use `${name}:` before a colon. Unbraced `$name:`
+     is parsed as a scope or drive qualifier; check `Parser.ParseFile` before launching processes.
 4. **Profiles and fixtures:**
    - Use a process-scoped scratch profile. A stale delete-pending
      `%LOCALAPPDATA%\GraphCode\zmx-validation-ee\logs\zmx.log` breaks the default-profile guard.
