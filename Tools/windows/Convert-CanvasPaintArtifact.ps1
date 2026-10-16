@@ -611,6 +611,7 @@ if (($transportNames -join "`n") -cne ($expectedNames -join "`n")) {
 
 $transportFacts = [Collections.Generic.List[object]]::new()
 $canonicalBitmap = $null
+$canonicalBitmapStream = $null
 for ($index = 0; $index -lt $expectedTransportNames.Count; $index++) {
   $bmpPath = Join-Path $transportRoot $expectedTransportNames[$index]
   if (-not (Test-Path -LiteralPath $bmpPath -PathType Leaf)) {
@@ -618,8 +619,10 @@ for ($index = 0; $index -lt $expectedTransportNames.Count; $index++) {
   }
   if (Test-HasReparseComponent $bmpPath) { Stop-Artifact "ReparsePoint" "BMP transport may not be a reparse point." }
   $bmpHeader = Read-BmpHeader $bmpPath
-  $bitmap = [Drawing.Bitmap]::new($bmpPath)
+  $bitmapStream = [IO.File]::Open($bmpPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+  $bitmap = $null
   try {
+    $bitmap = [Drawing.Bitmap]::new($bitmapStream)
     if ($bitmap.Width -ne $bmpHeader.Width -or $bitmap.Height -ne $bmpHeader.Height) {
       Stop-Artifact "BmpDecodeGeometryMismatch" "Decoded BMP dimensions differ from its header."
     }
@@ -640,8 +643,10 @@ for ($index = 0; $index -lt $expectedTransportNames.Count; $index++) {
         Stop-Artifact "BmpHashMismatch" "Canonical BMP file hash does not match the native receipt."
       }
       $canonicalBitmap = $bitmap
+      $canonicalBitmapStream = $bitmapStream
     } else {
       $bitmap.Dispose()
+      $bitmapStream.Dispose()
     }
     $transportFacts.Add([ordered]@{
         name = $expectedTransportNames[$index]
@@ -649,10 +654,13 @@ for ($index = 0; $index -lt $expectedTransportNames.Count; $index++) {
         decodedRgbSha256 = $decodedRgbHash
       })
   } catch {
-    $bitmap.Dispose()
+    if ($null -ne $bitmap) { $bitmap.Dispose() }
+    $bitmapStream.Dispose()
     if ($null -ne $canonicalBitmap) {
       $canonicalBitmap.Dispose()
       $canonicalBitmap = $null
+      $canonicalBitmapStream.Dispose()
+      $canonicalBitmapStream = $null
     }
     throw
   }
@@ -844,14 +852,17 @@ namespace GraphCode.PaintArtifactTests
       })
   }
 
-  $pngBitmap = [Drawing.Bitmap]::new($pngPath)
+  $pngReadStream = [IO.File]::Open($pngPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+  $pngBitmap = $null
   try {
+    $pngBitmap = [Drawing.Bitmap]::new($pngReadStream)
     if ($pngBitmap.Width -ne 1280 -or $pngBitmap.Height -ne 720) {
       Stop-Artifact "PngGeometryMismatch" "PNG decode changed the 1280x720 canvas dimensions."
     }
     $pngRgbHash = Get-DecodedRgbSha256 $pngBitmap
   } finally {
-    $pngBitmap.Dispose()
+    if ($null -ne $pngBitmap) { $pngBitmap.Dispose() }
+    $pngReadStream.Dispose()
   }
   if ($pngRgbHash -cne $receipt.renderRgbSha256[0]) {
     Stop-Artifact "PngRgbHashMismatch" "PNG decoded RGB pixels differ from the native paint render."
@@ -1009,4 +1020,5 @@ namespace GraphCode.PaintArtifactTests
     Write-Warning "Failed artifact staging preserved at $stagingFull"
   }
   if ($null -ne $canonicalBitmap) { $canonicalBitmap.Dispose() }
+  if ($null -ne $canonicalBitmapStream) { $canonicalBitmapStream.Dispose() }
 }
