@@ -4724,6 +4724,14 @@ if ($uiCaptureSummary.executed -isnot [long] -or $uiCaptureSummary.executed -le 
     $uiCaptureSummary.failed -isnot [long] -or $uiCaptureSummary.failed -ne 0) {
   throw "RED: offline real-launch capture child has no positive executed/passed contract count"
 }
+$agentCommandOutput = @(& $pwsh -NoProfile -File (
+    Join-Path $PSScriptRoot "Invoke-AgentCommand.Tests.ps1"))
+$agentCommandSummary = "Invoke-AgentCommand.Tests.ps1: PASS; executed=6; cases=argument-stream-marker,zero-arguments,existing-console,existing-marker,parse-failure,child-nonzero"
+if ($LASTEXITCODE -ne 0 -or $agentCommandOutput.Count -ne 1 -or
+    ([string]$agentCommandOutput[0]) -cne $agentCommandSummary) {
+  throw "RED: agent command contract failed or did not report exactly six cases: $($agentCommandOutput -join ' | ')"
+}
+
 
 Write-Host "ValidationRunner.Tests.ps1: PASS"
 exit 0
