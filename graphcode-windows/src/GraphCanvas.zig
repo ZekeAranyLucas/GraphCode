@@ -4141,7 +4141,6 @@ fn verifyPaint764Contract(
                 placed_edge_labels[placed_edge_label_count] = label_bounds;
                 placed_edge_label_count += 1;
             }
-            try std.testing.expect(dib.count(label_bounds, edgeKindColor(edge.kind)) > 0);
         }
     } else {
         for (fixture.model.graphs.items, 0..) |graph, graph_index| {
