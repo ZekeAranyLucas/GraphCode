@@ -2,6 +2,7 @@ param(
     [Parameter(Mandatory)][string]$OwnedRoot,
     [Parameter()][string]$AuthorizationPath,
     [Parameter()][string]$AuthorizationSha256,
+    [switch]$AwaitSupervisorGate,
     [Parameter()][switch]$DefinitionsOnly
 )
 $ErrorActionPreference = 'Stop'
@@ -109,6 +110,9 @@ function Write-CapProcessJournal {
         windowHandle = if ($Window -ne [IntPtr]::Zero) { [long]$Window.ToInt64() } else { 0 }
         registeredUtc = [DateTime]::UtcNow.ToString('o')
     }
+    if ($Identity.PSObject.Properties['JobId']) {
+        $entry | Add-Member -NotePropertyName jobId -NotePropertyValue $Identity.JobId
+    }
     $index = -1
     for ($i = 0; $i -lt $journalEntries.Count; $i++) {
         if ($journalEntries[$i].pid -eq $entry.pid -and
@@ -153,28 +157,45 @@ function Get-CapWorkerProcessReceipts {
             streamOwnerPid = [long]$identity.Pid
             streamOwnerCreationFileTimeUtc = [long]$identity.CreationFileTimeUtc
         }
+        if ($run.PSObject.Properties['JobId']) {
+            if (-not $run.CleanupComplete -or $null -eq $run.OutputProof) { throw 'Contained root lacks job/file closure.' }
+            $record | Add-Member -NotePropertyName outputProof -NotePropertyValue $run.OutputProof
+        }
         if ($roots.ContainsKey($identity.Pid)) { throw 'Duplicate managed-root process generation.' }
         $roots[$identity.Pid] = $record
         $records.Add($record)
     }
     foreach ($identity in $descendantIdentities) {
-        $parentPid = $identity.ParentPid
-        $visited = [Collections.Generic.HashSet[int]]::new()
-        while (-not $roots.ContainsKey($parentPid)) {
-            if (-not $visited.Add([int]$parentPid)) { throw 'Descendant ownership cycle.' }
-            $parents = @($descendantIdentities | Where-Object { $_.Pid -eq $parentPid })
-            if ($parents.Count -ne 1) { throw 'Descendant has no unique owning managed stream root.' }
-            $parentPid = $parents[0].ParentPid
+        if ($identity.PSObject.Properties['JobId']) {
+            $jobRoots = @($roots.Values | Where-Object {
+                $_.PSObject.Properties['outputProof'] -and $_.outputProof.jobId -ceq $identity.JobId
+            })
+            if ($jobRoots.Count -ne 1) { throw 'Job member lacks its unique held launcher output owner.' }
+            $owner = $jobRoots[0]
+        } else {
+            $parentPid = $identity.ParentPid
+            $visited = [Collections.Generic.HashSet[int]]::new()
+            while (-not $roots.ContainsKey($parentPid)) {
+                if (-not $visited.Add([int]$parentPid)) { throw 'Descendant ownership cycle.' }
+                $parents = @($descendantIdentities | Where-Object { $_.Pid -eq $parentPid })
+                if ($parents.Count -ne 1) { throw 'Descendant has no unique owning managed stream root.' }
+                $parentPid = $parents[0].ParentPid
+            }
+            $owner = $roots[$parentPid]
         }
-        $owner = $roots[$parentPid]
-        $records.Add([pscustomobject]@{
+        $record = [pscustomobject]@{
             pid = [long]$identity.Pid; creationFileTimeUtc = [long]$identity.CreationFileTimeUtc
             expectedImagePath = $identity.ExpectedImagePath; role = $identity.Role
             parentPid = [long]$identity.ParentPid; sessionId = [long]$identity.SessionId
             kernelExited = [CapNative]::IsExited($identity.Process.Handle, $identity.Pid)
             stdoutEof = $owner.stdoutEof; stderrEof = $owner.stderrEof
             streamOwnerPid = $owner.pid; streamOwnerCreationFileTimeUtc = $owner.creationFileTimeUtc
-        })
+        }
+        if ($identity.PSObject.Properties['JobId']) {
+            $record.stdoutEof = $false; $record.stderrEof = $false
+            $record | Add-Member -NotePropertyMembers @{ outputKind = 'OWNED_FILES_JOB'; jobId = $identity.JobId }
+        }
+        $records.Add($record)
     }
     return @($records.ToArray())
 }
@@ -229,7 +250,7 @@ function Initialize-CapPhaseRoot {
     Write-CapTrace -Command $MyInvocation.MyCommand.Name -Parameters $PSBoundParameters
 
     $phaseRoot = Assert-CapOwnedPath $PhaseRoot
-    foreach ($name in @('support', 'local', 'profile', 'temp', 'tmp', 'zmx', 'peer')) {
+    foreach ($name in @('support', 'local', 'profile', 'temp', 'tmp', 'peer')) {
         $null = New-Item -ItemType Directory -Path (Join-Path $phaseRoot $name) -Force
     }
     $support = Join-Path $phaseRoot 'support'
@@ -237,7 +258,9 @@ function Initialize-CapPhaseRoot {
     [IO.File]::WriteAllText((Join-Path $support 'settings.json'),
         '{"defaultBackend":"copilotCLI","showsActivityStrip":true,"briefsSessionsAboutTheGraph":false}',
         [Text.UTF8Encoding]::new($false))
-    $zmx = Join-Path $phaseRoot 'zmx'
+    $zmx = Assert-CapOwnedPath (Join-Path $root ([guid]::NewGuid().ToString('N').Substring(0, 5)))
+    $null = New-Item -ItemType Directory -Path $zmx
+    $null = Assert-CapOwnedPath $zmx
     $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
     $acl = [Security.AccessControl.DirectorySecurity]::new()
     $acl.SetOwner($sid)
@@ -350,25 +373,33 @@ function Start-CapOfflineSeed {
     $environment = @{
         ZMX_DIR = $zmxRoot
     }
+    $leasePathProof = Assert-CapZmxLeasePath -ZmxDir $zmxRoot -SessionName $arguments[1] `
+        -Sid ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
     $zmxPath = Join-Path $root 'runtime\zmx.exe'
-    $run = Start-CapManagedProcess -FilePath $zmxPath -ArgumentList $arguments `
-        -WorkingDirectory $zmxWorking -Role 'zmx-seed' -Environment $environment
+    $run = Start-CapJobLauncher -Root $root -OutputDirectory $zmxWorking `
+        -FilePath $zmxPath -ArgumentList $arguments -WorkingDirectory $zmxWorking `
+        -Role 'zmx-launcher' -Environment $environment
     $run | Add-Member -NotePropertyName Phase -NotePropertyValue $Phase
     $run | Add-Member -NotePropertyName SessionName -NotePropertyValue $arguments[1]
     $run | Add-Member -NotePropertyName Descendants -NotePropertyValue @()
-    $run | Add-Member -NotePropertyName CleanupComplete -NotePropertyValue $false
     $runs.Add($run)
     $seedRuns.Add($run)
     Write-CapProcessJournal -Identity $run.Identity -Phase $Phase
+    $target = Release-CapJobLauncher -Run $run -JournalState $journalState
     $receipt = [pscustomobject]@{
         phase = $Phase
         sessionName = $run.SessionName
         argumentList = @($arguments)
         exitCode = $null
-        seedPid = $run.Identity.Pid
-        seedCreationFileTimeUtc = $run.Identity.CreationFileTimeUtc
-        expectedImagePath = $run.Identity.ExpectedImagePath
+        seedPid = $target.pid
+        seedCreationFileTimeUtc = $target.creationFileTimeUtc
+        expectedImagePath = $target.expectedImagePath
+        launcherPid = $run.Identity.Pid
+        launcherCreationFileTimeUtc = $run.Identity.CreationFileTimeUtc
+        jobId = $run.JobId
+        outputProof = $null
         zmxRoot = $zmxRoot
+        leasePathProof = $leasePathProof
         supportRoot = $Roots.Support
         seedExitedUtc = $null
         daemonReady = $false
@@ -387,11 +418,10 @@ function Start-CapOfflineSeed {
 
     $seedDeadline = [DateTime]::UtcNow.AddSeconds(20)
     if ($seedDeadline -gt $leaseDeadlineUtc) { $seedDeadline = $leaseDeadlineUtc }
-    $seedWait = Wait-CapManagedProcess -Run $run -DeadlineUtc $seedDeadline -PollMilliseconds 50
-    if ($seedWait.State -ne 'Exited') { throw "Pinned zmx seed did not exit before the bounded $Phase deadline." }
-    $exitCode = [int]$seedWait.ExitCode
+    $seedWait = Wait-CapJobTarget -Run $run -DeadlineUtc $seedDeadline
+    $exitCode = [int]$seedWait.exitCode
     $receipt.exitCode = $exitCode
-    $receipt.seedExitedUtc = $seedWait.CompletedUtc.ToString('o')
+    $receipt.seedExitedUtc = [DateTime]::UtcNow.ToString('o')
     Write-CapJsonAtomic -Path $seedReceiptPath -Value $receipt
     $null = Write-CapWorkerLog "ZMX_SEED_EXIT phase=$Phase exit=$exitCode pid=$($run.Identity.Pid) args=$($arguments -join ' ')"
     if ($exitCode -ne 0) { throw "Pinned zmx seed exit code was $exitCode for $Phase; app launch is prohibited." }
@@ -405,9 +435,19 @@ function Start-CapOfflineSeed {
     $cmdPeers = @()
     do {
         Assert-CapWorkerDeadline "zmx seed readiness $Phase"
-        $tree = @(Get-CapOwnedDescendants -Roots @($run.Identity) -ZmxPath $zmxPath `
-            -CmdPath $cmdPath -ConhostPath $conhostPath -SessionName $run.SessionName `
-            -CommandMarker $arguments[6].Substring(5))
+        $tree = @(Get-CapJobMembers -Run $run)
+        foreach ($identity in $tree) {
+            $metadata = Get-CapCurrentMetadata -Pid $identity.Pid
+            if ($null -eq $metadata) { throw 'Ready job member lacks current metadata.' }
+            if ($identity.ExpectedImagePath -ieq $zmxPath -and $metadata.CommandLine -like "*$($run.SessionName)*") {
+                $identity.Role = 'zmx-daemon'
+            } elseif ($identity.ExpectedImagePath -ieq $cmdPath -and
+                $metadata.CommandLine -like "*$($arguments[6].Substring(5))*") {
+                $identity.Role = 'offline-cmd-peer'
+            } elseif ($identity.ExpectedImagePath -ieq $conhostPath) {
+                $identity.Role = 'conpty-conhost'
+            }
+        }
         $daemons = @($tree | Where-Object Role -eq 'zmx-daemon')
         $cmdPeers = @($tree | Where-Object Role -eq 'offline-cmd-peer')
         if ($daemons.Count -gt 0 -and $cmdPeers.Count -gt 0) { break }
@@ -417,9 +457,7 @@ function Start-CapOfflineSeed {
         throw "Private $Phase zmx seed did not become ready with an owned daemon and cmd peer."
     }
     foreach ($identity in $tree) {
-        if ($identity.Role -notin @('zmx-daemon', 'offline-cmd-peer', 'conpty-conhost')) {
-            throw "Unrecognized live $Phase zmx descendant role '$($identity.Role)'; refusing."
-        }
+        # Every member remains owned by the job even if it has no readiness role.
         Write-CapProcessJournal -Identity $identity -Phase $Phase
         if (-not @($descendantIdentities | Where-Object {
             $_.Pid -eq $identity.Pid -and $_.CreationFileTimeUtc -eq $identity.CreationFileTimeUtc
@@ -648,6 +686,11 @@ function Start-CapGraphCodeApp {
     $arguments = if ($rehearsal) { [string[]]@($job.rehearsalTarget.arguments) } else { [string[]]@() }
     if ($rehearsal) { $role = 'rehearsal-target' }
     $workingDirectory = if ($rehearsal) { $Roots.Peer } else { Join-Path $root 'fixtures\projects\Alpha' }
+    if (-not $rehearsal) {
+        $shellSession = 'graphcode-' + $SessionPrefix + '-' + [guid]::Empty.ToString('D')
+        $null = Assert-CapZmxLeasePath -ZmxDir $Roots.Zmx -SessionName $shellSession `
+            -Sid ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
+    }
     $run = Start-CapManagedProcess -FilePath $binaryPath -ArgumentList ([string[]]@($arguments)) `
         -WorkingDirectory $workingDirectory -Role $role -Environment $envMap -CloseStdin:$rehearsal
     $runs.Add($run)
@@ -795,6 +838,31 @@ function Close-CapOfflineSeed {
     Write-CapTrace -Command $MyInvocation.MyCommand.Name -Parameters $PSBoundParameters
 
     if ($SeedRun.CleanupComplete) { return }
+    if ($SeedRun.PSObject.Properties['JobId']) {
+        $proof = Close-CapJobLauncher -Run $SeedRun
+        foreach ($identity in $SeedRun.Members) {
+            if (-not @($descendantIdentities | Where-Object {
+                $_.Pid -eq $identity.Pid -and $_.CreationFileTimeUtc -eq $identity.CreationFileTimeUtc
+            }).Count) { $descendantIdentities.Add($identity) }
+            Write-CapProcessJournal -Identity $identity -Phase $SeedRun.Phase
+        }
+        $seedCleanup = @(@($SeedRun.Members) + @($SeedRun.Identity) | ForEach-Object {
+            if (-not [CapNative]::IsExited($_.Process.Handle, $_.Pid)) { throw 'Job member remains kernel-live.' }
+            [pscustomobject]@{ pid = $_.Pid; role = $_.Role; result = 'OWNED_JOB_ACTIVE_ZERO'; kernelExited = $true }
+        })
+        foreach ($result in $seedCleanup) { $cleanupReceipts.Add($result) }
+        if ($SeedRun.PSObject.Properties['SeedReceipt']) {
+            $SeedRun.SeedReceipt.cleanup = $seedCleanup
+            $SeedRun.SeedReceipt.outputProof = $proof
+            $SeedRun.SeedReceipt.cleanupStatus = 'CLEAN_ZERO_SURVIVORS_FILES_CLOSED'
+            # Target files are not raw redirected-stream EOF.
+            $SeedRun.SeedReceipt.stdoutEof = $false; $SeedRun.SeedReceipt.stderrEof = $false
+            $path = Join-Path $runDirectory "phases\$($SeedRun.Phase)\normal\zmx-seed.json"
+            Write-CapJsonAtomic -Path $path -Value $SeedRun.SeedReceipt
+        }
+        Write-CapRunStreams -Run $SeedRun -Label "$($SeedRun.Phase)-zmx-launcher"
+        return
+    }
     $failureCountBefore = $cleanupFailures.Count
     $tree = @()
     try {
@@ -931,8 +999,9 @@ function Invoke-CapNormalScenes {
         if ($seed) { Close-CapOfflineSeed -SeedRun $seed }
         Close-CapPeer -PeerRun $peer -Label $pipeName
     }
-    if ($seed -and $seed.SeedReceipt.cleanupStatus -ne 'CLEAN_ZERO_SURVIVORS_EOF') {
-        throw "Private zmx seed cleanup did not prove zero survivors and EOF for $Phase."
+    $expectedCleanup = if ($mockSceneRun) { 'CLEAN_ZERO_SURVIVORS_EOF' } else { 'CLEAN_ZERO_SURVIVORS_FILES_CLOSED' }
+    if ($seed -and $seed.SeedReceipt.cleanupStatus -ne $expectedCleanup) {
+        throw "Private zmx seed cleanup did not prove its output closure for $Phase."
     }
 }
 
@@ -1017,6 +1086,26 @@ function Invoke-CapRealLaunchRehearsal {
     } finally { Close-CapGraphCodeApp -AppRun $app }
 }
 
+function Invoke-CapRealSeedRehearsal {
+    if (-not $job.PSObject.Properties['seedDependencies']) { return }
+    $dependencies = $job.seedDependencies
+    Assert-CapDataRecord $dependencies @{ zmxPath = [string]; zmxSha256 = [string]; providerCommit = [string] } 'Real seed dependencies'
+    $zmx = Assert-CapOwnedPath $dependencies.zmxPath
+    if ($zmx -ine (Join-Path $root 'runtime\zmx.exe') -or
+        $dependencies.providerCommit -cne '785b3fd15dcafd1882b495c831a10f98c201b908' -or
+        $dependencies.zmxSha256 -cne $job.binaries.offlineZmx.sha256 -or
+        (Get-FileHash -LiteralPath $zmx -Algorithm SHA256).Hash -cne $dependencies.zmxSha256) {
+        throw 'Real seed dependencies are not bound to the pinned owned provider.'
+    }
+    foreach ($phase in @('before','after')) {
+        Assert-CapWorkerDeadline "real seed rehearsal $phase"
+        $roots = Initialize-CapPhaseRoot -PhaseRoot (Join-Path $runDirectory "phases\$phase\normal")
+        $seed = $null
+        try { $seed = Start-CapOfflineSeed -Roots $roots -Phase $phase }
+        finally { if ($seed) { Close-CapOfflineSeed -SeedRun $seed } }
+    }
+}
+
 if ($DefinitionsOnly) { return }
 
 try {
@@ -1047,6 +1136,12 @@ try {
         throw 'Worker/module loaded-source binding differs from supervisor authorization.'
     }
     Import-Module $modulePath -Force -WarningAction SilentlyContinue
+    [CapProcessJob]::ClearStandardHandleInheritance()
+    if (-not $AwaitSupervisorGate) { throw 'Worker requires the assigned supervisor job gate.' }
+    $gate = [Console]::In.ReadLineAsync()
+    if (-not $gate.Wait(30000) -or $gate.Result -cne $AuthorizationSha256) {
+        throw 'Supervisor job gate was not released.'
+    }
     $safeWorkerOutput = Assert-CapArtifactPath -Root $root -Path $auth.outputDirectory
     Set-CapTracePath -Path (Join-Path $safeWorkerOutput 'worker-calls.jsonl')
     Write-CapTrace -Command 'Invoke-UiCaptureWorker' -Parameters $PSBoundParameters
@@ -1146,6 +1241,7 @@ try {
     [IO.File]::WriteAllText($workerLog, '', [Text.UTF8Encoding]::new($false))
     Write-CapWorkerLog "WORKER_STARTED lease=$($auth.leaseId) head=$($job.head) job=$jobHash deadline=$($leaseDeadlineUtc.ToString('o', [Globalization.CultureInfo]::InvariantCulture))"
     if ($rehearsal) {
+        Invoke-CapRealSeedRehearsal
         Invoke-CapRealLaunchRehearsal
     } else {
     foreach ($phase in @('before', 'after')) {
@@ -1156,8 +1252,8 @@ try {
     if ($images.Count -ne 10) { throw "Expected ten images across before/after; captured $($images.Count)." }
     if ($zmxSeedReceipts.Count -ne 2 -or @($zmxSeedReceipts | Where-Object {
         $_.exitCode -ne 0 -or -not $_.daemonReady -or $_.cmdCount -lt 1 -or
-        $_.cleanupStatus -ne 'CLEAN_ZERO_SURVIVORS_EOF' -or
-        -not $_.stdoutEof -or -not $_.stderrEof
+        $_.cleanupStatus -ne 'CLEAN_ZERO_SURVIVORS_FILES_CLOSED' -or
+        $null -eq $_.outputProof -or -not $_.outputProof.jobActive0
     }).Count -ne 0) {
         throw 'Both phase-private cmd-only zmx seeds must exit zero, become ready, and cleanly drain EOF.'
     }
@@ -1255,6 +1351,11 @@ if ($journalFinalLine) {
     if (-not $primaryFailure -and $cleanupFailures.Count -eq 0) {
         try { Write-CapWorkerLog "WORKER_COMPLETE images=$($images.Count) lease=$($auth.leaseId)" }
         catch { $cleanupFailures.Add("Completion logging failed: $($_.Exception.Message)") }
+    }
+    foreach ($run in $seedRuns) {
+        if ($run.PSObject.Properties['OutputPins']) {
+            foreach ($pin in @($run.OutputPins) + @($run.ClosedOutputPins)) { $pin.Dispose() }
+        }
     }
     if (@(Get-CapTraceFailures).Count -eq 0 -and $cleanupFailures.Count -eq $journalFinalCleanupCount) {
         [Console]::Out.WriteLine($journalFinalLine)

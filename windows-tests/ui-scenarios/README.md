@@ -222,7 +222,12 @@ Run the offline regression with existing PowerShell 7.5+ and installed MSVC:
 
 ```powershell
 pwsh -NoProfile -File Tools\windows\Tests\UiCaptureDriver.Tests.ps1 `
-  -ScratchRoot C:\gcs\your-worker\capture-rehearsal
+  -PrepareFixturesOnly -ScratchRoot C:\owned\fresh-prebuilt
+$prebuiltManifestHash = (Get-FileHash C:\owned\fresh-prebuilt\fixtures.json -Algorithm SHA256).Hash
+pwsh -NoProfile -File Tools\windows\Tests\UiCaptureDriver.Tests.ps1 `
+  -ScratchRoot C:\owned\fresh-suite `
+  -PrebuiltFixtureManifest C:\owned\fresh-prebuilt\fixtures.json `
+  -PrebuiltFixtureManifestSha256 $prebuiltManifestHash
 ```
 
 The scratch directory must be fresh and caller-owned. The test embeds the
@@ -280,13 +285,17 @@ stale mapping hashes, mismatched fixture bytes, wrong mapping destinations,
 foreign embedded project paths, and refusal of preserved cap/lane roots.
 This does not create or approve a canonical production root.
 
-Only the harmless rehearsal target opts into redirected/closed stdin; live
-GraphCode, zmx seed, and peer launches keep their inherited stdin behavior.
+The harmless rehearsal target opts into redirected/closed stdin. GraphCode
+and peer launches do not explicitly redirect stdin, but the worker clears
+inheritance on its own STD handles first. Unchanged inherited-stdin behavior
+for these live launches is not established; it remains a runtime watch.
+The contained zmx
+launcher uses a private stdin gate and closes the normal seed's redirected stdin.
 Trace-write I/O failures are retained as explicit errors, never successful
 evidence, and cannot bypass guarded cleanup or the final release attempt.
 
 The supervisor's real lease-deadline/worker-kill branch, its standalone
-`-TimeoutProbe`, and `Test-CapNativeBindings` (16 declared export bindings)
+`-TimeoutProbe`, and native compatibility beyond declared-export resolution
 remain `NotExecuted` by this offline suite. The target-timeout case proves a
 guarded target stop, not that distinct worker-deadline branch. The repaired
 report gate checks control hashes, case identities, and positive counts in
@@ -315,3 +324,229 @@ A guarded termination waits on the retained kernel handle even when
 signalled handle is distinguished from a requested termination. Normal guarded
 termination and genuinely exited handles run in the offline suite; the exact
 access-denied exit race is not forced and is not claimed as runtime-proven.
+
+## Issue 834 job ownership: source candidate, not native qualification
+
+The job-based pivot is an operator-delegated design decision for later user
+review, not a design personally reviewed or approved by the user. This source
+candidate is an M1-only change. It does not authorize running this harness,
+using a desktop, publishing a PR, or claiming the historical failure repaired.
+
+The supervisor owns a noninherited KILL_ON_CLOSE job. The worker waits on
+private stdin until assignment, held-generation attestation, and immutable
+`worker-gate.json` publication have completed. This contains all subsequent
+worker app, peer, daemon, and compiler descendants. Its accounting is queried
+before its owner handle is closed; real worker stdout/stderr readers must
+also finish successfully. A failure before assignment never releases the gate.
+
+Each zmx seed uses an additional job and a source-bound embedded PowerShell
+launcher. The launcher is assigned and its exact generation/job is registered
+in the existing numbered journal before its gate is released. It starts zmx
+normally with `ProcessStartInfo.ArgumentList`, not a suspended/custom native
+process launch. The original target handle supplies post-start identity and
+exit receipts. This does **not** establish zmx identity before execution.
+All live job members are censused using held handles and membership checks;
+readiness still requires a positive daemon/cmd count. Unknown member roles
+are contained, not adopted from executable names or PIDs alone.
+
+The launcher copies the target's private raw pipes into owned byte files
+using unbuffered file streams. These are **not direct target file handles**.
+Termination may interrupt a daemon's final private-pipe tail; completeness
+of that tail is not claimed. After job termination and bounded Active=0,
+the worker compares retained file pins against writer-excluding readers and
+records their lengths and SHA-256 hashes. The final reader reopens and verifies
+those same bytes while holding writer-excluding readers. This proves the
+recorded owned bytes are stable at those checks, not foreign-writer absence.
+Target-file closure is never labelled target pipe EOF. Launcher and worker
+pipe EOF remain separate, actual reader-task observations.
+
+An umbrella member seen before the final safety-net stop is exempt only when
+it is the exact live held worker generation, not merely a matching PID or
+process name. Every other observed member records a typed `SAFETY_NET_KILLED`
+recovery receipt with PID-only membership evidence and an explicit cleanup
+failure. The existing release gate then reports `CLEANUP_UNPROVEN`, even if
+the worker supplied an otherwise clean terminal proof. Job emptiness is not
+allowed to turn that missing per-member cleanup evidence into a clean release.
+
+The worker and embedded launcher call GetStdHandle/SetHandleInformation on
+their own STD handles before target launches, refusing invalid handles/API
+failures. This does not prove behavior of runtime-cached or duplicated
+handles. Generic J4 identity/refusal functions and J5 binding, publication,
+and hash-chain function text remain unchanged; the final receipt validator
+adds a job/file-output branch without weakening generic raw-pipe receipts.
+
+The source-owned inventory is 26 P/Invoke declarations / 24 unique APIs:
+the original 16/15 plus the minimal job adapter's 10/9. The adapter reuses
+managed held-process acquisition and the existing CapNative snapshot rather
+than duplicating OpenProcess, GetProcessTimes, or image-query declarations.
+There is no job-open/duplication/recovery API, escape flag, external helper
+source file, imported test runtime, or live-path mock.
+
+Test definitions retain the original 59 cases (the native export contract is
+updated to 26), adding three contained harmless normal/nonzero/timeout cases,
+one STD source-ordering check, and N1's full numbered-final-proof synthetic
+output-descendant accept/refusal fixture, plus one negative umbrella safety-net
+release assertion, lease-path and receipt-IO groups, prebuilt binding and journal-phase timing contracts: 69 expected cases. N1 is not real
+seed evidence. `-RequireRealSeed` additionally defines three actual-command
+cases: two real zmx phases before a normal, nonzero, or timed-out harmless
+target, for 72 expected cases. It requires explicit `-RealSeedZmxPath` and
+`-RealSeedZmxSha256` inputs admitted against the pinned provider; there is no
+PATH or stale-candidate fallback. Without those cases, the repaired report
+gate refuses live admission even if the 69 offline cases pass.
+
+None of these new native cases ran during M1. Parse/compile-only evidence
+does not establish job nesting, gate timing, output transport, native STD
+inheritance, real zmx readiness, cleanup, GUI behavior, or parity. The accepted
+historical RED is run `cdba36a51f144798b40fd78bdb50251b`: a seed exited while
+its daemon retained worker pipes, leaving cleanup/EOF/final binding unproved.
+It must not be unsafely reproduced. A separate explicit M2 release and
+independent source review are required before any native qualification.
+
+### Short zmx state paths and the B invocation limit
+
+Each phase's zmx state now uses a fresh five-hex directory directly under
+the **actual owned root**, separate from nested run artifacts. Creation
+without `-Force` refuses a collision rather than adopting old state; the
+existing owned-path/reparse checks and private owner ACL remain in force.
+The same `Roots.Zmx` feeds the seed and live B app environment, including
+normal and actions phases.
+
+Before seed launch, the guard mirrors pinned zmx's lowercase hex encoding
+of UTF-8 session bytes and computes
+`ZMX_DIR\ipc\SID\hex(session).endpoint.lease`. It accepts at most **240**
+characters; 241 raises `PathTooLongException` with
+`CapCaptureCode=ZmxLeasePathTooLong`. Diagnostics expose SID length, not the
+SID value. A live app's harness-session shape is guarded before app launch.
+
+**A new LIVE_CAPTURE B invocation requires a fresh owned root of at most
+five characters**, for example `C:\b1` only if independently allocated,
+absent and coordinator-authorized. Its longest actual harness session is
+78 characters / 156 UTF-8 hex characters. With the observed 52-character
+SID and five-hex leaf, that root gives a 240-character lease. A longer B
+owned root is refused before worker launch with
+`CapCaptureCode=BCaptureRootTooLong`; there is no prefix truncation,
+foreign-parent allocation or fallback.
+
+The historical `C:\gccp\capture-coordinator-b1` owned root is 30 characters:
+a five-hex runtime leaf would give a **265-character** B-actions lease.
+That layout is infeasible and remains read-only history; do not relocate,
+reuse or delete it. The seven-character root used for a seed-only contained
+rehearsal is a separate case: its nested case-owned root and 46-character
+seed session are measured against the same actual-path guard.
+
+Retained failures had `ipc\SID` directories present but empty, while both
+endpoint and lease files were absent at inspection; their long lease paths
+measured 264-265 characters. Successful diagnostic A retained both files at
+173 characters. This is the operator's path-length attribution pending the
+new contained runtime result, not a claim that current absence proves every
+historical event or that a compile-only check establishes repair.
+
+### Bounded receipt-file IO contracts
+
+The private production target/exit receipt reader snapshots an opened file
+with `FileShare.ReadWrite | FileShare.Delete`. It retries only sharing
+violation `IOException` (native code32), file/path not-yet-published (2/3),
+and incomplete or invalid JSON/schema, within the caller's existing deadline.
+The existing missing-file/held-launcher exit refusal remains. Unrelated IO,
+access/security errors and valid foreign identity are not retried.
+Complete records must bind jobId/specSha256 and positive PID/creation time;
+an exit receipt must also match the previously accepted target generation.
+No record is returned after the deadline. Exhaustion is a typed
+`TimeoutException` with `CapCaptureCode=ReceiptDeadlineExceeded`; a valid
+foreign binding is `InvalidDataException` with `ReceiptIdentityMismatch`.
+The existing immutable writer already flushes/closes a temporary file and
+renames it into place; its publication protocol is unchanged.
+
+Run only the focused file contracts, without a compiler fixture, provider,
+real target or full capture suite:
+
+```powershell
+pwsh -NoProfile -File Tools\windows\Tests\UiCaptureDriver.Tests.ps1 `
+  -ReceiptContractOnly -ScratchRoot C:\owned\fresh-receipt-contracts
+```
+
+The five positive contract cases cover an exclusive holder released while
+the actual production reader waits, an exclusive hold past its typed
+deadline, partial JSON followed by atomic complete publication, foreign
+job identity, and foreign PID/creation. Bounded in-process runspaces drive
+the actual module-private reader; live launch/lease/release paths have no
+test override. Retry trace observations assert actual sharing/parse retries.
+`-ReceiptExclusiveOnly` with that focused mode selects just the exclusive
+release case for discriminating RED/GREEN evidence.
+
+These five contracts are registered as one full-suite case, giving the
+69/72 prospective counts above. Focused reports are named
+`UiCaptureReceiptContracts` and cannot stand in for a complete capture
+preflight. A file-IO GREEN is not native lifecycle or job-zero GREEN.
+The strict outer job-zero gate remains unchanged; there is no vctip exemption.
+
+### Native fixture precompilation and journal phase diagnostics
+
+The controller now prepares **both native C fixtures** (capture-target and
+CIM-race-target) before creating/assigning the added suite job. It invokes
+the existing two builders in `-PrepareFixturesOnly` mode, retaining compiler/
+preparation-host identities, command, exit, raw logs and provenance. This
+means outside the **added suite job**, not machine-jobless or zero surviving
+parent telemetry children. The parent may be in an ambient job. Per-process
+PowerShell `Add-Type` compilation remains in process; it is not prebuilt here.
+
+The prebuilt manifest binds the exact two recipes and fourteen artifacts:
+each source, EXE, OBJ, provenance, compile.cmd, stdout and stderr log, plus
+the current control-source hashes. The actual suite requires its explicit
+manifest path and SHA-256, checks names/lengths/digests/provenance, and refuses
+missing, foreign or altered input. There is **no compile fallback inside the
+suite job**. The controller records the manifest/all fourteen references in
+its configuration and final result and rehashes after the suite. Core per-case
+lease/identity/cleanup bindings are unchanged. A focused synthetic-byte
+positive/missing/tampered binding contract is registered in the full suite.
+
+MSVC redirects to retained `compile-stdout.raw.log` / `compile-stderr.raw.log`.
+The existing share-tolerant reader returns its same captured byte array,
+length, observation time, text and SHA. Preparation requires a positively
+present raw file and non-null captured bytes/hash, then publishes those exact
+bytes with CreateNew under the canonical `compile-stdout.log` / stderr names.
+It never re-encodes text, rereads raw bytes to manufacture the snapshot, or
+overwrites a published snapshot. The fourteen-file manifest binds these
+immutable snapshots; provenance also binds the raw path, snapshot time/SHA/
+length and compiler exit/held command-host identity. Raw log EOF and complete
+stream closure remain **UNPROVEN**, not silently converted to immutable-file
+or parent-host EOF. The focused contract holds a sharing writer, changes its
+raw file after capture, and proves publication preserves the original exact
+bytes (including BOM/newlines/non-UTF8 bytes).
+
+Preparation has a two-minute host bound within the same runtime window.
+The controller checks at least seventeen minutes of suite/cleanup headroom
+again after precompilation and immediately before assignment/gate release.
+If that reserve is gone, it refuses to start the suite; no implicit extension.
+Any member (including vctip) inside the suite job still fails its strict zero
+gate. Old PID31840's ownership in the no-breakaway job was established; its
+specific compiler parent was not recorded. Moving the two MSVC fixture
+compiles is the authorized scope, not a retroactive parent attribution.
+
+Journal diagnostics add cumulative measured Open/Copy milliseconds and total
+transaction elapsed time to observations and JournalUnavailable messages.
+Unattempted phases remain null/`UNOBSERVED`, not invented zero. Open and Copy
+throw paths retain measurements; N1 records copy-complete phase observations.
+The **1000ms transaction budget, seven global retries, eight Open attempts,
+deadline/no-late-success and schema/identity rules are unchanged**. The
+two-minute fixture context does not replace the one-second read transaction.
+Host-load/foreign-build causation of the old N1 timeout remains unproved.
+
+Run the focused synthetic prebuilt binding and actual file-IO timing contracts
+without a compiler or target:
+
+```powershell
+pwsh -NoProfile -File Tools\windows\Tests\UiCaptureDriver.Tests.ps1 `
+  -FixtureContractOnly -JournalTimingContractOnly -ScratchRoot C:\owned\fresh-setup-contracts
+```
+
+These add two full-suite cases (69 offline / 72 real-seed mode). A focused
+setup-contract pass is not a complete capture, native job-zero or parity pass.
+
+`ValidationRunner.Tests.ps1` uses this same two-step PrepareFixturesOnly →
+manifest SHA → consuming capture-child flow. Its existing positive-count,
+unique-summary and zero-failure checks are unchanged. This CI runner path
+does not add a suite job; precompilation there preserves the same input
+contract, not a claim of vctip containment. An isolated execution of its
+capture-caller slice is not the full ValidationRunner or the separate
+real-zmx qualification run.

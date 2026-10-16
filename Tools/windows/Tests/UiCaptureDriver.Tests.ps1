@@ -2,6 +2,17 @@ param(
     [string]$ScratchRoot = (Join-Path ([IO.Path]::GetTempPath()) ('gc-capture-' + [guid]::NewGuid().ToString('N'))),
     [switch]$LaunchContractOnly,
     [switch]$JournalContractOnly,
+    [switch]$ReceiptContractOnly,
+    [switch]$ReceiptExclusiveOnly,
+    [switch]$PrepareFixturesOnly,
+    [switch]$FixtureContractOnly,
+    [switch]$JournalTimingContractOnly,
+    [switch]$PreflightReportContractOnly,
+    [string]$PrebuiltFixtureManifest = '',
+    [string]$PrebuiltFixtureManifestSha256 = '',
+    [switch]$RequireRealSeed,
+    [string]$RealSeedZmxPath = '',
+    [string]$RealSeedZmxSha256 = '',
     [ValidateSet('','Writer','Reader')][string]$JournalActor = '',
     [string]$JournalActorConfig = ''
 )
@@ -519,7 +530,7 @@ function Assert-CapRejects {
             Assert-CapTest ([IO.File]::Exists($tmp) -and $before.Count -eq 2) 'Residual diagnostic was deleted to pass.'
             return @{ subcases = 2; retainedPublications = $before; residualPreserved = $true }
         }
-        Invoke-CapTest 'journal native bindings match the exact sixteen-declaration contract' {
+        Invoke-CapTest 'journal native bindings match the exact job-ownership declaration contract' {
             $expected = @(
                 'GraphCodeUiaGateState|PostMessage|user32.dll|PostMessageA',
                 'GraphCodeUiaGateState|EnumWindows|user32.dll|EnumWindows',
@@ -536,11 +547,21 @@ function Assert-CapRejects {
                 'CapNative|GetClientRect|user32.dll|GetClientRect',
                 'CapNative|GetDpiForWindow|user32.dll|GetDpiForWindow',
                 'CapNative|SetWindowPos|user32.dll|SetWindowPos',
-                'CapNative|PrintWindow|user32.dll|PrintWindow'
+                'CapNative|PrintWindow|user32.dll|PrintWindow',
+                'CapProcessJob|CreateJobObjectW|kernel32.dll|CreateJobObjectW',
+                'CapProcessJob|SetInformationJobObject|kernel32.dll|SetInformationJobObject',
+                'CapProcessJob|QueryInformationJobObject|kernel32.dll|QueryInformationJobObject',
+                'CapProcessJob|QueryInformationJobObject|kernel32.dll|QueryInformationJobObject',
+                'CapProcessJob|IsProcessInJob|kernel32.dll|IsProcessInJob',
+                'CapProcessJob|AssignProcessToJobObject|kernel32.dll|AssignProcessToJobObject',
+                'CapProcessJob|TerminateJobObject|kernel32.dll|TerminateJobObject',
+                'CapProcessJob|CloseHandle|kernel32.dll|CloseHandle',
+                'CapProcessJob|GetStdHandle|kernel32.dll|GetStdHandle',
+                'CapProcessJob|SetHandleInformation|kernel32.dll|SetHandleInformation'
             )
             $actual = @(Test-CapNativeBindings | ForEach-Object { "$($_.Type)|$($_.Method)|$($_.Library)|$($_.EntryPoint)" })
-            Assert-CapTest ($actual.Count -eq 16 -and @(Compare-Object $expected $actual).Count -eq 0) 'Exact static16 export contract differs.'
-            return @{ subcases = 16; evidence = 'API export resolution only, no native window or GUI action.' }
+            Assert-CapTest ($actual.Count -eq 26 -and @(Compare-Object $expected $actual).Count -eq 0) 'Exact static26 export contract differs.'
+            return @{ subcases = 26; evidence = 'API export resolution only, no native window or GUI action.' }
         }
         Invoke-CapTest 'legacy mutable seed journal proof is refused and exact numbered terminal proof is accepted' {
             $f = New-JournalTerminalFixture 'seed-reference'
@@ -568,6 +589,7 @@ function Invoke-CapBoundedChild {
             exitCode = $wait.ExitCode; stdout = [string]$run.StdoutTask.Result; stderr = [string]$run.StderrTask.Result
             pid = $run.Identity.Pid; creationFileTimeUtc = $run.Identity.CreationFileTimeUtc
             executable = $run.Identity.ExpectedImagePath; kernelExited = [CapNative]::IsExited($run.Identity.Process.Handle, $run.Identity.Pid)
+            heldKernelHandle = $run.Identity.Process.Handle.ToInt64()
             stdinRedirected = $run.StartInfo.RedirectStandardInput
         }
     } finally {
@@ -582,7 +604,7 @@ function Read-CapCompileLogSnapshot {
     param([Parameter(Mandatory)][string]$Path)
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
-        return [pscustomobject]@{ Text = ''; Sha256 = $null }
+        return [pscustomobject]@{ Text = ''; Sha256 = $null; Bytes = $null; Length = $null; ObservedUtc = $null }
     }
 
     $fileStream = $null
@@ -597,6 +619,7 @@ function Read-CapCompileLogSnapshot {
         $snapshot = [IO.MemoryStream]::new()
         $fileStream.CopyTo($snapshot)
         $bytes = $snapshot.ToArray()
+        $observedUtc = [DateTimeOffset]::UtcNow.ToString('o')
     } finally {
         if ($null -ne $snapshot) { $snapshot.Dispose() }
         if ($null -ne $fileStream) { $fileStream.Dispose() }
@@ -622,7 +645,30 @@ function Read-CapCompileLogSnapshot {
     return [pscustomobject]@{
         Text = $text
         Sha256 = ([BitConverter]::ToString($digest)).Replace('-', '')
+        Bytes = $bytes
+        Length = [long]$bytes.Length
+        ObservedUtc = $observedUtc
     }
+}
+
+function Publish-CapCompileLogSnapshot {
+    param([string]$RawPath, [string]$Path, $Snapshot)
+    if (-not [IO.File]::Exists($RawPath) -or $null -eq $Snapshot.Bytes -or $null -eq $Snapshot.Length -or
+        -not $Snapshot.ObservedUtc -or $Snapshot.Sha256 -cnotmatch '\A[A-F0-9]{64}\z') {
+        throw 'CompileLogSnapshotUnproven: a positively present raw file and captured byte array are required.'
+    }
+    $bytes = [byte[]]$Snapshot.Bytes
+    if ($bytes.Length -ne $Snapshot.Length -or
+        [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)) -cne $Snapshot.Sha256) {
+        throw 'CompileLogSnapshotUnproven: captured bytes do not match their original snapshot digest.'
+    }
+    $stream = [IO.File]::Open($Path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+    try { $stream.Write($bytes,0,$bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+    if ((Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -cne $Snapshot.Sha256) {
+        throw 'CompileLogSnapshotUnproven: published snapshot bytes differ.'
+    }
+    return [pscustomobject]@{ rawPath = $RawPath; publishedPath = $Path; sha256 = $Snapshot.Sha256
+        length = [long]$bytes.Length; observedUtc = $Snapshot.ObservedUtc; rawEof = 'UNPROVEN' }
 }
 
 function New-CapHarmlessTarget {
@@ -685,17 +731,20 @@ int wmain(int argc, wchar_t **argv) {
     $version = [IO.File]::ReadAllText((Join-Path $installation 'VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt')).Trim()
     $compiler = Join-Path $installation "VC\Tools\MSVC\$version\bin\Hostx64\x64\cl.exe"
     $exe = Join-Path $fixture 'capture-target.exe'
+    $object = Join-Path $fixture 'capture-target.obj'
     $compileStdout = Join-Path $fixture 'compile-stdout.log'
     $compileStderr = Join-Path $fixture 'compile-stderr.log'
-    $command = 'call "{0}" -vcvars_ver={1} >nul && "{2}" /nologo /W4 /WX /O2 /utf-8 /Fe:"{3}" "{4}" /link /SUBSYSTEM:CONSOLE' -f $vcvars, $version, $compiler, $exe, $sourcePath
+    $compileStdoutRaw = Join-Path $fixture 'compile-stdout.raw.log'
+    $compileStderrRaw = Join-Path $fixture 'compile-stderr.raw.log'
+    $command = 'call "{0}" -vcvars_ver={1} >nul && "{2}" /nologo /W4 /WX /O2 /utf-8 /Fe:"{3}" /Fo:"{5}" "{4}" /link /SUBSYSTEM:CONSOLE' -f $vcvars, $version, $compiler, $exe, $sourcePath, $object
     # Redirect the whole compile group's stdout/stderr to owned files so the real
     # compiler and any toolchain telemetry helpers it spawns inherit file handles,
     # never the module's redirected pipe. Only the short-lived cmd.exe then holds
     # that pipe, so it reaches bounded EOF promptly on exit. This is a fixture setup
     # robustness fix; it does not touch any runtime/kernel/EOF/release guard.
-    $redirectedCommand = '({0}) > "{1}" 2> "{2}"' -f $command, $compileStdout, $compileStderr
+    $redirectedCommand = '({0}) > "{1}" 2> "{2}"' -f $command, $compileStdoutRaw, $compileStderrRaw
     [IO.File]::WriteAllText((Join-Path $fixture 'compile.cmd'), "@echo off`r`n$redirectedCommand`r`nexit /b %errorlevel%`r`n", [Text.UTF8Encoding]::new($false))
-    $compilerEnvironment = @{ PATH = (Split-Path -Parent $vswhere) + ';' + $env:PATH }
+    $compilerEnvironment = @{ PATH = (Split-Path -Parent $vswhere) + ';' + $env:PATH; VSCMD_SKIP_SENDTELEMETRY = '1' }
     foreach ($key in @('VSCMD_VER', '__VSCMD_PREINIT_PATH', 'VSINSTALLDIR', 'VCINSTALLDIR',
         'VCToolsInstallDir', 'VCToolsVersion', 'WindowsSdkDir', 'WindowsSDKVersion', 'INCLUDE', 'LIB', 'LIBPATH')) {
         $compilerEnvironment[$key] = ''
@@ -704,8 +753,10 @@ int wmain(int argc, wchar_t **argv) {
         -Directory $fixture -Role 'harmless-fixture-compile' -Seconds 90 -Environment $compilerEnvironment
     # Preserve the actual compiler exit before reading the owned compile logs.
     $compilerExitCode = $build.exitCode
-    $compileStdoutSnapshot = Read-CapCompileLogSnapshot -Path $compileStdout
-    $compileStderrSnapshot = Read-CapCompileLogSnapshot -Path $compileStderr
+    $compileStdoutSnapshot = Read-CapCompileLogSnapshot -Path $compileStdoutRaw
+    $compileStderrSnapshot = Read-CapCompileLogSnapshot -Path $compileStderrRaw
+    $publishedStdout = Publish-CapCompileLogSnapshot $compileStdoutRaw $compileStdout $compileStdoutSnapshot
+    $publishedStderr = Publish-CapCompileLogSnapshot $compileStderrRaw $compileStderr $compileStderrSnapshot
     $compileStdoutText = $compileStdoutSnapshot.Text
     $compileStderrText = $compileStderrSnapshot.Text
     Assert-CapTest ($compilerExitCode -eq 0 -and (Test-Path -LiteralPath $exe -PathType Leaf)) `
@@ -719,6 +770,9 @@ int wmain(int argc, wchar_t **argv) {
         compileStderrSha256 = $compileStderrSnapshot.Sha256
         source = $sourcePath; sourceSha256 = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash
         executable = $exe; executableSha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
+        object = $object; objectSha256 = (Get-FileHash -LiteralPath $object -Algorithm SHA256).Hash
+        compileProcess = $build
+        compileLogSnapshots = @($publishedStdout,$publishedStderr)
     }
     $provenance | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $fixture 'provenance.json') -Encoding utf8NoBOM
     return [pscustomobject]$provenance
@@ -783,15 +837,18 @@ int wmain(void) {
     $version = [IO.File]::ReadAllText((Join-Path $installation 'VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt')).Trim()
     $compiler = Join-Path $installation "VC\Tools\MSVC\$version\bin\Hostx64\x64\cl.exe"
     $exe = Join-Path $fixture 'cim-race-target.exe'
+    $object = Join-Path $fixture 'cim-race-target.obj'
     $compileStdout = Join-Path $fixture 'compile-stdout.log'
     $compileStderr = Join-Path $fixture 'compile-stderr.log'
-    $command = 'call "{0}" -vcvars_ver={1} >nul && "{2}" /nologo /W3 /O2 /utf-8 /Fe:"{3}" "{4}" /link /SUBSYSTEM:CONSOLE' -f $vcvars, $version, $compiler, $exe, $sourcePath
+    $compileStdoutRaw = Join-Path $fixture 'compile-stdout.raw.log'
+    $compileStderrRaw = Join-Path $fixture 'compile-stderr.raw.log'
+    $command = 'call "{0}" -vcvars_ver={1} >nul && "{2}" /nologo /W3 /O2 /utf-8 /Fe:"{3}" /Fo:"{5}" "{4}" /link /SUBSYSTEM:CONSOLE' -f $vcvars, $version, $compiler, $exe, $sourcePath, $object
     # Same owned-file redirection as New-CapHarmlessTarget: the compiler and any
     # telemetry helpers inherit file handles, so only the short-lived cmd.exe holds
     # the module's redirected pipe and it reaches bounded EOF on exit.
-    $redirectedCommand = '({0}) > "{1}" 2> "{2}"' -f $command, $compileStdout, $compileStderr
+    $redirectedCommand = '({0}) > "{1}" 2> "{2}"' -f $command, $compileStdoutRaw, $compileStderrRaw
     [IO.File]::WriteAllText((Join-Path $fixture 'compile.cmd'), "@echo off`r`n$redirectedCommand`r`nexit /b %errorlevel%`r`n", [Text.UTF8Encoding]::new($false))
-    $compilerEnvironment = @{ PATH = (Split-Path -Parent $vswhere) + ';' + $env:PATH }
+    $compilerEnvironment = @{ PATH = (Split-Path -Parent $vswhere) + ';' + $env:PATH; VSCMD_SKIP_SENDTELEMETRY = '1' }
     foreach ($key in @('VSCMD_VER', '__VSCMD_PREINIT_PATH', 'VSINSTALLDIR', 'VCINSTALLDIR',
         'VCToolsInstallDir', 'VCToolsVersion', 'WindowsSdkDir', 'WindowsSDKVersion', 'INCLUDE', 'LIB', 'LIBPATH')) {
         $compilerEnvironment[$key] = ''
@@ -800,17 +857,132 @@ int wmain(void) {
         -Directory $fixture -Role 'cim-race-fixture-compile' -Seconds 90 -Environment $compilerEnvironment
     # Preserve the actual compiler exit before reading the owned compile logs.
     $compilerExitCode = $build.exitCode
-    $compileStdoutSnapshot = Read-CapCompileLogSnapshot -Path $compileStdout
-    $compileStderrSnapshot = Read-CapCompileLogSnapshot -Path $compileStderr
+    $compileStdoutSnapshot = Read-CapCompileLogSnapshot -Path $compileStdoutRaw
+    $compileStderrSnapshot = Read-CapCompileLogSnapshot -Path $compileStderrRaw
+    $publishedStdout = Publish-CapCompileLogSnapshot $compileStdoutRaw $compileStdout $compileStdoutSnapshot
+    $publishedStderr = Publish-CapCompileLogSnapshot $compileStderrRaw $compileStderr $compileStderrSnapshot
     $compileStdoutText = $compileStdoutSnapshot.Text
     $compileStderrText = $compileStderrSnapshot.Text
     Assert-CapTest ($compilerExitCode -eq 0 -and (Test-Path -LiteralPath $exe -PathType Leaf)) `
         "CIM race target compilation failed (not launch evidence): $compileStdoutText $compileStderrText"
-    return [pscustomobject]@{
+    $provenance = [pscustomobject]@{
         executable = $exe
+        source = $sourcePath
         sourceSha256 = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash
         executableSha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
+        object = $object; objectSha256 = (Get-FileHash -LiteralPath $object -Algorithm SHA256).Hash
+        compiler = $compiler; compilerSha256 = (Get-FileHash -LiteralPath $compiler -Algorithm SHA256).Hash
+        compilerCommand = $command; compilerExitCode = $compilerExitCode; compileProcess = $build
+        compileStdoutLog = $compileStdout; compileStderrLog = $compileStderr
+        compileStdoutSha256 = $compileStdoutSnapshot.Sha256; compileStderrSha256 = $compileStderrSnapshot.Sha256
+        compileLogSnapshots = @($publishedStdout,$publishedStderr)
     }
+    $provenance | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $fixture 'provenance.json') -Encoding utf8NoBOM
+    return $provenance
+}
+
+function Get-CapFixtureArtifactNames {
+    return @(
+        'fixture\capture-target.c','fixture\capture-target.exe','fixture\capture-target.obj',
+        'fixture\provenance.json','fixture\compile.cmd','fixture\compile-stdout.log','fixture\compile-stderr.log',
+        'cim-race-fixture\cim-race-target.c','cim-race-fixture\cim-race-target.exe','cim-race-fixture\cim-race-target.obj',
+        'cim-race-fixture\provenance.json','cim-race-fixture\compile.cmd',
+        'cim-race-fixture\compile-stdout.log','cim-race-fixture\compile-stderr.log'
+    )
+}
+
+function Read-CapPrebuiltFixtures {
+    param([string]$ManifestPath, [string]$ExpectedSha256)
+    if (-not $ManifestPath -or $ExpectedSha256 -cnotmatch '\A[A-F0-9]{64}\z') {
+        throw 'PrebuiltFixtureRequired: suite cannot compile or fall back inside the suite job.'
+    }
+    $directory = Split-Path -Parent ([IO.Path]::GetFullPath($ManifestPath))
+    if ([IO.Path]::GetFileName($ManifestPath) -cne 'fixtures.json') { throw 'PrebuiltFixtureIdentity: unexpected manifest filename.' }
+    $manifest = Read-CapBoundJson -Root $directory -Reference ([pscustomobject]@{ path = $ManifestPath; sha256 = $ExpectedSha256 })
+    Assert-CapDataRecord $manifest @{ schemaVersion = [long]; scenario = [string]; sources = [pscustomobject]; files = [array] } 'Prebuilt fixtures'
+    if ($manifest.schemaVersion -ne 1 -or $manifest.scenario -cne 'UI_CAPTURE_HARMLESS_AND_CIM_RACE_V1') {
+        throw 'PrebuiltFixtureIdentity: unsupported fixture recipe.'
+    }
+    foreach ($path in @($modulePath,$supervisorPath,$workerPath,$PSCommandPath)) {
+        $name = [IO.Path]::GetFileName($path)
+        if ($manifest.sources.$name -cne $sourceHashesBefore[$path]) { throw 'PrebuiltFixtureSource: frozen control bytes differ.' }
+    }
+    $expected = @(Get-CapFixtureArtifactNames)
+    if ($manifest.files.Count -ne $expected.Count) { throw 'PrebuiltFixtureInventory: incomplete or extra artifacts.' }
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($file in $manifest.files) {
+        Assert-CapDataRecord $file @{ name = [string]; sha256 = [string]; length = [long] } 'Prebuilt artifact'
+        if ($file.name -cnotin $expected -or -not $seen.Add($file.name) -or
+            $file.sha256 -cnotmatch '\A[A-F0-9]{64}\z' -or $file.length -lt 0) { throw 'PrebuiltFixtureInventory: foreign or duplicate artifact.' }
+        $path = Assert-CapArtifactPath -Root $directory -Path (Join-Path $directory $file.name)
+        $stream = [IO.File]::Open($path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+        try {
+            if ($stream.Length -ne $file.length -or (Get-FileHash -InputStream $stream -Algorithm SHA256).Hash -cne $file.sha256) {
+                throw 'PrebuiltFixtureHash: artifact bytes differ.'
+            }
+        } finally { $stream.Dispose() }
+    }
+    $target = Get-Content -LiteralPath (Join-Path $directory 'fixture\provenance.json') -Raw | ConvertFrom-Json -DateKind String
+    $race = Get-Content -LiteralPath (Join-Path $directory 'cim-race-fixture\provenance.json') -Raw | ConvertFrom-Json -DateKind String
+    foreach ($pair in @(@($target,'fixture','capture-target'),@($race,'cim-race-fixture','cim-race-target'))) {
+        $receipt = $pair[0]
+        Assert-CapDataRecord $receipt @{ compilerExitCode = [long]; compiler = [string]
+            compilerSha256 = [string]; compilerCommand = [string]; compileProcess = [pscustomobject] } 'Prebuilt compile provenance'
+        Assert-CapDataRecord $receipt.compileProcess @{ pid = [long]; creationFileTimeUtc = [long]
+            executable = [string]; heldKernelHandle = [long]; kernelExited = [bool]; exitCode = [long] } 'Held compile-command host'
+        if ($receipt.compilerExitCode -ne 0 -or
+            $receipt.compilerSha256 -cnotmatch '\A[A-F0-9]{64}\z' -or
+            $receipt.compileProcess.pid -le 0 -or $receipt.compileProcess.creationFileTimeUtc -le 0 -or
+            $receipt.compileProcess.heldKernelHandle -le 0 -or -not $receipt.compileProcess.kernelExited -or
+            $receipt.compileProcess.exitCode -ne 0 -or
+            $receipt.executable -ine (Join-Path $directory ($pair[1] + '\' + $pair[2] + '.exe')) -or
+            $receipt.source -ine (Join-Path $directory ($pair[1] + '\' + $pair[2] + '.c')) -or
+            $receipt.object -ine (Join-Path $directory ($pair[1] + '\' + $pair[2] + '.obj'))) {
+            throw 'PrebuiltFixtureProvenance: compile outcome or exact fixture paths differ.'
+        }
+        foreach ($binding in @(@('executable','executableSha256'),@('source','sourceSha256'),@('object','objectSha256'),
+            @('compileStdoutLog','compileStdoutSha256'),@('compileStderrLog','compileStderrSha256'))) {
+            $path = Assert-CapArtifactPath -Root $directory -Path $receipt.($binding[0])
+            if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -cne $receipt.($binding[1])) {
+                throw 'PrebuiltFixtureProvenance: recorded artifact digest differs.'
+            }
+        }
+        if ($receipt.compileLogSnapshots -isnot [array] -or $receipt.compileLogSnapshots.Count -ne 2) {
+            throw 'PrebuiltFixtureProvenance: two exact-byte compile-log snapshot records are required.'
+        }
+        foreach ($name in @('stdout','stderr')) {
+            $published = Join-Path $directory ($pair[1] + '\compile-' + $name + '.log')
+            $raw = Join-Path $directory ($pair[1] + '\compile-' + $name + '.raw.log')
+            $snapshots = @($receipt.compileLogSnapshots | Where-Object publishedPath -IEQ $published)
+            if ($snapshots.Count -ne 1) { throw 'PrebuiltFixtureProvenance: snapshot path binding differs.' }
+            $snapshot = $snapshots[0]
+            Assert-CapDataRecord $snapshot @{ rawPath = [string]; publishedPath = [string]; sha256 = [string]
+                length = [long]; observedUtc = [string]; rawEof = [string] } 'Compile log snapshot'
+            $null = Assert-CapArtifactPath -Root $directory -Path $snapshot.rawPath
+            if ($snapshot.rawPath -ine $raw -or $snapshot.rawEof -cne 'UNPROVEN' -or
+                -not [IO.File]::Exists($snapshot.rawPath) -or
+                $snapshot.observedUtc -notmatch '(?i)(?:Z|[+-]\d{2}:\d{2})$' -or
+                $snapshot.length -ne (Get-Item -LiteralPath $published).Length -or
+                $snapshot.sha256 -cne (Get-FileHash -LiteralPath $published -Algorithm SHA256).Hash) {
+                throw 'PrebuiltFixtureProvenance: snapshot byte/time identity differs or raw EOF was invented.'
+            }
+            $null = [DateTimeOffset]::Parse($snapshot.observedUtc,[Globalization.CultureInfo]::InvariantCulture)
+        }
+    }
+    return [pscustomobject]@{ Target = $target; CimRace = $race; Manifest = $manifest; ManifestSha256 = $ExpectedSha256 }
+}
+
+function Write-CapPrebuiltFixtureManifest {
+    $sources = [ordered]@{}
+    foreach ($path in $sourceHashesBefore.Keys) { $sources[[IO.Path]::GetFileName($path)] = $sourceHashesBefore[$path] }
+    $files = @(Get-CapFixtureArtifactNames | ForEach-Object {
+        $path = Join-Path $scratch $_
+        [pscustomobject]@{ name = $_; sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash; length = [long](Get-Item -LiteralPath $path).Length }
+    })
+    $manifest = [ordered]@{ schemaVersion = 1; scenario = 'UI_CAPTURE_HARMLESS_AND_CIM_RACE_V1'; sources = $sources; files = $files }
+    $path = Join-Path $scratch 'fixtures.json'
+    Write-JournalContractJson $path $manifest
+    return [pscustomobject]@{ path = $path; sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash; files = $files }
 }
 
 function Invoke-CapCaptureCommand {
@@ -819,7 +991,8 @@ function Invoke-CapCaptureCommand {
         [AllowEmptyCollection()][AllowEmptyString()][string[]]$Arguments = @(),
         [string]$Behavior = 'normal',
         [string]$LeaseMutation = '',
-        [string]$AdmissionMutation = ''
+        [string]$AdmissionMutation = '',
+        [switch]$RealSeed
     )
     $owned = Join-Path $scratch "cases\$Name"
     $null = New-Item -ItemType Directory -Path $owned
@@ -833,6 +1006,20 @@ function Invoke-CapCaptureCommand {
         head = 'OFFLINE_FIXTURE_NOT_PRODUCT'; base = 'OFFLINE_FIXTURE_NOT_PRODUCT'
         rehearsalTarget = [ordered]@{ path = $exe; sha256 = $target.executableSha256
             arguments = @($Arguments); behavior = $Behavior; timeoutMilliseconds = 1000 }
+    }
+    if ($RealSeed) {
+        if (-not $RealSeedZmxPath -or $RealSeedZmxSha256 -cnotmatch '\A[A-F0-9]{64}\z' -or
+            (Get-FileHash -LiteralPath $RealSeedZmxPath -Algorithm SHA256).Hash -cne $RealSeedZmxSha256) {
+            throw 'Real seed tests require an explicitly supplied hash-verified pinned zmx.'
+        }
+        $null = New-Item -ItemType Directory -Path (Join-Path $owned 'runtime')
+        $zmx = Join-Path $owned 'runtime\zmx.exe'
+        Copy-Item -LiteralPath $RealSeedZmxPath -Destination $zmx
+        $job.seedDependencies = [ordered]@{ zmxPath = $zmx; zmxSha256 = $RealSeedZmxSha256
+            providerCommit = '785b3fd15dcafd1882b495c831a10f98c201b908' }
+        $job.binaries = [ordered]@{ offlineZmx = [ordered]@{ sha256 = $RealSeedZmxSha256
+            seedArgumentOrder = @('run','graphcode-11111111-1111-4111-8111-000000000001',
+                '-d','cmd.exe','/Q','/K','echo Offline card fixture - no backend') } }
     }
     if ($AdmissionMutation) { $job = New-CapAdmissionJob -Owned $owned -Job $job -Mutation $AdmissionMutation }
     $job | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $jobPath -Encoding utf8NoBOM
@@ -1068,9 +1255,485 @@ function Assert-CapRehearsalSuccess {
         targetArguments = @($Arguments); actualTargetLaunches = 1; images = 0; desktop = 'NotExecuted' }
 }
 
+function Invoke-CapJobOwnershipContract {
+    param([ValidateSet('normal','nonzero','timeout')][string]$Behavior)
+    $context = New-JournalContractContext ('job-' + $Behavior)
+    $directory = Join-Path $context.Root 'launch'
+    $null = New-Item -ItemType Directory -Path $directory
+    $run = Start-CapJobLauncher -Root $context.Root -OutputDirectory $directory `
+        -FilePath $target.executable -ArgumentList @() -WorkingDirectory $directory `
+        -Role 'job-contract-launcher' -Environment @{ CAP_REHEARSAL_BEHAVIOR = $Behavior }
+    try {
+        Assert-CapTest (-not [IO.File]::Exists($run.TargetReceiptPath)) 'Target executed before assignment/publication/gate release.'
+        $gatedMembers = @([CapProcessJob]::Members($run.Job))
+        Assert-CapTest ($gatedMembers.Count -eq 1 -and $gatedMembers[0] -eq $run.Identity.Pid -and
+            [CapProcessJob]::Contains($run.Job, $run.Identity.Process.Handle)) 'Gated job does not contain exactly the held launcher.'
+        $entry = [pscustomobject]@{ pid = [long]$run.Identity.Pid
+            creationFileTimeUtc = [long]$run.Identity.CreationFileTimeUtc; jobId = $run.JobId }
+        $null = Publish-CapJournalSnapshot $context.State Bootstrap ([pscustomobject]@{ entries = @($entry) })
+        $targetReceipt = Release-CapJobLauncher -Run $run -JournalState $context.State
+        Assert-CapTest ($targetReceipt.expectedImagePath -ieq $target.executable -and
+            $targetReceipt.creationFileTimeUtc -gt 0) 'Normal target launch receipt is missing.'
+        if ($Behavior -eq 'timeout') {
+            $null = Assert-CapRejects {
+                Wait-CapJobTarget -Run $run -DeadlineUtc ([DateTime]::UtcNow.AddMilliseconds(750))
+            } 'Contained target deadline'
+        } else {
+            $exit = Wait-CapJobTarget -Run $run -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(10))
+            $expected = if ($Behavior -eq 'normal') { 0 } else { 23 }
+            Assert-CapTest ($exit.exitCode -eq $expected -and $exit.kernelExited) 'Target exit was replaced by cleanup state.'
+        }
+        $proof = Close-CapJobLauncher -Run $run
+        Assert-CapTest ($proof.jobActive0 -and $proof.activeProcesses -eq 0 -and
+            $proof.files.Count -eq 2 -and $proof.launcherStdoutEof -and $proof.launcherStderrEof) `
+            'Job Active=0, owned-file closure and actual launcher pipe EOF were not proved separately.'
+        $stdout = [IO.File]::ReadAllText($proof.files[0].path)
+        $stderr = [IO.File]::ReadAllText($proof.files[1].path)
+        Assert-CapTest ($stdout.Contains('CAP_READY') -and $stdout.Contains('CAP_STDIN_EOF') -and
+            $stderr.Contains('CAP_STDERR_EOF')) 'Closed owned files lost the target output contract.'
+        return $proof
+    } finally {
+        if (-not $run.CleanupComplete) { $null = Close-CapJobLauncher -Run $run }
+        foreach ($member in $run.Members) { $member.Process.Dispose() }
+        foreach ($pin in @($run.OutputPins) + @($run.ClosedOutputPins)) { $pin.Dispose() }
+        $run.Identity.Process.Dispose()
+    }
+}
+
+function Invoke-CapReceiptReadControl {
+    param($Run, [string]$Path, [DateTime]$DeadlineUtc, [int]$HoldMilliseconds = 0, $PublishValue = $null)
+    $held = $null
+    $reader = [powershell]::Create()
+    $ready = [Threading.ManualResetEventSlim]::new($false)
+    $pending = $null
+    $tracePath = Join-Path (Split-Path -Parent $Path) 'reader-calls.jsonl'
+    try {
+        if ($HoldMilliseconds -gt 0) {
+            $held = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        }
+        Assert-CapTest ([IO.File]::Exists($Path)) 'Receipt harness requires a positively present file.'
+        $null = $reader.AddScript({
+            param($ModulePath, $Run, $Path, $Deadline, $Ready, $TracePath)
+            $ErrorActionPreference = 'Stop'
+            Import-Module $ModulePath -Force -WarningAction SilentlyContinue
+            Set-CapTracePath -Path $TracePath
+            $Ready.Set()
+            try {
+                $record = & (Get-Module UiCaptureDriver) {
+                    param($Run, $Path, $Deadline)
+                    Read-CapJobTargetRecord -Run $Run -Path $Path -DeadlineUtc $Deadline
+                } $Run $Path $Deadline
+                [pscustomobject]@{ Succeeded = $true; Record = $record; Failure = $null }
+            } catch {
+                [pscustomobject]@{ Succeeded = $false; Record = $null; Failure = $_ }
+            }
+        }).AddArgument($modulePath).AddArgument($Run).AddArgument($Path).AddArgument($DeadlineUtc).AddArgument($ready).AddArgument($tracePath)
+        $pending = $reader.BeginInvoke()
+        if (-not $ready.Wait(5000)) { throw 'RECEIPT_HARNESS_MECHANICAL: reader did not reach its start barrier.' }
+        $wait = if ($null -ne $PublishValue -and $HoldMilliseconds -eq 0) { 250 } else { $HoldMilliseconds }
+        $completedBeforeRelease = $pending.AsyncWaitHandle.WaitOne([Math]::Max(0, $wait))
+        if ($null -ne $held) { $held.Dispose(); $held = $null }
+        if ($null -ne $PublishValue) {
+            $temporary = "$Path.publish"
+            [IO.File]::WriteAllText($temporary, (ConvertTo-Json $PublishValue -Compress), [Text.UTF8Encoding]::new($false))
+            [IO.File]::Move($temporary, $Path, $true)
+        }
+        if (-not $pending.AsyncWaitHandle.WaitOne(5000)) {
+            throw 'RECEIPT_HARNESS_MECHANICAL: production reader exceeded its bounded deadline.'
+        }
+        $values = @($reader.EndInvoke($pending))
+        Assert-CapTest ($values.Count -eq 1) 'RECEIPT_HARNESS_MECHANICAL: reader returned no unique outcome.'
+        return [pscustomobject]@{ Outcome = $values[0]; CompletedBeforeRelease = $completedBeforeRelease; TracePath = $tracePath }
+    } finally {
+        if ($null -ne $held) { $held.Dispose() }
+        if ($null -ne $pending -and -not $pending.IsCompleted) { $reader.Stop() }
+        $reader.Dispose()
+        $ready.Dispose()
+    }
+}
+
+function Get-CapReceiptControlCode {
+    param($Failure)
+    for ($exception = $Failure.Exception; $null -ne $exception; $exception = $exception.InnerException) {
+        if ($exception.Data.Contains('CapCaptureCode')) { return [string]$exception.Data['CapCaptureCode'] }
+    }
+    return $null
+}
+
+function Invoke-CapReceiptIoCase {
+    param([ValidateSet('exclusive-release','exclusive-deadline','partial-json','foreign-job','foreign-generation')][string]$Name)
+    $directory = Join-Path $scratch ('receipt-io\' + $Name + '-' + [guid]::NewGuid().ToString('N'))
+    $null = New-Item -ItemType Directory -Path $directory
+    $path = Join-Path $directory 'exit.json'
+    $self = [Diagnostics.Process]::GetCurrentProcess()
+    $run = [pscustomobject]@{
+        JobId = [guid]::NewGuid().ToString('N'); SpecSha256 = ('A' * 64)
+        TargetReceipt = [pscustomobject]@{ pid = 4242L; creationFileTimeUtc = 100000000L }
+        ExitReceiptPath = $path
+        Identity = [pscustomobject]@{ Process = $self; Pid = $self.Id }
+    }
+    $value = [pscustomobject]@{ jobId = $run.JobId; specSha256 = $run.SpecSha256
+        pid = 4242L; creationFileTimeUtc = 100000000L; exitCode = 0L; kernelExited = $true }
+    try {
+        [IO.File]::WriteAllText($path, (ConvertTo-Json $value -Compress), [Text.UTF8Encoding]::new($false))
+        $deadline = [DateTime]::UtcNow.AddSeconds(5)
+        switch ($Name) {
+            'exclusive-release' {
+                $read = Invoke-CapReceiptReadControl $run $path $deadline -HoldMilliseconds 250
+                if (-not $read.Outcome.Succeeded) { throw $read.Outcome.Failure }
+                Assert-CapTest (-not $read.CompletedBeforeRelease -and $read.Outcome.Record.pid -eq 4242L) `
+                    'Production reader did not wait for the exclusive holder before accepting the bound receipt.'
+                $attempts = @(Get-Content -LiteralPath $read.TracePath | ForEach-Object { ConvertFrom-Json $_ } |
+                    Where-Object { $_.command -ceq 'CapReceiptReadRetry' -and $_.parameters.Observation -ceq 'SharingViolation' })
+                Assert-CapTest ($attempts.Count -gt 0) 'No actual production sharing-violation retry was observed.'
+            }
+            'exclusive-deadline' {
+                $read = Invoke-CapReceiptReadControl $run $path ([DateTime]::UtcNow.AddMilliseconds(400)) -HoldMilliseconds 800
+                Assert-CapTest (-not $read.Outcome.Succeeded -and
+                    (Get-CapReceiptControlCode $read.Outcome.Failure) -ceq 'ReceiptDeadlineExceeded') `
+                    'Exclusive receipt past the deadline did not preserve its typed refusal.'
+            }
+            'partial-json' {
+                [IO.File]::WriteAllText($path, '{', [Text.UTF8Encoding]::new($false))
+                $read = Invoke-CapReceiptReadControl $run $path $deadline -PublishValue $value
+                if (-not $read.Outcome.Succeeded) { throw $read.Outcome.Failure }
+                Assert-CapTest (-not $read.CompletedBeforeRelease -and $read.Outcome.Record.creationFileTimeUtc -eq 100000000L) `
+                    'A partial JSON receipt was accepted before complete atomic publication.'
+                $attempts = @(Get-Content -LiteralPath $read.TracePath | ForEach-Object { ConvertFrom-Json $_ } |
+                    Where-Object { $_.command -ceq 'CapReceiptReadRetry' -and $_.parameters.Observation -ceq 'MalformedReceiptJson' })
+                Assert-CapTest ($attempts.Count -gt 0) 'No actual partial-JSON retry was observed.'
+            }
+            'foreign-job' {
+                $value.jobId = [guid]::NewGuid().ToString('N')
+                [IO.File]::WriteAllText($path, (ConvertTo-Json $value -Compress))
+                $read = Invoke-CapReceiptReadControl $run $path $deadline
+                Assert-CapTest (-not $read.Outcome.Succeeded -and
+                    (Get-CapReceiptControlCode $read.Outcome.Failure) -ceq 'ReceiptIdentityMismatch') 'Foreign job identity was not refused.'
+            }
+            'foreign-generation' {
+                foreach ($field in @('pid','creationFileTimeUtc')) {
+                    $foreign = $value.PSObject.Copy()
+                    $foreign.$field++
+                    [IO.File]::WriteAllText($path, (ConvertTo-Json $foreign -Compress))
+                    $read = Invoke-CapReceiptReadControl $run $path $deadline
+                    Assert-CapTest (-not $read.Outcome.Succeeded -and
+                        (Get-CapReceiptControlCode $read.Outcome.Failure) -ceq 'ReceiptIdentityMismatch') 'Foreign target generation was not refused.'
+                }
+            }
+        }
+        return @{ name = $Name; productionReader = 'Read-CapJobTargetRecord'; nativeTargetLaunched = $false }
+    } finally { $self.Dispose() }
+}
+
+if ($ReceiptContractOnly) {
+    $receiptNames = @(if ($ReceiptExclusiveOnly) { @('exclusive-release') }
+        else { @('exclusive-release','exclusive-deadline','partial-json','foreign-job','foreign-generation') })
+    foreach ($receiptCaseName in $receiptNames) {
+        Invoke-CapTest ("actual receipt file IO " + $receiptCaseName) { Invoke-CapReceiptIoCase $receiptCaseName }
+    }
+    $passed = @($results | Where-Object passed -EQ $true).Count
+    $failed = @($results | Where-Object passed -EQ $false).Count
+    $report = [ordered]@{ suite = 'UiCaptureReceiptContracts'; executed = $results.Count; passed = $passed; failed = $failed
+        mode = 'FOCUSED_FILE_IO_NO_TARGET'; gui = 'NotExecuted'; images = 0; backendTurns = 0
+        sourceHashesBeforeImport = $sourceHashesBefore; cases = @($results) }
+    $report | ConvertTo-Json -Depth 25 | Set-Content -LiteralPath (Join-Path $scratch 'report.json') -Encoding utf8NoBOM
+    ([pscustomobject]$report) | Select-Object suite,executed,passed,failed | ConvertTo-Json -Compress
+    if ($results.Count -ne $receiptNames.Count -or $failed -ne 0 -or $passed -ne $results.Count) { exit 1 }
+    exit 0
+}
+
+function Invoke-CapPrebuiltFixtureContract {
+    $savedScratch = $scratch
+    $directory = Join-Path $scratch ('prebuilt-contract-' + [guid]::NewGuid().ToString('N'))
+    $null = New-Item -ItemType Directory -Path (Join-Path $directory 'fixture'),(Join-Path $directory 'cim-race-fixture')
+    try {
+        $scratch = $directory
+        foreach ($name in @(Get-CapFixtureArtifactNames)) {
+            [IO.File]::WriteAllText((Join-Path $directory $name), 'SYNTHETIC_BINDING_BYTES_NOT_A_COMPILED_FIXTURE')
+        }
+        foreach ($pair in @(@('fixture','capture-target'),@('cim-race-fixture','cim-race-target'))) {
+            $receipt = [ordered]@{ compilerExitCode = 0; compiler = 'C:\synthetic-cl.exe'
+                compilerSha256 = ('C' * 64); compilerCommand = 'SYNTHETIC_BINDING_ONLY_NOT_A_COMPILE'
+                compileProcess = [pscustomobject]@{ pid = 10L; creationFileTimeUtc = 100L
+                    executable = 'C:\synthetic-cmd.exe'; heldKernelHandle = 123L; kernelExited = $true; exitCode = 0L } }
+            foreach ($binding in @(@('executable','executableSha256','.exe'),@('source','sourceSha256','.c'),
+                @('object','objectSha256','.obj'),@('compileStdoutLog','compileStdoutSha256','compile-stdout.log'),
+                @('compileStderrLog','compileStderrSha256','compile-stderr.log'))) {
+                $name = if ($binding[2].StartsWith('.')) { $pair[1] + $binding[2] } else { $binding[2] }
+                $path = Join-Path $directory ($pair[0] + '\' + $name)
+                $receipt[$binding[0]] = $path
+                $receipt[$binding[1]] = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+            }
+            $receipt.compileLogSnapshots = @('stdout','stderr') | ForEach-Object {
+                $path = Join-Path $directory ($pair[0] + '\compile-' + $_ + '.log')
+                $raw = Join-Path $directory ($pair[0] + '\compile-' + $_ + '.raw.log')
+                [IO.File]::WriteAllText($raw,'SYNTHETIC_RAW_LOG_NOT_A_COMPILE')
+                [pscustomobject]@{ rawPath = $raw
+                    publishedPath = $path; sha256 = (Get-FileHash $path -Algorithm SHA256).Hash
+                    length = [long](Get-Item $path).Length; observedUtc = [DateTimeOffset]::UtcNow.ToString('o'); rawEof = 'UNPROVEN' }
+            }
+            $receipt | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $directory ($pair[0] + '\provenance.json')) -Encoding utf8NoBOM
+        }
+        $reference = Write-CapPrebuiltFixtureManifest
+        $accepted = Read-CapPrebuiltFixtures $reference.path $reference.sha256
+        Assert-CapTest ($accepted.Manifest.files.Count -eq 14 -and $accepted.Target.executable.EndsWith('capture-target.exe')) `
+            'Actual prebuilt binder did not consume the complete fourteen-artifact manifest.'
+        $null = Assert-CapRejects { Read-CapPrebuiltFixtures '' '' } 'PrebuiltFixtureRequired'
+        $null = Assert-CapRejects { Read-CapPrebuiltFixtures $reference.path ('0' * 64) } 'hash mismatch'
+        foreach ($fault in @('scenario','source')) {
+            $foreign = $accepted.Manifest.PSObject.Copy()
+            if ($fault -ceq 'scenario') { $foreign.scenario = 'FOREIGN_FIXTURE' }
+            else {
+                $foreign.sources = $foreign.sources.PSObject.Copy()
+                $foreign.sources.'UiCaptureDriver.psm1' = '0' * 64
+            }
+            $foreignDirectory = Join-Path $directory $fault
+            $null = New-Item -ItemType Directory -Path $foreignDirectory
+            $foreignPath = Join-Path $foreignDirectory 'fixtures.json'
+            Write-JournalContractJson $foreignPath $foreign
+            $foreignHash = (Get-FileHash $foreignPath -Algorithm SHA256).Hash
+            $expected = if ($fault -ceq 'scenario') { 'PrebuiltFixtureIdentity' } else { 'PrebuiltFixtureSource' }
+            $null = Assert-CapRejects { Read-CapPrebuiltFixtures $foreignPath $foreignHash } $expected
+        }
+        $artifact = Join-Path $directory 'fixture\capture-target.obj'
+        $original = [IO.File]::ReadAllBytes($artifact)
+        [IO.File]::AppendAllText($artifact, 'TAMPER')
+        $null = Assert-CapRejects { Read-CapPrebuiltFixtures $reference.path $reference.sha256 } 'PrebuiltFixtureHash'
+        [IO.File]::WriteAllBytes($artifact, $original)
+        $removed = Join-Path $directory 'fixture\saved-capture-target.obj'
+        [IO.File]::Move($artifact, $removed)
+        $missingRefused = $false
+        try { $null = Read-CapPrebuiltFixtures $reference.path $reference.sha256 }
+        catch [IO.FileNotFoundException] { $missingRefused = $true }
+        Assert-CapTest $missingRefused 'Missing object bytes were accepted or silently rebuilt.'
+        [IO.File]::Move($removed, $artifact)
+        $raw = Join-Path $directory 'shared-writer.raw.log'
+        $originalBytes = [byte[]]@(239,187,191,65,13,10,0,255)
+        [IO.File]::WriteAllBytes($raw,$originalBytes)
+        $writer = [IO.File]::Open($raw,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,
+            ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+        try {
+            $snapshot = Read-CapCompileLogSnapshot $raw
+            $writer.Position = 0; $writer.WriteByte(90); $writer.Flush($true)
+            $published = Publish-CapCompileLogSnapshot $raw (Join-Path $directory 'immutable-snapshot.log') $snapshot
+            $publishedBytes = [IO.File]::ReadAllBytes($published.publishedPath)
+            Assert-CapTest ([Convert]::ToHexString($publishedBytes) -ceq [Convert]::ToHexString($originalBytes) -and
+                $published.rawEof -ceq 'UNPROVEN' -and $published.length -eq 8) `
+                'Snapshot publication reread/normalized the raw writer stream or invented EOF.'
+            $missingSnapshot = Read-CapCompileLogSnapshot (Join-Path $directory 'absent.raw.log')
+            $null = Assert-CapRejects {
+                Publish-CapCompileLogSnapshot (Join-Path $directory 'absent.raw.log') (Join-Path $directory 'must-not-publish.log') $missingSnapshot
+            } 'CompileLogSnapshotUnproven'
+        } finally { $writer.Dispose() }
+        return @{ subcases = 9; artifacts = 14; evidence = 'Actual binder, sharing raw writer and exact immutable byte snapshot; no compiler/target run.' }
+    } finally { $scratch = $savedScratch }
+}
+
+function Get-CapJournalPostCopyObservations {
+    param([Management.Automation.Language.Ast]$Ast)
+    $readers = @($Ast.FindAll({ param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Read-CapJournalObject'
+    }, $true))
+    Assert-CapTest ($readers.Count -eq 1) 'Journal reader AST is missing or duplicated.'
+    $reader = $readers[0]
+    $copies = @($reader.FindAll({ param($node)
+        $node -is [Management.Automation.Language.InvokeMemberExpressionAst] -and $node.Member.Value -ceq 'CopyTo'
+    }, $true))
+    Assert-CapTest ($copies.Count -eq 1) 'Journal CopyTo AST is missing or duplicated.'
+    $copy = $copies[0]
+    $checks = @($reader.FindAll({ param($node)
+        $node -is [Management.Automation.Language.CommandAst] -and
+        $node.GetCommandName() -ceq 'Assert-CapJournalTime' -and $node.Extent.StartOffset -gt $copy.Extent.EndOffset
+    }, $true) | Sort-Object { $_.Extent.StartOffset })
+    Assert-CapTest ($checks.Count -gt 0) 'First post-copy time assertion is missing.'
+    $firstCheck = $checks[0]
+    return @($reader.FindAll({ param($node)
+        if ($node -isnot [Management.Automation.Language.CommandAst] -or
+            $node.GetCommandName() -cne 'Write-CapJournalObservation' -or
+            $node.Extent.StartOffset -le $copy.Extent.EndOffset -or
+            $node.Extent.EndOffset -ge $firstCheck.Extent.StartOffset) { return $false }
+        for ($parent = $node.Parent; $null -ne $parent; $parent = $parent.Parent) {
+            if ($parent -is [Management.Automation.Language.CatchClauseAst]) { return $false }
+        }
+        return $true
+    }, $true))
+}
+
+function Invoke-CapJournalTimingContract {
+    $readerAst = [Management.Automation.Language.Parser]::ParseFile($modulePath, [ref]$null, [ref]$null)
+    Assert-CapTest (@(Get-CapJournalPostCopyObservations $readerAst).Count -eq 0) `
+        'A success-path observation write intervenes between CopyTo and its first deadline assertion.'
+    $reader = @($readerAst.FindAll({ param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Read-CapJournalObject'
+    }, $true))[0]
+    $copy = @($reader.FindAll({ param($node)
+        $node -is [Management.Automation.Language.InvokeMemberExpressionAst] -and $node.Member.Value -ceq 'CopyTo'
+    }, $true))[0]
+    $check = @($reader.FindAll({ param($node)
+        $node -is [Management.Automation.Language.CommandAst] -and
+        $node.GetCommandName() -ceq 'Assert-CapJournalTime' -and $node.Extent.StartOffset -gt $copy.Extent.EndOffset
+    }, $true) | Sort-Object { $_.Extent.StartOffset })[0]
+    $position = $check.Extent.StartOffset - $reader.Extent.StartOffset
+    $mutant = $reader.Extent.Text.Insert($position,
+        "            Write-CapJournalObservation `$State `$Sequence `$attempt 'RenamedSuccessObservation' `$null `$Transaction`n")
+    $mutantAst = [Management.Automation.Language.Parser]::ParseInput($mutant, [ref]$null, [ref]$null)
+    Assert-CapTest (@(Get-CapJournalPostCopyObservations $mutantAst).Count -eq 1) `
+        'Post-copy ordering contract failed to reject a renamed success-path observation.'
+    $directory = Join-Path $scratch ('journal-timing-' + [guid]::NewGuid().ToString('N'))
+    $snapshots = Join-Path $directory 'snapshots'
+    $null = New-Item -ItemType Directory -Path $snapshots
+    $binding = [pscustomobject]@{
+        runId = [guid]::NewGuid().ToString(); leaseId = [guid]::NewGuid().ToString()
+        jobSha256 = ('A' * 64); moduleSha256 = $sourceHashesBefore[$modulePath]
+        workerSha256 = $sourceHashesBefore[$workerPath]; supervisorSha256 = $sourceHashesBefore[$supervisorPath]
+        workerPid = 1L; workerCreationFileTimeUtc = 1L; workerImagePath = 'C:\synthetic-worker.exe'
+        workerExecutableSha256 = ('B' * 64); workerParentPid = 2L; workerSessionId = 1L; workerRole = 'SYNTHETIC_TIMING_ONLY'
+    }
+    $observation = Join-Path $directory 'observations.jsonl'
+    $state = New-CapJournalState -Root $scratch -Directory $snapshots -Binding $binding `
+        -DeadlineUtc ([DateTime]::UtcNow.AddMinutes(2)) -ObservationPath $observation
+    $null = Publish-CapJournalSnapshot $state Bootstrap ([pscustomobject]@{ entries = @() })
+    $module = Get-Module UiCaptureDriver
+    $transaction = & $module { param($State) New-CapJournalTransaction $State } $state
+    Assert-CapTest ($transaction.BudgetMilliseconds -eq 1000 -and
+        $null -eq $transaction.OpenElapsedMilliseconds -and $null -eq $transaction.CopyElapsedMilliseconds) `
+        'Timing instrumentation changed the 1000ms budget or invented unobserved phase durations.'
+    $null = & $module { param($State,$Transaction) Read-CapJournalObject $State 1 $Transaction } $state $transaction
+    Assert-CapTest ($null -ne $transaction.OpenElapsedMilliseconds -and $transaction.OpenElapsedMilliseconds -ge 0 -and
+        $null -ne $transaction.CopyElapsedMilliseconds -and $transaction.CopyElapsedMilliseconds -ge 0) `
+        'Actual Open/Copy phases were not measured.'
+    $events = @(Get-Content -LiteralPath $observation | ForEach-Object { ConvertFrom-Json $_ -DateKind String })
+    $verified = @($events | Where-Object decision -CEQ 'ReadVerified')
+    Assert-CapTest ($verified.Count -eq 1 -and
+        $verified[0].openElapsedMilliseconds -eq $transaction.OpenElapsedMilliseconds -and
+        $verified[0].copyElapsedMilliseconds -eq $transaction.CopyElapsedMilliseconds -and
+        $verified[0].totalElapsedMilliseconds -ge 0) `
+        'Existing post-verification observation lacks the actual Open/Copy accumulator values.'
+    Start-Sleep -Milliseconds 1050
+    $failure = Assert-CapRejects {
+        & $module { param($Transaction) Assert-CapJournalTime $Transaction 1 } $transaction
+    } 'JournalUnavailable'
+    Assert-CapTest ($failure -match 'openMs=[0-9]' -and $failure -match 'copyMs=[0-9]' -and
+        $failure -match 'totalMs=[0-9]' -and $transaction.BudgetMilliseconds -eq 1000 -and $transaction.Retries -eq 0) `
+        'Deadline message lost actual phases or changed the original timing/retry contract.'
+    $missing = & $module { param($State) New-CapJournalTransaction $State } $state
+    $null = Assert-CapRejects {
+        & $module { param($State,$Transaction) Read-CapJournalObject $State 2 $Transaction } $state $missing
+    } 'JournalUnavailable'
+    Assert-CapTest ($missing.Retries -eq 7 -and $missing.Attempts[2L] -eq 8 -and
+        $null -ne $missing.OpenElapsedMilliseconds -and $null -eq $missing.CopyElapsedMilliseconds) `
+        'Open throw-path timing changed the seven-retry/eight-attempt limit or fabricated copy time.'
+    return @{ subcases = 4; budgetMilliseconds = 1000; retryLimit = 7; openAttempts = 8
+        mode = 'Actual file Open/Copy observations plus elapsed-clock refusal; no native target.' }
+}
+
+function Invoke-CapPreflightReportContract {
+    $ast = [Management.Automation.Language.Parser]::ParseFile($supervisorPath,[ref]$null,[ref]$null)
+    $definitions = @($ast.FindAll({ param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Assert-CapPreflightReport'
+    },$true))
+    Assert-CapTest ($definitions.Count -eq 1) 'Actual report-preflight function is missing or duplicated.'
+    $definition = $definitions[0]
+    . ([scriptblock]::Create($definition.Extent.Text))
+    $requirements = @($definition.FindAll({ param($node)
+        $node -is [Management.Automation.Language.ForEachStatementAst] -and
+        $node.Variable.VariablePath.UserPath -ceq 'required'
+    },$true))
+    Assert-CapTest ($requirements.Count -eq 1) 'Actual required-case list is missing or duplicated.'
+    $requiredNames = @($requirements[0].Condition.FindAll({ param($node)
+        $node -is [Management.Automation.Language.StringConstantExpressionAst]
+    },$true) | ForEach-Object Value)
+    Assert-CapTest ($requiredNames.Count -gt 0 -and
+        @($requiredNames | Sort-Object -Unique).Count -eq $requiredNames.Count) 'Synthetic case inventory is empty or duplicated.'
+    $moduleHash = $sourceHashesBefore[$modulePath]
+    $workerHash = $sourceHashesBefore[$workerPath]
+    $supervisorHash = $sourceHashesBefore[$supervisorPath]
+    $preflightHash = 'A' * 64
+    $PreflightReceiptSha256 = $preflightHash
+    $job = [pscustomobject]@{ binaries = [pscustomobject]@{ offlineZmx = [pscustomobject]@{
+        sha256 = 'DFFF744FA8D7B0FB483416674C2FF4C2647EA46A3BDD82A95DC173A1FA07DC5B'
+    } } }
+    $preflight = [pscustomobject]@{
+        suite = 'UiCaptureDriver'; executed = [long]$requiredNames.Count; passed = [long]$requiredNames.Count; failed = 0L
+        mode = 'NO_DESKTOP_REAL_LAUNCH_REHEARSAL'; gui = 'NotExecuted'; images = 0L; backendTurns = 0L
+        fixture = [pscustomobject]@{ compilerExitCode = 0L }
+        controls = [pscustomobject]@{ moduleSha256 = $moduleHash; workerSha256 = $workerHash; supervisorSha256 = $supervisorHash }
+        cases = @($requiredNames | ForEach-Object { [pscustomobject]@{
+            name = $_; passed = $true; detail = [pscustomobject]@{
+                zmxSha256 = $job.binaries.offlineZmx.sha256; providerCommit = '785b3fd15dcafd1882b495c831a10f98c201b908'
+                evidenceMode = 'EXECUTED_CURRENT_REAL_ZMX'; phases = 2L
+            }
+        } })
+    }
+    Assert-CapPreflightReport
+    $branches = [Collections.Generic.List[object]]::new()
+    foreach ($behavior in @('normal','nonzero','timeout')) {
+        $rows = @($preflight.cases | Where-Object name -CEQ "real zmx job lifecycle through actual command with target $behavior")
+        Assert-CapTest ($rows.Count -eq 1) 'Synthetic real-case row does not uniquely select the actual behavior.'
+        $rows[0].detail.phases = 1L
+        $phaseRefusal = Assert-CapRejects { Assert-CapPreflightReport } 'Real seed preflight case does not bind the current pinned provider.'
+        $rows[0].detail.phases = 2L
+        $rows[0].detail.providerCommit = '0' * 40
+        $providerRefusal = Assert-CapRejects { Assert-CapPreflightReport } 'Real seed preflight case does not bind the current pinned provider.'
+        $rows[0].detail.providerCommit = '785b3fd15dcafd1882b495c831a10f98c201b908'
+        $branches.Add([pscustomobject]@{ behavior = $behavior; phaseRefused = $phaseRefusal; providerRefused = $providerRefusal })
+    }
+    $traces = @(Get-Content -LiteralPath (Join-Path $scratch 'test-calls.jsonl') | ForEach-Object { ConvertFrom-Json $_ })
+    $calls = @($traces | Where-Object command -CEQ 'Assert-CapPreflightReport')
+    Assert-CapTest ($branches.Count -eq 3 -and $calls.Count -eq 7) 'Actual preflight acceptance and all three behavior checks did not execute.'
+    return @{ mode = 'SYNTHETIC_REPORT_DATA_NOT_EXECUTED_PROVIDER_OR_LIVE_PREFLIGHT'
+        validDataAccepted = $true; actualFunctionCalls = $calls.Count; behaviorBranches = @($branches.ToArray())
+        syntheticCaseCount = $requiredNames.Count; requiredCaseNamesFromActualAst = $true
+        functionSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
+            [Text.Encoding]::UTF8.GetBytes($definition.Extent.Text))) }
+}
+
+if ($PreflightReportContractOnly) {
+    Invoke-CapTest 'actual rehearsal data satisfies the repaired report gate and refuses stale proof' { Invoke-CapPreflightReportContract }
+    $passed = @($results | Where-Object passed -EQ $true).Count
+    $failed = @($results | Where-Object passed -EQ $false).Count
+    $report = [pscustomobject]@{ suite = 'UiCapturePreflightReportContract'; executed = $results.Count
+        passed = $passed; failed = $failed; cases = @($results)
+        mode = 'SYNTHETIC_REPORT_ACCEPTANCE_NO_COMPILER_TARGET_OR_PROVIDER' }
+    $report | ConvertTo-Json -Depth 25 | Set-Content -LiteralPath (Join-Path $scratch 'report.json') -Encoding utf8NoBOM
+    $report | Select-Object suite,executed,passed,failed | ConvertTo-Json -Compress
+    if ($results.Count -ne 1 -or $passed -ne 1 -or $failed -ne 0) { exit 1 }
+    exit 0
+}
+
+if ($FixtureContractOnly -or $JournalTimingContractOnly) {
+    if ($FixtureContractOnly) {
+        Invoke-CapTest 'prebuilt fixture binder accepts exact artifacts and refuses missing or tampered bytes' { Invoke-CapPrebuiltFixtureContract }
+    }
+    if ($JournalTimingContractOnly) {
+        Invoke-CapTest 'journal phase timing records open copy total without changing budget or retry limits' { Invoke-CapJournalTimingContract }
+    }
+    $passed = @($results | Where-Object passed -EQ $true).Count
+    $failed = @($results | Where-Object passed -EQ $false).Count
+    $report = [pscustomobject]@{ suite = 'UiCaptureSetupContracts'; executed = $results.Count; passed = $passed; failed = $failed
+        cases = @($results); mode = 'BINDER_AND_TIMING_FILE_IO_NO_COMPILER_OR_TARGET' }
+    $report | ConvertTo-Json -Depth 25 | Set-Content -LiteralPath (Join-Path $scratch 'report.json') -Encoding utf8NoBOM
+    $report | Select-Object suite,executed,passed,failed | ConvertTo-Json -Compress
+    if ($results.Count -ne ([int]$FixtureContractOnly.IsPresent + [int]$JournalTimingContractOnly.IsPresent) -or $failed -ne 0) { exit 1 }
+    exit 0
+}
+
+if ($PrepareFixturesOnly) {
+    if ($ReceiptContractOnly -or $FixtureContractOnly -or $JournalTimingContractOnly -or $PrebuiltFixtureManifest) {
+        throw 'Fixture preparation cannot also consume or run contract suites.'
+    }
+    $null = New-CapHarmlessTarget
+    $null = New-CapCimRaceTarget
+    $reference = Write-CapPrebuiltFixtureManifest
+    $null = Read-CapPrebuiltFixtures $reference.path $reference.sha256
+    $reference | ConvertTo-Json -Depth 8 -Compress
+    exit 0
+}
+
 $target = $null
 try {
-    $target = New-CapHarmlessTarget
+    $prebuilt = Read-CapPrebuiltFixtures $PrebuiltFixtureManifest $PrebuiltFixtureManifestSha256
+    $target = $prebuilt.Target
     if ($JournalContractOnly) {
         Invoke-JournalContractGroups -IncludeConcurrent
         Invoke-CapTest 'real harmless managed-worker journal integration' {
@@ -1082,8 +1745,172 @@ try {
                 inventory = $run.receipt.journalPublishedInventory; gui = 'NotExecuted' }
         }
     } else {
-    $cimRaceTarget = New-CapCimRaceTarget
+    $cimRaceTarget = $prebuilt.CimRace
     if (-not $LaunchContractOnly) {
+        Invoke-CapTest 'prebuilt fixture binder accepts exact artifacts and refuses missing or tampered bytes' { Invoke-CapPrebuiltFixtureContract }
+        Invoke-CapTest 'journal phase timing records open copy total without changing budget or retry limits' { Invoke-CapJournalTimingContract }
+        Invoke-CapTest 'actual exit receipt reader retries sharing and partial JSON with typed deadline and identity refusal' {
+            $details = @(
+                foreach ($receiptCaseName in @('exclusive-release','exclusive-deadline','partial-json','foreign-job','foreign-generation')) {
+                    Invoke-CapReceiptIoCase $receiptCaseName
+                }
+            )
+            Assert-CapTest ($details.Count -eq 5) 'Receipt contract group must execute all five actual-reader cases.'
+            return @{ executed = $details.Count; cases = $details; mode = 'File IO only; no native target or lease mock' }
+        }
+        Invoke-CapTest 'zmx rendezvous lease guard accepts240 and refuses241 before launch' {
+            $sid = 'S-1-5-21-1111111111-2222222222-3333333333-1234567890'
+            $session = 'graphcode-11111111-1111-4111-8111-000000000001'
+            $directory = 'C:\' + ('x' * 72)
+            $accepted = Assert-CapZmxLeasePath -ZmxDir $directory -SessionName $session -Sid $sid
+            Assert-CapTest ($sid.Length -eq 52 -and $accepted.LeasePathLength -eq 240 -and
+                $accepted.SessionUtf8Bytes -eq 46 -and $accepted.SessionHexLength -eq 92) 'Provider lease-path boundary differs.'
+            $refusal = $null
+            try {
+                $null = Assert-CapZmxLeasePath -ZmxDir ($directory + 'x') -SessionName $session -Sid $sid
+                throw 'The 241-character lease path was not refused.'
+            } catch [IO.PathTooLongException] { $refusal = $_.Exception }
+            Assert-CapTest ($null -ne $refusal -and $refusal.Data['CapCaptureCode'] -ceq 'ZmxLeasePathTooLong' -and
+                $refusal.Data['LeasePathLength'] -eq 241) 'Lease overflow did not preserve its typed refusal.'
+            $unicode = Assert-CapZmxLeasePath -ZmxDir 'C:\gjp3\abcde' -SessionName ('a' + [char]0x00e9) -Sid $sid
+            Assert-CapTest ($unicode.SessionUtf8Bytes -eq 3 -and $unicode.SessionHexLength -eq 6) 'Session hex must encode UTF8 bytes, not UTF16 characters.'
+            $bSession = 'graphcode-gc-cap-actions-12345678-before--00000000-0000-0000-0000-000000000000'
+            $bPath = Assert-CapZmxLeasePath -ZmxDir 'C:\b1\abcde' -SessionName $bSession -Sid $sid
+            Assert-CapTest ($bSession.Length -eq 78 -and $bPath.LeasePathLength -eq 240) 'Live B root budget differs from its longest actual session shape.'
+            $null = Assert-CapRejects {
+                Assert-CapZmxLeasePath -ZmxDir 'C:\gjp3\abcde' -SessionName $bSession -Sid $sid
+            } 'ZmxLeasePathTooLong'
+            return 'Pure path arithmetic and typed guard, including inclusive240/negative241/UTF8; no target or provider execution.'
+        }
+        foreach ($jobBehavior in @('normal','nonzero','timeout')) {
+            Invoke-CapTest "contained job launcher preserves target $jobBehavior and proves closure" {
+                Invoke-CapJobOwnershipContract $jobBehavior
+            }
+        }
+        Invoke-CapTest 'worker and contained launcher clear STD inheritance before target launch' {
+            $source = [IO.File]::ReadAllText($workerPath)
+            Assert-CapTest ($source.IndexOf('[CapProcessJob]::ClearStandardHandleInheritance()') -lt
+                $source.IndexOf('    $identity = Assert-CapJobIdentity')) 'Worker guard does not precede admission Git spawns.'
+            $moduleSource = [IO.File]::ReadAllText($modulePath)
+            Assert-CapTest ($moduleSource.Contains('KILL_ON_JOB_CLOSE') -and
+                -not $moduleSource.Contains('BREAKAWAY_OK')) 'Job containment policy changed.'
+            return 'Source ordering only; duplicated/cached STD handles are not proved by this assertion.'
+        }
+        Invoke-CapTest 'umbrella safety-net kill refuses clean release for an unreceipted member' {
+            $ast = [Management.Automation.Language.Parser]::ParseFile($supervisorPath, [ref]$null, [ref]$null)
+            $consumer = @($ast.FindAll({ param($node)
+                $node -is [Management.Automation.Language.ForEachStatementAst] -and
+                $node.Variable.VariablePath.UserPath -ceq 'memberPid' -and
+                $node.Extent.Text.Contains("'SAFETY_NET_KILLED'")
+            }, $true))
+            Assert-CapTest ($consumer.Count -eq 1) 'Actual umbrella safety-net consumer missing or duplicated.'
+            $status = @($ast.FindAll({ param($node)
+                $node -is [Management.Automation.Language.IfStatementAst] -and
+                $node.Clauses[0].Item1.Extent.Text.Contains('$workerLaunchAttempted') -and
+                $node.Clauses[0].Item1.Extent.Text.Contains('$cleanupFailures.Count -eq 0') -and
+                $node.Extent.Text.Contains("'FAILED_ZERO_SURVIVORS'")
+            }, $true))
+            Assert-CapTest ($status.Count -eq 1) 'Actual release-status expression missing or duplicated.'
+            $membersBeforeStop = @(10,20)
+            $exemptWorkerPid = 10
+            $recoveryReceipts = [Collections.Generic.List[object]]::new()
+            $cleanupFailures = [Collections.Generic.List[string]]::new()
+            & ([scriptblock]::Create($consumer[0].Extent.Text))
+            Assert-CapTest ($recoveryReceipts.Count -eq 1 -and $recoveryReceipts[0].pid -eq 20 -and
+                $recoveryReceipts[0].kind -ceq 'SAFETY_NET_KILLED' -and
+                -not $recoveryReceipts[0].identityAttested -and -not $recoveryReceipts[0].cleanReleaseProven -and
+                $cleanupFailures.Count -eq 1 -and $cleanupFailures[0].Contains('SAFETY_NET_KILLED')) `
+                'Unreceipted member was silently safety-killed or the exact worker exemption widened.'
+            $workerLaunchAttempted = $true
+            $cleanupProven = $cleanupFailures.Count -eq 0
+            $survivors = [Collections.Generic.List[object]]::new()
+            $primaryFailure = $null
+            $actualStatus = & ([scriptblock]::Create($status[0].Extent.Text))
+            Assert-CapTest ($actualStatus -ceq 'CLEANUP_UNPROVEN') 'Safety-net cleanup became a clean release.'
+            return 'Actual source consumer/status expressions with synthetic membership data only; no job/native execution or generation adoption.'
+        }
+        Invoke-CapTest 'N1 owned output descendant fixture accepts closure and refuses foreign or stale bytes' {
+            $context = New-JournalContractContext 'n1-owned-files'
+            $context.State.ObservationPath = Join-Path $context.Root 'journal-read-observations.jsonl'
+            $directory = Join-Path $context.Root 'output'
+            $null = New-Item -ItemType Directory -Path $directory
+            $files = @('seed-stdout.log','seed-stderr.log') | ForEach-Object {
+                $path = Join-Path $directory $_
+                [IO.File]::WriteAllText($path, 'SYNTHETIC_RECEIPT_ACCEPT_PATH_NOT_REAL_SEED')
+                [pscustomobject]@{ path = $path; length = [long](Get-Item $path).Length
+                    sha256 = (Get-FileHash $path -Algorithm SHA256).Hash }
+            }
+            $proof = [pscustomobject]@{ kind = 'OWNED_FILES_JOB'; jobId = [guid]::NewGuid().ToString()
+                state = 'CLOSED'; jobActive0 = $true; activeProcesses = 0L; files = $files
+                launcherStdoutEof = $true; launcherStderrEof = $true
+                launcherPid = 10L; launcherCreationFileTimeUtc = 100L; censusProven = $true }
+            $null = Assert-CapJobOutputProof -Root $context.Root -Proof $proof
+            $rootReceipt = [pscustomobject]@{ pid = 10L; creationFileTimeUtc = 100L
+                expectedImagePath = (Join-Path $context.Root 'fixture.exe'); role = 'zmx-launcher'
+                parentPid = 1L; sessionId = 1L; kernelExited = $true; stdoutEof = $true; stderrEof = $true
+                streamOwnerPid = 10L; streamOwnerCreationFileTimeUtc = 100L; outputProof = $proof }
+            $childReceipt = [pscustomobject]@{ pid = 20L; creationFileTimeUtc = 200L
+                expectedImagePath = (Join-Path $context.Root 'daemon.exe'); role = 'zmx-daemon'
+                parentPid = 10L; sessionId = 1L; kernelExited = $true; stdoutEof = $false; stderrEof = $false
+                streamOwnerPid = 10L; streamOwnerCreationFileTimeUtc = 100L
+                outputKind = 'OWNED_FILES_JOB'; jobId = $proof.jobId }
+            $processes = @($rootReceipt,$childReceipt)
+            $entries = @($processes | ForEach-Object { [pscustomobject]@{
+                pid = $_.pid; creationFileTimeUtc = $_.creationFileTimeUtc; role = $_.role
+                expectedImagePath = $_.expectedImagePath; expectedParentPid = $_.parentPid; expectedSessionId = $_.sessionId
+            } })
+            $data = [pscustomobject]@{ entries = $entries; ownedProcesses = $processes; outcome = 'COMPLETE'
+                ownedProcessSurvivors = @(); pendingLaunchesRemaining = @(); cleanupFailures = @() }
+            $null = Publish-CapJournalSnapshot $context.State Bootstrap $data
+            $terminal = Publish-CapJournalSnapshot $context.State Terminal $data
+            $manifest = [pscustomobject]@{ status = 'COMPLETE'; ownedProcesses = $processes
+                ownedProcessSurvivors = @(); pendingLaunchesRemaining = @(); cleanupFailures = @()
+                journal = [pscustomobject]@{ protocolVersion = 2L; binding = $context.Binding
+                    directory = $context.State.Directory; terminal = $terminal
+                    published = @($context.State.Published.ToArray()) } }
+            $manifestRef = Write-CapImmutableJson -Root $context.Root -Path (Join-Path $directory 'manifest.json') -Value $manifest
+            $record = Read-CapJournalFinalRecord (Format-CapJournalFinalRecord $context.Binding $manifestRef $terminal) $context.Binding
+            $accepted = Read-CapJournalFinalProof -State $context.State -OutputDirectory $directory -Record $record
+            Assert-CapTest ($accepted.HashChainVerified -and $accepted.Manifest.ownedProcesses.Count -eq 2 -and
+                $accepted.Manifest.ownedProcesses[1].pid -ne $accepted.Manifest.ownedProcesses[1].streamOwnerPid -and
+                -not $accepted.Manifest.ownedProcesses[1].stdoutEof) 'N1 did not exercise a real output-descendant accept path.'
+            $wrong = $proof.PSObject.Copy()
+            $wrong.files = @($files[0].PSObject.Copy(), $files[1])
+            $wrong.files[0].path = Join-Path (Split-Path -Parent $context.Root) 'foreign.log'
+            $null = Assert-CapRejects { Assert-CapJobOutputProof -Root $context.Root -Proof $wrong } 'escaped'
+            [IO.File]::AppendAllText($files[0].path, 'STALE')
+            $null = Assert-CapRejects { Assert-CapJobOutputProof -Root $context.Root -Proof $proof } 'bytes'
+            $null = Assert-CapRejects {
+                Read-CapJournalFinalProof -State $context.State -OutputDirectory $directory -Record $record
+            } 'bytes'
+            return 'Synthetic descendant output fixture, not root equality or real provider/daemon evidence.'
+        }
+        if ($RequireRealSeed) {
+            foreach ($realBehavior in @('normal','nonzero','timeout')) {
+                Invoke-CapTest "real zmx job lifecycle through actual command with target $realBehavior" {
+                    $run = Invoke-CapCaptureCommand -Name ('real-seed-' + $realBehavior) -Behavior $realBehavior -RealSeed
+                    Assert-CapTest ($null -ne $run.receipt -and $run.receipt.containmentJob.jobActive0 -and
+                        $run.receipt.workerStdoutEof -and $run.receipt.workerStderrEof -and
+                        $null -ne $run.receipt.journalFinalBinding) 'Real seed command lacks job/EOF/final binding.'
+                    $manifest = Get-Content -LiteralPath (Join-Path $run.output 'manifest.json') -Raw | ConvertFrom-Json -DateKind String
+                    Assert-CapTest ($manifest.zmxSeeds.Count -eq 2 -and @($manifest.zmxSeeds | Where-Object {
+                        $_.exitCode -ne 0 -or -not $_.daemonReady -or $_.daemonCount -lt 1 -or $_.cmdCount -lt 1 -or
+                        $_.cleanupStatus -cne 'CLEAN_ZERO_SURVIVORS_FILES_CLOSED' -or
+                        $_.stdoutEof -or $_.stderrEof -or -not $_.outputProof.jobActive0
+                    }).Count -eq 0) 'Real two-phase seed census/file closure was not proved.'
+                    foreach ($seed in $manifest.zmxSeeds) { $null = Assert-CapJobOutputProof -Root $run.owned -Proof $seed.outputProof }
+                    $expectedStatus = if ($realBehavior -eq 'normal') { 'RELEASED_ZERO_SURVIVORS' } else { 'FAILED_ZERO_SURVIVORS' }
+                    Assert-CapTest ($run.receipt.status -ceq $expectedStatus -and
+                        (($realBehavior -eq 'normal' -and $run.child.exitCode -eq 0) -or
+                        ($realBehavior -ne 'normal' -and $run.child.exitCode -ne 0 -and
+                            $run.receipt.workerPrimaryFailure.Count -gt 0))) 'Target primary failure was replaced by successful real seed cleanup.'
+                    return @{ release = $run.receiptPath; releaseSha256 = $run.receiptSha256
+                        zmxSha256 = $RealSeedZmxSha256; phases = 2; targetBehavior = $realBehavior
+                        providerCommit = '785b3fd15dcafd1882b495c831a10f98c201b908'
+                        evidenceMode = 'EXECUTED_CURRENT_REAL_ZMX' }
+                }
+            }
+        }
         foreach ($mutation in @('accepted', 'lane-d', 'red-ci', 'binary-hash', 'product-diff',
             'ci-head', 'empty-ci', 'source-bytes', 'lease-base', 'duplicate-ci', 'duplicate-json', 'null-build', 'stale-build',
             'omitted-product-diff', 'phase-swap', 'unrelated-base')) {
@@ -1484,7 +2311,11 @@ try {
             $supervisorHash = $sourceHashesBefore[$supervisorPath]
             $preflightHash = 'A' * 64
             $PreflightReceiptSha256 = $preflightHash
-            Assert-CapPreflightReport
+            $job = [pscustomobject]@{ binaries = [pscustomobject]@{
+                offlineZmx = [pscustomobject]@{ sha256 = $RealSeedZmxSha256 }
+            } }
+            if ($RequireRealSeed) { Assert-CapPreflightReport }
+            else { $null = Assert-CapRejects { Assert-CapPreflightReport } 'real zmx job lifecycle' }
             $preflight.controls.workerSha256 = '0' * 64
             $null = Assert-CapRejects { Assert-CapPreflightReport } 'exact-source offline rehearsal'
             return 'Actual completed command-case data accepted; stale worker hash refused. Report-data validation only, no native preflight.'
@@ -1906,6 +2737,8 @@ try {
     $report = [ordered]@{ suite = $suiteName; executed = $results.Count; passed = $passed; failed = $failed
         mode = $mode; gui = 'NotExecuted'; nativeCompatibilityPreflight = 'NotExecuted'; images = 0
         backendTurns = 0; fixture = $target; sourceHashesBeforeImport = $sourceHashesBefore
+        prebuiltFixtureManifest = $PrebuiltFixtureManifest
+        prebuiltFixtureManifestSha256 = $PrebuiltFixtureManifestSha256
         controls = [ordered]@{ moduleSha256 = $sourceHashesBefore[$modulePath]
             workerSha256 = $sourceHashesBefore[$workerPath]; supervisorSha256 = $sourceHashesBefore[$supervisorPath] }
         cases = @($results) }
@@ -1913,6 +2746,6 @@ try {
 }
 [ordered]@{ suite = $suiteName; executed = $results.Count; passed = $passed; failed = $failed; artifacts = $scratch } |
     ConvertTo-Json -Compress
-$expectedCount = if ($JournalContractOnly) { 10 } elseif ($LaunchContractOnly) { 2 } else { 59 }
+$expectedCount = if ($JournalContractOnly) { 10 } elseif ($LaunchContractOnly) { 2 } elseif ($RequireRealSeed) { 72 } else { 69 }
 if ($results.Count -ne $expectedCount -or $failed -ne 0 -or $passed -ne $results.Count) { exit 1 }
 exit 0

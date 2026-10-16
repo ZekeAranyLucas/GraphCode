@@ -254,6 +254,456 @@ function Set-CapTracePath {
     $script:CapTracePath = [IO.Path]::GetFullPath($Path)
 }
 
+$jobSource = @'
+using System;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+// Adapted from this repository's Packaging.Standalone.Tests.ps1 StandaloneProcessJob.
+public static class CapProcessJob {
+  [StructLayout(LayoutKind.Sequential)]
+  struct BasicLimits { public long ProcessTime, JobTime; public uint Flags; public UIntPtr Min, Max; public uint Active; public UIntPtr Affinity; public uint Priority, Scheduling; }
+  [StructLayout(LayoutKind.Sequential)]
+  struct IoCounters { public ulong ReadOps, WriteOps, OtherOps, ReadBytes, WriteBytes, OtherBytes; }
+  [StructLayout(LayoutKind.Sequential)]
+  struct Limits { public BasicLimits Basic; public IoCounters Io; public UIntPtr ProcessMemory, JobMemory, PeakProcessMemory, PeakJobMemory; }
+  [StructLayout(LayoutKind.Sequential)]
+  struct Accounting { public long User, Kernel, PeriodUser, PeriodKernel; public uint Faults, Total, Active, Terminated; }
+  [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr CreateJobObjectW(IntPtr attributes, IntPtr name);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool SetInformationJobObject(IntPtr job, int info, ref Limits limits, uint size);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool QueryInformationJobObject(IntPtr job, int info, out Accounting value, uint size, IntPtr length);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool QueryInformationJobObject(IntPtr job, int info, IntPtr buffer, uint size, IntPtr length);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool TerminateJobObject(IntPtr job, uint code);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool CloseHandle(IntPtr handle);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr GetStdHandle(int number);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool SetHandleInformation(IntPtr handle, uint mask, uint flags);
+  public static void ClearStandardHandleInheritance() {
+    foreach (int number in new[] { -10, -11, -12 }) {
+      IntPtr handle = GetStdHandle(number);
+      if (handle == IntPtr.Zero || handle == new IntPtr(-1))
+        throw new InvalidOperationException("Invalid own STD handle: " + number);
+      if (!SetHandleInformation(handle, 1, 0)) throw new Win32Exception();
+    }
+  }
+  public static IntPtr Create() {
+    IntPtr job = CreateJobObjectW(IntPtr.Zero, IntPtr.Zero);
+    if (job == IntPtr.Zero) throw new Win32Exception();
+    var limits = new Limits();
+    limits.Basic.Flags = 0x2000; // KILL_ON_JOB_CLOSE; no escape flags.
+    if (!SetInformationJobObject(job, 9, ref limits, (uint)Marshal.SizeOf<Limits>())) {
+      var error = new Win32Exception();
+      if (!CloseHandle(job)) throw new InvalidOperationException("Job configuration and handle close both failed.", error);
+      throw error;
+    }
+    return job;
+  }
+  public static bool Contains(IntPtr job, IntPtr process) {
+    bool result;
+    if (!IsProcessInJob(process, job, out result)) throw new Win32Exception();
+    return result;
+  }
+  public static void Assign(IntPtr job, IntPtr process) {
+    if (!AssignProcessToJobObject(job, process)) throw new Win32Exception();
+    if (!Contains(job, process)) throw new InvalidOperationException("Assigned launcher is not a job member.");
+  }
+  public static uint Active(IntPtr job) {
+    Accounting value;
+    if (!QueryInformationJobObject(job, 1, out value, (uint)Marshal.SizeOf<Accounting>(), IntPtr.Zero)) throw new Win32Exception();
+    return value.Active;
+  }
+  public static int[] Members(IntPtr job) {
+    const int capacity = 4096;
+    int size = 8 + capacity * IntPtr.Size;
+    IntPtr buffer = Marshal.AllocHGlobal(size);
+    try {
+      if (!QueryInformationJobObject(job, 3, buffer, (uint)size, IntPtr.Zero)) throw new Win32Exception();
+      int assigned = Marshal.ReadInt32(buffer, 0), count = Marshal.ReadInt32(buffer, 4);
+      if (count < 0 || count > capacity || assigned != count)
+        throw new InvalidOperationException("Incomplete job member census.");
+      var result = new int[count];
+      for (int i = 0; i < count; i++)
+        result[i] = checked((int)Marshal.ReadIntPtr(buffer, 8 + i * IntPtr.Size).ToInt64());
+      return result;
+    } finally { Marshal.FreeHGlobal(buffer); }
+  }
+  public static void Terminate(IntPtr job) {
+    if (!TerminateJobObject(job, 125)) throw new Win32Exception();
+  }
+  public static void WaitForEmpty(IntPtr job, int milliseconds) {
+    var clock = Stopwatch.StartNew();
+    while (Active(job) != 0) {
+      if (clock.ElapsedMilliseconds >= milliseconds) throw new TimeoutException("Owned capture job still has active processes.");
+      System.Threading.Thread.Sleep(10);
+    }
+  }
+  public static void Close(IntPtr job) {
+    if (!CloseHandle(job)) throw new Win32Exception();
+  }
+}
+'@
+if (-not ('CapProcessJob' -as [type])) {
+    Add-Type -TypeDefinition $jobSource -ReferencedAssemblies @(
+        'System.Runtime.dll','System.Runtime.InteropServices.dll','System.ComponentModel.Primitives.dll',
+        'Microsoft.Win32.Primitives.dll','System.Diagnostics.Process.dll','System.Threading.Thread.dll'
+    )
+}
+
+# Embedded in the bound module: the child cannot spawn a target until its private
+# stdin gate is released after assignment and immutable launcher registration.
+$jobLauncherSource = @'
+$ErrorActionPreference = 'Stop'
+$specBytes = [IO.File]::ReadAllBytes($specPath)
+if ([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($specBytes)) -cne $specHash) {
+    throw 'Contained launcher specification bytes changed.'
+}
+$spec = [Text.UTF8Encoding]::new($false, $true).GetString($specBytes) | ConvertFrom-Json -DateKind String
+if ((Get-FileHash -LiteralPath $spec.modulePath -Algorithm SHA256).Hash -cne $spec.moduleSha256) {
+    throw 'Contained launcher source binding changed.'
+}
+Import-Module $spec.modulePath -Force -WarningAction SilentlyContinue
+[CapProcessJob]::ClearStandardHandleInheritance()
+$gate = [Console]::In.ReadLineAsync()
+if (-not $gate.Wait(30000) -or $gate.Result -cne $specHash) { throw 'Contained launcher gate was not authorized.' }
+foreach ($path in @($spec.stdoutPath, $spec.stderrPath, $spec.targetReceiptPath, $spec.exitReceiptPath)) {
+    $null = Assert-CapArtifactPath -Root $spec.root -Path $path
+}
+$stdout = [IO.FileStream]::new($spec.stdoutPath, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::Read, 1, $true)
+$stderr = $null
+$process = $null
+try {
+    $stderr = [IO.FileStream]::new($spec.stderrPath, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::Read, 1, $true)
+    $info = [Diagnostics.ProcessStartInfo]::new()
+    $info.FileName = $spec.filePath
+    $info.WorkingDirectory = $spec.workingDirectory
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    $info.RedirectStandardInput = $true
+    foreach ($argument in $spec.arguments) { $info.ArgumentList.Add([string]$argument) }
+    foreach ($key in @($info.Environment.Keys)) {
+        if ($key -like 'GRAPHCODE_*' -or $key -like 'ZMX_*') { $null = $info.Environment.Remove($key) }
+    }
+    foreach ($property in $spec.environment.PSObject.Properties) { $info.Environment[$property.Name] = [string]$property.Value }
+    $process = [Diagnostics.Process]::Start($info)
+    if ($null -eq $process) { throw 'Contained normal Process.Start returned null.' }
+    $snapshot = [CapNative]::Snapshot($process.Handle, $process.Id)
+    if (-not $snapshot.IsExited -and $snapshot.ImagePath -ine $spec.filePath) { throw 'Contained target image differs.' }
+    $outPump = $process.StandardOutput.BaseStream.CopyToAsync($stdout)
+    $errPump = $process.StandardError.BaseStream.CopyToAsync($stderr)
+    $process.StandardInput.Close()
+    $null = Write-CapImmutableJson -Root $spec.root -Path $spec.targetReceiptPath -Value ([pscustomobject]@{
+        jobId = $spec.jobId; specSha256 = $specHash; pid = [long]$process.Id
+        creationFileTimeUtc = [long]$snapshot.CreationFileTimeUtc
+        expectedImagePath = $spec.filePath; arguments = @($spec.arguments)
+        attestation = 'NORMAL_START_RETAINED_HANDLE_NOT_PREEXECUTION_IDENTITY'
+    })
+    while (-not $process.WaitForExit(100)) {}
+    $exit = [CapNative]::Snapshot($process.Handle, $process.Id)
+    if (-not $exit.IsExited) { throw 'Contained target exit lacks a signalled original handle.' }
+    $null = Write-CapImmutableJson -Root $spec.root -Path $spec.exitReceiptPath -Value ([pscustomobject]@{
+        jobId = $spec.jobId; specSha256 = $specHash; pid = [long]$process.Id
+        creationFileTimeUtc = [long]$snapshot.CreationFileTimeUtc; exitCode = [long]$process.ExitCode; kernelExited = $true
+    })
+    # The job owner may terminate this host while daemon descendants still hold
+    # these private target pipes. Files are not labelled pipe EOF in that case.
+    [Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($outPump, $errPump))
+    $stdout.Flush($true); $stderr.Flush($true)
+} finally {
+    if ($null -ne $process) { $process.Dispose() }
+    if ($null -ne $stderr) { $stderr.Dispose() }
+    $stdout.Dispose()
+}
+'@
+
+function Start-CapJobLauncher {
+    [CmdletBinding()]
+    param([string]$Root, [string]$OutputDirectory, [string]$FilePath,
+        [AllowEmptyCollection()][AllowEmptyString()][string[]]$ArgumentList, [string]$WorkingDirectory,
+        [string]$Role, [hashtable]$Environment = @{})
+    $directory = Assert-CapArtifactPath -Root $Root -Path $OutputDirectory
+    $filePath = [IO.Path]::GetFullPath($FilePath)
+    if (-not [IO.Path]::IsPathFullyQualified($FilePath) -or -not [IO.File]::Exists($filePath)) {
+        throw 'Contained target requires an existing absolute executable path.'
+    }
+    $jobId = [guid]::NewGuid().ToString('N')
+    $specPath = Join-Path $directory "$jobId-launch.json"
+    $stdoutPath = Join-Path $directory "$jobId-stdout.log"
+    $stderrPath = Join-Path $directory "$jobId-stderr.log"
+    $spec = [pscustomobject]@{
+        root = $Root; jobId = $jobId; modulePath = (Join-Path $PSScriptRoot 'UiCaptureDriver.psm1')
+        moduleSha256 = (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'UiCaptureDriver.psm1') -Algorithm SHA256).Hash
+        filePath = $filePath; arguments = @($ArgumentList); workingDirectory = [IO.Path]::GetFullPath($WorkingDirectory)
+        environment = [pscustomobject]$Environment; stdoutPath = $stdoutPath; stderrPath = $stderrPath
+        targetReceiptPath = (Join-Path $directory "$jobId-target.json")
+        exitReceiptPath = (Join-Path $directory "$jobId-exit.json")
+    }
+    $pins = [Collections.Generic.List[IO.Stream]]::new()
+    $job = [IntPtr]::Zero
+    $run = $null
+    try {
+        foreach ($path in @($stdoutPath, $stderrPath)) {
+            $created = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            $created.Dispose()
+            $pins.Add([IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite))
+        }
+        $specReference = Write-CapImmutableJson -Root $Root -Path $specPath -Value $spec
+        $job = [CapProcessJob]::Create()
+        $prefix = '$specPath = ' + "'" + $specPath.Replace("'", "''") + "'`n" +
+            '$specHash = ' + "'" + $specReference.sha256 + "'`n"
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($prefix + $jobLauncherSource))
+        $run = Start-CapManagedProcess -FilePath (Join-Path $PSHOME 'pwsh.exe') `
+            -ArgumentList @('-NoProfile','-NonInteractive','-EncodedCommand',$encoded) `
+            -WorkingDirectory $WorkingDirectory -Role $Role -HoldStdin
+        [CapProcessJob]::Assign($job, $run.Identity.Process.Handle)
+        $run.Identity | Add-Member -NotePropertyName JobId -NotePropertyValue $jobId
+        $run | Add-Member -NotePropertyMembers @{
+            Job = $job; JobId = $jobId; Root = $Root; SpecSha256 = $specReference.sha256
+            TargetReceiptPath = $spec.targetReceiptPath; ExitReceiptPath = $spec.exitReceiptPath
+            TargetReceipt = $null; TargetExit = $null; OutputPaths = @($stdoutPath,$stderrPath)
+            OutputPins = $pins; ClosedOutputPins = [Collections.Generic.List[IO.Stream]]::new()
+            Members = [Collections.Generic.List[object]]::new(); GateReleased = $false
+            CleanupComplete = $false; OutputProof = $null
+        }
+        return $run
+    } catch {
+        $primary = $_
+        $cleanup = [Collections.Generic.List[string]]::new()
+        if ($job -ne [IntPtr]::Zero) {
+            try {
+                [CapProcessJob]::Terminate($job)
+                [CapProcessJob]::WaitForEmpty($job, 5000)
+                if ([CapProcessJob]::Active($job) -ne 0) { throw 'Job not empty before close.' }
+                [CapProcessJob]::Close($job)
+            } catch { $cleanup.Add($_.Exception.ToString()) }
+        }
+        if ($run) {
+            try {
+                $null = Stop-CapManagedProcess -Identity $run.Identity
+                if (-not $run.StdoutTask.Wait(2000) -or -not $run.StderrTask.Wait(2000)) { throw 'Unreleased launcher raw EOF unproved.' }
+                $run.Identity.Process.Dispose()
+            } catch { $cleanup.Add($_.Exception.ToString()) }
+        }
+        foreach ($pin in $pins) { $pin.Dispose() }
+        if ($cleanup.Count) { throw "Contained launch failed: $($primary.Exception.Message); CLEANUP_UNPROVEN: $($cleanup -join '; ')" }
+        throw $primary
+    }
+}
+
+function Release-CapJobLauncher {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Run, [Parameter(Mandatory)]$JournalState)
+    if ($Run.GateReleased -or $Run.CleanupComplete -or
+        -not [CapProcessJob]::Contains($Run.Job, $Run.Identity.Process.Handle)) { throw 'Invalid contained launcher gate state.' }
+    if ($JournalState.Sequence -lt 1) { throw 'Launcher requires an immutable journal publication before gate release.' }
+    $snapshot = Read-CapJournalObject $JournalState $JournalState.Sequence (New-CapJournalTransaction $JournalState)
+    $entries = @($snapshot.Payload.data.entries | Where-Object {
+        $_.pid -eq $Run.Identity.Pid -and $_.creationFileTimeUtc -eq $Run.Identity.CreationFileTimeUtc -and
+        $_.PSObject.Properties['jobId'] -and $_.jobId -ceq $Run.JobId
+    })
+    if ($entries.Count -ne 1) { throw 'Publication does not bind the assigned launcher generation/job.' }
+    $Run.Identity.Process.StandardInput.WriteLine($Run.SpecSha256)
+    $Run.Identity.Process.StandardInput.Flush()
+    $Run.Identity.Process.StandardInput.Close()
+    $Run.GateReleased = $true
+    $Run.TargetReceipt = Read-CapJobTargetRecord -Run $Run -Path $Run.TargetReceiptPath `
+        -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(10))
+    return $Run.TargetReceipt
+}
+
+function Read-CapJobTargetRecord {
+    param($Run, [string]$Path, [DateTime]$DeadlineUtc)
+    $observation = 'NotPublished'
+    $nativeError = $null
+    $attempt = 0
+    while ([DateTime]::UtcNow -lt $DeadlineUtc) {
+        $attempt++
+        $bytes = $null
+        try {
+            $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+                ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+            try {
+                $memory = [IO.MemoryStream]::new()
+                try { $stream.CopyTo($memory); $bytes = $memory.ToArray() } finally { $memory.Dispose() }
+            } finally { $stream.Dispose() }
+        } catch [IO.IOException] {
+            $nativeError = Get-CapJournalNativeError $_.Exception
+            if ($nativeError -notin @('80070002','80070003','80070020')) { throw }
+            $observation = if ($nativeError -eq '80070020') { 'SharingViolation' } else { 'NotPublished' }
+            if ($nativeError -ne '80070020' -and
+                [CapNative]::IsExited($Run.Identity.Process.Handle, $Run.Identity.Pid)) {
+                throw "Contained launcher exited without target receipt: $Path"
+            }
+        }
+        if ($null -ne $bytes) {
+            if ([DateTime]::UtcNow -ge $DeadlineUtc) { break }
+            $record = $null
+            try { $record = ConvertFrom-CapJournalBytes $bytes }
+            catch [IO.IOException] {
+                $class = $null
+                for ($exception = $_.Exception; $null -ne $exception; $exception = $exception.InnerException) {
+                    if ($exception.Data.Contains('CapJournalFailure')) { $class = $exception.Data['CapJournalFailure']; break }
+                }
+                if ($class -notin @('JournalEncoding','JournalParse')) { throw }
+                $observation = 'MalformedReceiptJson'
+            }
+            $fields = @{ jobId = [string]; specSha256 = [string]; pid = [long]; creationFileTimeUtc = [long] }
+            if ($Path -ieq $Run.ExitReceiptPath) { $fields.exitCode = [long]; $fields.kernelExited = [bool] }
+            $complete = $record -is [pscustomobject]
+            if ($complete) {
+                foreach ($name in $fields.Keys) {
+                    $property = $record.PSObject.Properties[$name]
+                    if ($null -eq $property -or $null -eq $property.Value -or
+                        -not $fields[$name].IsInstanceOfType($property.Value)) { $complete = $false; break }
+                }
+            }
+            if ($complete) {
+                if ($record.jobId -cne $Run.JobId -or $record.specSha256 -cne $Run.SpecSha256 -or
+                    $record.pid -le 0 -or $record.creationFileTimeUtc -le 0 -or
+                    ($null -ne $Run.TargetReceipt -and ($record.pid -ne $Run.TargetReceipt.pid -or
+                        $record.creationFileTimeUtc -ne $Run.TargetReceipt.creationFileTimeUtc))) {
+                    $failure = [IO.InvalidDataException]::new('ReceiptIdentityMismatch: contained target receipt binding differs.')
+                    $failure.Data['CapCaptureCode'] = 'ReceiptIdentityMismatch'
+                    throw $failure
+                }
+                if ([DateTime]::UtcNow -ge $DeadlineUtc) { break }
+                return $record
+            }
+            $observation = 'MalformedReceiptJson'
+        }
+        Write-CapTrace -Command 'CapReceiptReadRetry' -Parameters @{
+            Path = $Path; Attempt = $attempt; Observation = $observation; NativeHresult = $nativeError
+        }
+        $remaining = ($DeadlineUtc - [DateTime]::UtcNow).TotalMilliseconds
+        if ($remaining -gt 0) { Start-Sleep -Milliseconds ([int][Math]::Min(20, [Math]::Ceiling($remaining))) }
+    }
+    $failure = [TimeoutException]::new("Contained target deadline reached: $Path; ReceiptDeadlineExceeded, last=$observation.")
+    $failure.Data['CapCaptureCode'] = 'ReceiptDeadlineExceeded'
+    $failure.Data['LastReceiptObservation'] = $observation
+    $failure.Data['LastNativeHresult'] = $nativeError
+    throw $failure
+}
+
+function Wait-CapJobTarget {
+    [CmdletBinding()]
+    param($Run, [DateTime]$DeadlineUtc)
+    $record = Read-CapJobTargetRecord -Run $Run -Path $Run.ExitReceiptPath -DeadlineUtc $DeadlineUtc
+    Assert-CapDataRecord $record @{ exitCode = [long]; kernelExited = [bool] } 'Contained target exit'
+    if (-not $record.kernelExited -or $record.pid -ne $Run.TargetReceipt.pid -or
+        $record.creationFileTimeUtc -ne $Run.TargetReceipt.creationFileTimeUtc) { throw 'Contained target exit generation differs.' }
+    $Run.TargetExit = $record
+    return $record
+}
+
+function Get-CapJobMembers {
+    [CmdletBinding()]
+    param($Run)
+    $members = [Collections.Generic.List[object]]::new()
+    foreach ($memberPid in [CapProcessJob]::Members($Run.Job)) {
+        if ($memberPid -eq $Run.Identity.Pid) { continue }
+        $process = $null
+        try { $process = [Diagnostics.Process]::GetProcessById($memberPid) }
+        catch [ArgumentException] {
+            if ($memberPid -in [CapProcessJob]::Members($Run.Job)) { throw 'Job member identity unavailable while still listed.' }
+            continue
+        }
+        $retained = $false
+        try {
+            if (-not [CapProcessJob]::Contains($Run.Job, $process.Handle)) {
+                throw 'Census PID does not identify a held job-member generation.'
+            }
+            $snapshot = [CapNative]::Snapshot($process.Handle, $memberPid)
+            if ($snapshot.IsExited) { continue }
+            $existing = @($Run.Members | Where-Object { $_.Pid -eq $memberPid -and
+                $_.CreationFileTimeUtc -eq $snapshot.CreationFileTimeUtc })
+            if ($existing.Count -eq 1) { $members.Add($existing[0]); continue }
+            $identity = Get-CapProcessIdentity -Process $process -ExpectedImagePath $snapshot.ImagePath -Role 'job-member'
+            $identity | Add-Member -NotePropertyName JobId -NotePropertyValue $Run.JobId
+            $Run.Members.Add($identity); $members.Add($identity); $retained = $true
+        } finally { if (-not $retained) { $process.Dispose() } }
+    }
+    return @($members.ToArray())
+}
+
+function Close-CapJobLauncher {
+    [CmdletBinding()]
+    param($Run)
+    if ($Run.CleanupComplete) { return $Run.OutputProof }
+    $censusFailure = $null
+    try { $null = Get-CapJobMembers -Run $Run }
+    catch { $censusFailure = $_ }
+    if ($null -ne $Run.TargetExit) { $null = $Run.Identity.Process.WaitForExit(250) }
+    [CapProcessJob]::Terminate($Run.Job)
+    [CapProcessJob]::WaitForEmpty($Run.Job, 5000)
+    $active = [CapProcessJob]::Active($Run.Job)
+    if ($active -ne 0) { throw 'Contained job Active=0 was not observed before handle close.' }
+    if (-not $Run.StdoutTask.Wait(2000) -or -not $Run.StderrTask.Wait(2000)) {
+        throw 'Contained launcher raw stdout/stderr EOF was not reached.'
+    }
+    $files = [Collections.Generic.List[object]]::new()
+    for ($index = 0; $index -lt $Run.OutputPaths.Count; $index++) {
+        $path = $Run.OutputPaths[$index]
+        $exclusive = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        $Run.ClosedOutputPins.Add($exclusive)
+        $pin = $Run.OutputPins[$index]
+        $pin.Position = 0; $exclusive.Position = 0
+        $pinHash = (Get-FileHash -InputStream $pin -Algorithm SHA256).Hash
+        $hash = (Get-FileHash -InputStream $exclusive -Algorithm SHA256).Hash
+        if ($pin.Length -ne $exclusive.Length -or $pinHash -cne $hash) { throw 'Pinned owned output bytes differ.' }
+        $files.Add([pscustomobject]@{ path = $path; length = [long]$exclusive.Length; sha256 = $hash })
+    }
+    $Run.OutputProof = [pscustomobject]@{
+        kind = 'OWNED_FILES_JOB'; jobId = $Run.JobId; state = 'CLOSED'
+        jobActive0 = $true; activeProcesses = [long]$active
+        launcherPid = [long]$Run.Identity.Pid; launcherCreationFileTimeUtc = [long]$Run.Identity.CreationFileTimeUtc
+        launcherStdoutEof = $true; launcherStderrEof = $true
+        files = @($files.ToArray()); memberCount = [long]$Run.Members.Count
+        censusProven = $null -eq $censusFailure
+        transport = 'PRIVATE_TARGET_PIPE_PUMPS_TO_OWNED_FILES'
+        targetPipeEofClaimed = $false
+    }
+    [CapProcessJob]::Close($Run.Job)
+    $Run.Job = [IntPtr]::Zero
+    $Run.CleanupComplete = $true
+    if ($censusFailure) { throw "Contained job is empty but member census was unproved: $($censusFailure.Exception.Message)" }
+    return $Run.OutputProof
+}
+
+function Assert-CapJobOutputProof {
+    [CmdletBinding()]
+    param([string]$Root, $Proof, [switch]$RetainStreams)
+    Assert-CapDataRecord $Proof @{ kind = [string]; jobId = [string]; state = [string]
+        jobActive0 = [bool]; activeProcesses = [long]; files = [array]
+        launcherStdoutEof = [bool]; launcherStderrEof = [bool]; censusProven = [bool]
+        launcherPid = [long]; launcherCreationFileTimeUtc = [long] } 'Job output proof'
+    $null = [guid]::Parse($Proof.jobId)
+    if ($Proof.kind -cne 'OWNED_FILES_JOB' -or $Proof.state -cne 'CLOSED' -or -not $Proof.jobActive0 -or
+        $Proof.activeProcesses -ne 0 -or -not $Proof.launcherStdoutEof -or
+        -not $Proof.launcherStderrEof -or -not $Proof.censusProven -or
+        $Proof.launcherPid -le 0 -or $Proof.launcherCreationFileTimeUtc -le 0 -or
+        $Proof.files.Count -ne 2) { throw 'Job output closure is unproved.' }
+    $held = [Collections.Generic.List[IO.Stream]]::new()
+    $keep = $false
+    $paths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    try {
+        foreach ($file in $Proof.files) {
+            Assert-CapDataRecord $file @{ path = [string]; length = [long]; sha256 = [string] } 'Owned output bytes'
+            $path = Assert-CapArtifactPath -Root $Root -Path $file.path
+            if (-not $paths.Add($path) -or $file.length -lt 0 -or $file.sha256 -cnotmatch '\A[A-F0-9]{64}\z') {
+                throw 'Invalid or duplicate owned output bytes.'
+            }
+            $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+            $held.Add($stream)
+            if ($stream.Length -ne $file.length -or (Get-FileHash -InputStream $stream -Algorithm SHA256).Hash -cne $file.sha256) {
+                throw 'Owned output bytes changed after closure.'
+            }
+        }
+        if ($RetainStreams) { $keep = $true; return @($held.ToArray()) }
+    } finally { if (-not $keep) { foreach ($stream in $held) { $stream.Dispose() } } }
+}
+
 function Write-CapTrace {
     [CmdletBinding()]
     param(
@@ -328,6 +778,38 @@ function Assert-CapArtifactPath {
         throw "Capture artifact escaped the explicit owned root: $full"
     }
     return $full
+}
+
+function Assert-CapZmxLeasePath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ZmxDir,
+        [Parameter(Mandatory)][string]$SessionName,
+        [Parameter(Mandatory)][string]$Sid
+    )
+    Write-CapTrace -Command $MyInvocation.MyCommand.Name -Parameters @{
+        ZmxDir = $ZmxDir; SessionName = $SessionName; SidLength = $Sid.Length
+    }
+    if (-not [IO.Path]::IsPathFullyQualified($ZmxDir) -or
+        [string]::IsNullOrWhiteSpace($Sid) -or [string]::IsNullOrWhiteSpace($SessionName)) {
+        throw [ArgumentException]::new('Zmx lease validation requires an absolute state directory, SID and session.')
+    }
+    $directory = [IO.Path]::GetFullPath($ZmxDir).TrimEnd('\')
+    $sessionBytes = [Text.UTF8Encoding]::new($false, $true).GetBytes($SessionName)
+    $sessionHex = [Convert]::ToHexString($sessionBytes).ToLowerInvariant()
+    $length = ('{0}\ipc\{1}\{2}.endpoint.lease' -f $directory, $Sid, $sessionHex).Length
+    if ($length -gt 240) {
+        $failure = [IO.PathTooLongException]::new(
+            "ZmxLeasePathTooLong: rendezvous lease requires $length characters; maximum is 240.")
+        $failure.Data['CapCaptureCode'] = 'ZmxLeasePathTooLong'
+        $failure.Data['LeasePathLength'] = $length
+        $failure.Data['MaximumLeasePathLength'] = 240
+        throw $failure
+    }
+    return [pscustomobject]@{
+        ZmxDir = $directory; LeasePathLength = $length; MaximumLeasePathLength = 240
+        SidLength = $Sid.Length; SessionUtf8Bytes = $sessionBytes.Length; SessionHexLength = $sessionHex.Length
+    }
 }
 
 function Get-CapActionSpec {
@@ -1179,6 +1661,7 @@ function Start-CapManagedProcessCore {
         [Parameter(Mandatory)][string]$Role,
         [hashtable]$Environment = @{},
         [switch]$CloseStdin,
+        [switch]$HoldStdin,
         [scriptblock]$AttestationOverride
     )
     Write-CapTrace -Command $MyInvocation.MyCommand.Name -Parameters $PSBoundParameters
@@ -1195,7 +1678,8 @@ function Start-CapManagedProcessCore {
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
-    $startInfo.RedirectStandardInput = [bool]$CloseStdin
+    if ($CloseStdin -and $HoldStdin) { throw 'Cannot both close and hold the launch stdin gate.' }
+    $startInfo.RedirectStandardInput = [bool]($CloseStdin -or $HoldStdin)
     foreach ($argument in $ArgumentList) { $startInfo.ArgumentList.Add($argument) }
     foreach ($key in @($startInfo.Environment.Keys)) {
         if ([string]$key -like 'GRAPHCODE_*' -or [string]$key -like 'ZMX_*') {
@@ -1311,7 +1795,8 @@ function Start-CapManagedProcess {
         [Parameter(Mandatory)][string]$WorkingDirectory,
         [Parameter(Mandatory)][string]$Role,
         [hashtable]$Environment = @{},
-        [switch]$CloseStdin
+        [switch]$CloseStdin,
+        [switch]$HoldStdin
     )
     Write-CapTrace -Command $MyInvocation.MyCommand.Name -Parameters $PSBoundParameters
 
@@ -1569,7 +2054,7 @@ function Test-CapNativeBindings {
     Write-CapTrace -Command $MyInvocation.MyCommand.Name -Parameters $PSBoundParameters
 
 
-    $types = @([CapNative], [GraphCodeUiaGateState])
+    $types = @([CapNative], [GraphCodeUiaGateState], [CapProcessJob])
     $bindings = [Collections.Generic.List[object]]::new()
     foreach ($type in $types) {
         foreach ($method in $type.GetMethods([Reflection.BindingFlags]'Static,Public,NonPublic')) {
@@ -2171,6 +2656,9 @@ function Write-CapJournalObservation {
         monotonicFrequency = [Diagnostics.Stopwatch]::Frequency
         nativeHresult = $NativeError; decision = $Decision
         deadlineUtc = $Transaction.DeadlineUtc.ToString('o'); retries = $Transaction.Retries
+        openElapsedMilliseconds = $Transaction.OpenElapsedMilliseconds
+        copyElapsedMilliseconds = $Transaction.CopyElapsedMilliseconds
+        totalElapsedMilliseconds = $Transaction.Clock.Elapsed.TotalMilliseconds
     }
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes(
         (ConvertTo-Json -InputObject $record -Compress -Depth 8) + "`n")
@@ -2287,7 +2775,18 @@ function New-CapJournalTransaction {
         BudgetMilliseconds = [Math]::Max(0, $remaining)
         Retries = 0
         Attempts = [Collections.Generic.Dictionary[long,int]]::new()
+        OpenElapsedMilliseconds = $null
+        CopyElapsedMilliseconds = $null
     }
+}
+
+function Format-CapJournalPhaseTiming {
+    param($Transaction)
+    $open = if ($null -eq $Transaction.OpenElapsedMilliseconds) { 'UNOBSERVED' }
+        else { $Transaction.OpenElapsedMilliseconds.ToString('F3', [Globalization.CultureInfo]::InvariantCulture) }
+    $copy = if ($null -eq $Transaction.CopyElapsedMilliseconds) { 'UNOBSERVED' }
+        else { $Transaction.CopyElapsedMilliseconds.ToString('F3', [Globalization.CultureInfo]::InvariantCulture) }
+    return "openMs=$open copyMs=$copy totalMs=$($Transaction.Clock.Elapsed.TotalMilliseconds.ToString('F3', [Globalization.CultureInfo]::InvariantCulture))"
 }
 
 function Assert-CapJournalTime {
@@ -2295,7 +2794,7 @@ function Assert-CapJournalTime {
     if ([DateTime]::UtcNow -ge $Transaction.DeadlineUtc -or
         $Transaction.Clock.Elapsed.TotalMilliseconds -ge $Transaction.BudgetMilliseconds) {
         throw (New-CapJournalFailure 'JournalUnavailable' (
-            "sequence=$Sequence HRESULT=$NativeError retries=$($Transaction.Retries); deadline/exhaustion, no late success."))
+            "sequence=$Sequence HRESULT=$NativeError retries=$($Transaction.Retries); deadline/exhaustion, no late success. $(Format-CapJournalPhaseTiming $Transaction)"))
     }
 }
 
@@ -2306,15 +2805,22 @@ function Read-CapJournalObject {
         Assert-CapJournalTime $Transaction $Sequence $native
         if (-not $Transaction.Attempts.ContainsKey($Sequence)) { $Transaction.Attempts[$Sequence] = 0 }
         if ($Transaction.Attempts[$Sequence] -ge 8) {
-            throw (New-CapJournalFailure 'JournalUnavailable' "sequence=$Sequence HRESULT=$native; eight Open attempts.")
+            throw (New-CapJournalFailure 'JournalUnavailable' "sequence=$Sequence HRESULT=$native; eight Open attempts. $(Format-CapJournalPhaseTiming $Transaction)")
         }
         $Transaction.Attempts[$Sequence]++
         $attempt = $Transaction.Attempts[$Sequence]
         $name = $Sequence.ToString('D6', [Globalization.CultureInfo]::InvariantCulture) + '.json'
         $retained = $false
         try {
-            $stream = [IO.File]::Open((Join-Path $State.Directory $name), [IO.FileMode]::Open,
-                [IO.FileAccess]::Read, [IO.FileShare]::Read)
+            $openClock = [Diagnostics.Stopwatch]::StartNew()
+            try {
+                $stream = [IO.File]::Open((Join-Path $State.Directory $name), [IO.FileMode]::Open,
+                    [IO.FileAccess]::Read, [IO.FileShare]::Read)
+            } finally {
+                $elapsed = $openClock.Elapsed.TotalMilliseconds
+                $Transaction.OpenElapsedMilliseconds = if ($null -eq $Transaction.OpenElapsedMilliseconds) { $elapsed }
+                    else { $Transaction.OpenElapsedMilliseconds + $elapsed }
+            }
         } catch {
             $native = Get-CapJournalNativeError $_.Exception
             Write-CapJournalObservation $State $Sequence $attempt 'OpenFailed' $native $Transaction
@@ -2323,7 +2829,7 @@ function Read-CapJournalObject {
                 throw (New-CapJournalFailure $class "sequence=$Sequence HRESULT=$native" $_.Exception)
             }
             if ($Transaction.Retries -ge 7) {
-                throw (New-CapJournalFailure 'JournalUnavailable' "sequence=$Sequence HRESULT=$native; global retry limit.")
+                throw (New-CapJournalFailure 'JournalUnavailable' "sequence=$Sequence HRESULT=$native; global retry limit. $(Format-CapJournalPhaseTiming $Transaction)")
             }
             $Transaction.Retries++
             Assert-CapJournalTime $Transaction $Sequence $native
@@ -2340,7 +2846,18 @@ function Read-CapJournalObject {
         }
         try {
             $buffer = [IO.MemoryStream]::new()
-            try { $stream.CopyTo($buffer); $bytes = $buffer.ToArray() }
+            try {
+                $copyClock = [Diagnostics.Stopwatch]::StartNew()
+                try { $stream.CopyTo($buffer); $bytes = $buffer.ToArray() }
+                finally {
+                    $elapsed = $copyClock.Elapsed.TotalMilliseconds
+                    $Transaction.CopyElapsedMilliseconds = if ($null -eq $Transaction.CopyElapsedMilliseconds) { $elapsed }
+                        else { $Transaction.CopyElapsedMilliseconds + $elapsed }
+                }
+            } catch {
+                Write-CapJournalObservation $State $Sequence $attempt 'CopyFailed' (Get-CapJournalNativeError $_.Exception) $Transaction
+                throw
+            }
             finally { $buffer.Dispose() }
             Assert-CapJournalTime $Transaction $Sequence
             $envelope = ConvertFrom-CapJournalBytes $bytes
@@ -2584,7 +3101,10 @@ function Read-CapJournalFinalProof {
                 role = [string]; parentPid = [long]; sessionId = [long]; kernelExited = [bool]
                 stdoutEof = [bool]; stderrEof = [bool]; streamOwnerPid = [long]
                 streamOwnerCreationFileTimeUtc = [long] } 'Owned process receipt'
-            if (-not $process.kernelExited -or -not $process.stdoutEof -or -not $process.stderrEof) {
+            $fileOutput = $process.PSObject.Properties['outputKind'] -and $process.outputKind -ceq 'OWNED_FILES_JOB'
+            if (-not $process.kernelExited -or
+                (-not $fileOutput -and (-not $process.stdoutEof -or -not $process.stderrEof)) -or
+                ($fileOutput -and ($process.stdoutEof -or $process.stderrEof))) {
                 throw (New-CapJournalFailure 'JournalCleanupUnproven' 'Kernel exit or owning-stream EOF is unproved.')
             }
             if ($process.pid -le 0 -or $process.creationFileTimeUtc -le 0 -or $process.parentPid -le 0 -or
@@ -2602,6 +3122,31 @@ function Read-CapJournalFinalProof {
             })
             if ($owners.Count -ne 1) {
                 throw (New-CapJournalFailure 'JournalCleanupUnproven' 'Owning managed-root streams are unbound.')
+            }
+            if ($fileOutput) {
+                $owner = $owners[0]
+                Assert-CapDataRecord $process @{ jobId = [string] } 'Owned job member'
+                Assert-CapDataRecord $owner @{ outputProof = [pscustomobject] } 'Owned job launcher'
+                $outputProof = $owner.outputProof
+                if ($outputProof.jobId -cne $process.jobId -or
+                    $outputProof.launcherPid -ne $owner.pid -or
+                    $outputProof.launcherCreationFileTimeUtc -ne $owner.creationFileTimeUtc) {
+                    throw (New-CapJournalFailure 'JournalCleanupUnproven' 'Job output owner generation differs.')
+                }
+                foreach ($outputStream in @(Assert-CapJobOutputProof -Root $State.Root -Proof $outputProof -RetainStreams)) {
+                    $held.Add($outputStream)
+                }
+            }
+            if ($process.PSObject.Properties['outputProof']) {
+                if ($process.outputProof.launcherPid -ne $process.pid -or
+                    $process.outputProof.launcherCreationFileTimeUtc -ne $process.creationFileTimeUtc -or
+                    $process.streamOwnerPid -ne $process.pid -or
+                    $process.streamOwnerCreationFileTimeUtc -ne $process.creationFileTimeUtc) {
+                    throw (New-CapJournalFailure 'JournalCleanupUnproven' 'Output proof is not bound to its raw-pipe launcher root.')
+                }
+                foreach ($outputStream in @(Assert-CapJobOutputProof -Root $State.Root -Proof $process.outputProof -RetainStreams)) {
+                    $held.Add($outputStream)
+                }
             }
         }
         foreach ($entry in $data.entries) {
@@ -2721,6 +3266,12 @@ function Assert-CapNoWorkerTransientArtifacts {
 }
 
 Export-ModuleMember -Function @(
+    'Start-CapJobLauncher',
+    'Release-CapJobLauncher',
+    'Wait-CapJobTarget',
+    'Get-CapJobMembers',
+    'Close-CapJobLauncher',
+    'Assert-CapJobOutputProof',
     'New-CapJournalBinding',
     'New-CapJournalState',
     'Publish-CapJournalSnapshot',
@@ -2735,6 +3286,7 @@ Export-ModuleMember -Function @(
     'Write-CapTrace',
     'Get-CapTraceFailures',
     'Assert-CapArtifactPath',
+    'Assert-CapZmxLeasePath',
     'Assert-CapFixtureMapping',
     'Read-CapBoundJson',
     'Assert-CapDataRecord',

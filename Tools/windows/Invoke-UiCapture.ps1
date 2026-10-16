@@ -28,6 +28,8 @@ $tracked = [Collections.Generic.Dictionary[string, object]]::new([StringComparer
 $untrackedJournalEntries = [Collections.Generic.List[object]]::new()
 $workerRun = $null
 $workerLaunchAttempted = $false
+$workerJob = [IntPtr]::Zero
+$workerJobReceipt = $null
 $pendingLaunchesRemaining = @()
 $workerWait = $null
 $workerStdout = $null
@@ -192,10 +194,33 @@ function Assert-CapPreflightReport {
             'lease-bound admission omitted-product-diff through actual capture command',
             'lease-bound admission phase-swap through actual capture command',
             'lease-bound admission unrelated-base through actual capture command',
-            'actual immutable journal reader preserves held snapshots across concurrent numbered publications'
+            'actual immutable journal reader preserves held snapshots across concurrent numbered publications',
+            'contained job launcher preserves target normal and proves closure',
+            'contained job launcher preserves target nonzero and proves closure',
+            'contained job launcher preserves target timeout and proves closure',
+            'worker and contained launcher clear STD inheritance before target launch',
+            'N1 owned output descendant fixture accepts closure and refuses foreign or stale bytes',
+            'zmx rendezvous lease guard accepts240 and refuses241 before launch',
+            'actual exit receipt reader retries sharing and partial JSON with typed deadline and identity refusal',
+            'prebuilt fixture binder accepts exact artifacts and refuses missing or tampered bytes',
+            'journal phase timing records open copy total without changing budget or retry limits',
+            'umbrella safety-net kill refuses clean release for an unreceipted member',
+            'real zmx job lifecycle through actual command with target normal',
+            'real zmx job lifecycle through actual command with target nonzero',
+            'real zmx job lifecycle through actual command with target timeout'
         )) {
             if (@($preflight.cases | Where-Object name -CEQ $required).Count -ne 1) {
                 throw "Repaired-core preflight is missing a unique required actual-command case: $required"
+            }
+        }
+        foreach ($behavior in @('normal','nonzero','timeout')) {
+            $case = @($preflight.cases | Where-Object name -CEQ "real zmx job lifecycle through actual command with target $behavior")[0]
+            Assert-CapDataRecord $case.detail @{ zmxSha256 = [string]; providerCommit = [string]
+                evidenceMode = [string]; phases = [long] } 'Real seed preflight case'
+            if ($case.detail.zmxSha256 -cne $job.binaries.offlineZmx.sha256 -or
+                $case.detail.providerCommit -cne '785b3fd15dcafd1882b495c831a10f98c201b908' -or
+                $case.detail.evidenceMode -cne 'EXECUTED_CURRENT_REAL_ZMX' -or $case.detail.phases -ne 2) {
+                throw 'Real seed preflight case does not bind the current pinned provider.'
             }
         }
         return
@@ -203,8 +228,8 @@ function Assert-CapPreflightReport {
     $seedPhases = @($preflight.actualPhaseSeedLifecycle | ForEach-Object phase | Sort-Object)
     $invalidSeeds = @($preflight.actualPhaseSeedLifecycle | Where-Object {
         $_.exitCode -ne 0 -or -not $_.daemonReady -or $_.cmdCount -lt 1 -or
-        $_.cleanupStatus -ne 'CLEAN_ZERO_SURVIVORS_EOF' -or
-        -not $_.stdoutEof -or -not $_.stderrEof -or
+        $_.cleanupStatus -ne 'CLEAN_ZERO_SURVIVORS_FILES_CLOSED' -or
+        -not $_.outputProof.jobActive0 -or $_.stdoutEof -or $_.stderrEof -or
         $_.sourceJobSha256 -ne $jobHash -or $_.sourceModuleSha256 -ne $moduleHash -or
         $_.sourceWorkerSha256 -ne $workerHash -or
         $_.evidenceMode -cne $preflight.actualSeedEvidenceMode -or
@@ -268,8 +293,8 @@ function Assert-CapPreflightReport {
             ($receipt.argumentList -join [char]0) -cne ($seedArguments -join [char]0) -or
             -not $receipt.daemonReady -or $receipt.daemonCount -lt 1 -or $receipt.cmdCount -lt 1 -or
             $receipt.descendants.Count -lt 2 -or $receipt.cleanup.Count -lt ($receipt.descendants.Count + 1) -or
-            $receipt.cleanupStatus -ne 'CLEAN_ZERO_SURVIVORS_EOF' -or
-            -not $receipt.stdoutEof -or -not $receipt.stderrEof -or
+            $receipt.cleanupStatus -ne 'CLEAN_ZERO_SURVIVORS_FILES_CLOSED' -or
+            -not $receipt.outputProof.jobActive0 -or $receipt.stdoutEof -or $receipt.stderrEof -or
             $receipt.seedPid -ne $seedEvidence.seedPid -or
             $receipt.seedCreationFileTimeUtc -ne $seedEvidence.seedCreationFileTimeUtc -or
             $receipt.zmxRoot -cne $seedEvidence.zmxRoot -or $receipt.supportRoot -cne $seedEvidence.supportRoot) {
@@ -277,9 +302,9 @@ function Assert-CapPreflightReport {
         }
         $processRecords = @(
             [pscustomobject]@{
-                role = 'zmx-seed'; pid = $receipt.seedPid
-                creationFileTimeUtc = $receipt.seedCreationFileTimeUtc
-                expectedImagePath = $receipt.expectedImagePath
+                role = 'zmx-launcher'; pid = $receipt.launcherPid
+                creationFileTimeUtc = $receipt.launcherCreationFileTimeUtc
+                expectedImagePath = (Join-Path $PSHOME 'pwsh.exe')
             }
         ) + @($receipt.descendants)
         foreach ($record in $processRecords) {
@@ -621,6 +646,14 @@ function Assert-CapWorkerManifest {
             ($launch.arguments -join [char]0) -cne ($job.rehearsalTarget.arguments -join [char]0)) {
             throw 'Offline target did not prove exact arguments, readiness, zero exit, held-kernel exit and EOF.'
         }
+        if ($job.PSObject.Properties['seedDependencies']) {
+            if ($manifest.zmxSeeds.Count -ne 2 -or @($manifest.zmxSeeds | Where-Object {
+                $_.exitCode -ne 0 -or -not $_.daemonReady -or $_.daemonCount -lt 1 -or $_.cmdCount -lt 1 -or
+                $_.cleanupStatus -cne 'CLEAN_ZERO_SURVIVORS_FILES_CLOSED' -or
+                $_.stdoutEof -or $_.stderrEof -or -not $_.outputProof.jobActive0
+            }).Count -ne 0) { throw 'Real seed rehearsal lacks two ready, job-empty, closed-file phases.' }
+            foreach ($seed in $manifest.zmxSeeds) { $null = Assert-CapJobOutputProof -Root $root -Proof $seed.outputProof }
+        }
         return
     }
     $expectedImages = @(
@@ -643,8 +676,8 @@ function Assert-CapWorkerManifest {
     }).Count -gt 0
     $invalidSeeds = @($manifest.zmxSeeds | Where-Object {
         $_.exitCode -ne 0 -or -not $_.daemonReady -or $_.cmdCount -lt 1 -or
-        $_.cleanupStatus -ne 'CLEAN_ZERO_SURVIVORS_EOF' -or
-        -not $_.stdoutEof -or -not $_.stderrEof -or $_.descendants.Count -lt 2 -or
+        $_.cleanupStatus -ne 'CLEAN_ZERO_SURVIVORS_FILES_CLOSED' -or
+        -not $_.outputProof.jobActive0 -or $_.stdoutEof -or $_.stderrEof -or $_.descendants.Count -lt 2 -or
         $_.cleanup.Count -lt ($_.descendants.Count + 1) -or
         -not ([string]$_.zmxRoot).StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase) -or
         -not ([string]$_.supportRoot).StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)
@@ -784,11 +817,22 @@ try {
     if ($exports.Count -lt 30) { throw "Capture driver exports unavailable: count=$($exports.Count)." }
     if (-not $rehearsal) {
         $native = @(Test-CapNativeBindings)
-        if ($native.Count -ne 16) { throw "Required native binding export probe incomplete: count=$($native.Count)." }
+        if ($native.Count -ne 26) { throw "Required native binding export probe incomplete: count=$($native.Count)." }
     }
     if (@(Get-CapPendingLaunches).Count -ne 0) { throw 'Unreturned capture worker launches remain before run authorization.' }
 
     $shortLease = $lease.leaseId.Replace('-', '').Substring(0, 8)
+    if (-not $rehearsal) {
+        if ($root.Length -gt 5) {
+            $pathFailure = [IO.PathTooLongException]::new(
+                'BCaptureRootTooLong: live B capture requires a fresh owned root of at most 5 characters.')
+            $pathFailure.Data['CapCaptureCode'] = 'BCaptureRootTooLong'
+            throw $pathFailure
+        }
+        $longestSession = 'graphcode-gc-cap-actions-' + $shortLease + '-before--' + [guid]::Empty.ToString('D')
+        $null = Assert-CapZmxLeasePath -ZmxDir (Join-Path $root '00000') -SessionName $longestSession `
+            -Sid ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
+    }
     $runDirectory = Join-Path $root ('runs\' + [guid]::NewGuid().ToString('N'))
     $authorizationPath = Join-Path $runDirectory 'supervisor-authorization.json'
     $processJournalPath = Join-Path $runDirectory 'process-journal'
@@ -844,16 +888,26 @@ try {
     if (@(Get-CapTraceFailures).Count -gt 0) { throw 'Capture tracing failed before worker launch.' }
     $pwshPath = Join-Path $PSHOME 'pwsh.exe'
     $workerLaunchAttempted = $true
+    [CapProcessJob]::ClearStandardHandleInheritance()
+    $workerJob = [CapProcessJob]::Create()
     $workerRun = Start-CapManagedProcess -FilePath $pwshPath -ArgumentList @(
         '-NoProfile', '-File', $workerPath,
         '-AuthorizationPath', $authorizationPath,
-        '-AuthorizationSha256', $authorizationHash, '-OwnedRoot', $root
-    ) -WorkingDirectory $runDirectory -Role 'b-capture-worker'
+        '-AuthorizationSha256', $authorizationHash, '-OwnedRoot', $root, '-AwaitSupervisorGate'
+    ) -WorkingDirectory $runDirectory -Role 'b-capture-worker' -HoldStdin
+    [CapProcessJob]::Assign($workerJob, $workerRun.Identity.Process.Handle)
     $journalBinding = New-CapJournalBinding -RunId ([IO.Path]::GetFileName($runDirectory)) `
         -LeaseId $lease.leaseId -JobSha256 $jobHash -ModuleSha256 $moduleHash `
         -WorkerSha256 $workerHash -SupervisorSha256 $supervisorHash -Identity $workerRun.Identity
     $journalState = New-CapJournalState -Root $root -Directory $processJournalPath -Binding $journalBinding `
         -DeadlineUtc $deadlineUtc -ObservationPath (Join-Path $diagnosticsDirectory 'journal-read-observations.jsonl')
+    $null = Write-CapImmutableJson -Root $root -Path (Join-Path $runDirectory 'worker-gate.json') -Value ([pscustomobject]@{
+        binding = $journalBinding; authorizationSha256 = $authorizationHash
+        assignedBeforeGateRelease = $true; containment = 'KILL_ON_CLOSE_NO_ESCAPE_FLAGS'
+    })
+    $workerRun.Identity.Process.StandardInput.WriteLine($authorizationHash)
+    $workerRun.Identity.Process.StandardInput.Flush()
+    $workerRun.Identity.Process.StandardInput.Close()
     $lastJournalRead = [DateTime]::MinValue
     while ([DateTime]::UtcNow -lt $deadlineUtc) {
         if (@(Get-CapTraceFailures).Count -gt 0) { throw 'Capture tracing failed; supervisor is beginning guarded cleanup.' }
@@ -911,6 +965,41 @@ try {
                 }
             },
             { Stop-CapWorkerIfNeeded },
+            {
+                if ($workerJob -eq [IntPtr]::Zero) { throw 'Supervisor job owner handle is absent.' }
+                $membersBeforeStop = @([CapProcessJob]::Members($workerJob))
+                $exemptWorkerPid = $null
+                if ($membersBeforeStop -contains $workerRun.Identity.Pid) {
+                    try {
+                        $workerSnapshot = [CapNative]::Snapshot($workerRun.Identity.Process.Handle, $workerRun.Identity.Pid)
+                        if (-not $workerSnapshot.IsExited -and
+                            $workerSnapshot.CreationFileTimeUtc -eq $workerRun.Identity.CreationFileTimeUtc -and
+                            $workerSnapshot.ImagePath -ieq $workerRun.Identity.ExpectedImagePath) {
+                            $exemptWorkerPid = $workerSnapshot.ProcessId
+                        }
+                    } catch {
+                        $cleanupFailures.Add("Umbrella worker exemption could not attest its held generation: $($_.Exception.Message)")
+                    }
+                }
+                [CapProcessJob]::Terminate($workerJob)
+                [CapProcessJob]::WaitForEmpty($workerJob, 5000)
+                $active = [CapProcessJob]::Active($workerJob)
+                if ($active -ne 0) { throw 'Supervisor job not empty before close.' }
+                $script:workerJobReceipt = [pscustomobject]@{ kind = 'KILL_ON_CLOSE_JOB'
+                    membersBeforeStop = $membersBeforeStop; activeProcesses = [long]$active
+                    jobActive0 = $true; observedBeforeHandleClose = $true }
+                [CapProcessJob]::Close($workerJob)
+                $script:workerJob = [IntPtr]::Zero
+                foreach ($memberPid in $membersBeforeStop) {
+                    if ($null -ne $exemptWorkerPid -and $memberPid -eq $exemptWorkerPid) { continue }
+                    $recoveryReceipts.Add([pscustomobject]@{
+                        kind = 'SAFETY_NET_KILLED'; pid = [long]$memberPid
+                        identityAttested = $false; evidence = 'UMBRELLA_JOB_MEMBERSHIP_PID_ONLY'
+                        jobActive0 = $true; cleanReleaseProven = $false
+                    })
+                    $cleanupFailures.Add("SAFETY_NET_KILLED: umbrella member PID $memberPid lacked an exact exempt worker generation; cleanup remains unproved.")
+                }
+            },
             { Write-CapProcessOutput -Run $workerRun -Prefix 'supervisor-worker' },
             { Assert-CapNoTrackedSurvivors },
             { Read-CapQuiescentWorkerProof }
@@ -922,6 +1011,15 @@ try {
             }
         }
         $cleanupProven = $cleanupFailures.Count -eq 0
+    }
+    if ($workerJob -ne [IntPtr]::Zero) {
+        try {
+            [CapProcessJob]::Terminate($workerJob)
+            [CapProcessJob]::WaitForEmpty($workerJob, 5000)
+            if ([CapProcessJob]::Active($workerJob) -ne 0) { throw 'Unreturned worker job remains active.' }
+            [CapProcessJob]::Close($workerJob)
+            $workerJob = [IntPtr]::Zero
+        } catch { $cleanupFailures.Add("Supervisor job cleanup failed: $(Get-CapSupervisorFailureText $_)") }
     }
     foreach ($record in $tracked.Values) {
         try { $record.Identity.Process.Dispose() }
@@ -980,8 +1078,8 @@ try {
                 $leaseExpiresUtc.ToString('o', [Globalization.CultureInfo]::InvariantCulture)
             } else { $null }
             workerExitCode = if ($workerWait) { $workerWait.ExitCode } else { $null }
-            workerStdoutEof = if ($workerRun) { $workerRun.StdoutTask.IsCompleted } else { $false }
-            workerStderrEof = if ($workerRun) { $workerRun.StderrTask.IsCompleted } else { $false }
+            workerStdoutEof = if ($workerRun) { $workerRun.StdoutTask.Status -eq [Threading.Tasks.TaskStatus]::RanToCompletion } else { $false }
+            workerStderrEof = if ($workerRun) { $workerRun.StderrTask.Status -eq [Threading.Tasks.TaskStatus]::RanToCompletion } else { $false }
             journalEntriesWithoutHeldKernelHandle = @($untrackedJournalEntries)
             kernelVerifiedSurvivors = @($survivors)
             recovery = @($recoveryReceipts)
@@ -993,6 +1091,7 @@ try {
             workerPendingLaunchesRemaining = if ($manifest -and $manifest.PSObject.Properties['pendingLaunchesRemaining'] -and $manifest.pendingLaunchesRemaining -is [array]) { ,@($manifest.pendingLaunchesRemaining) } else { $null }
             workerOwnedProcessSurvivors = if ($manifest -and $manifest.PSObject.Properties['ownedProcessSurvivors'] -and $manifest.ownedProcessSurvivors -is [array]) { ,@($manifest.ownedProcessSurvivors) } else { $null }
             journalFinalBinding = if ($journalProof) { $journalProof.Record } else { $null }
+            containmentJob = $workerJobReceipt
             journalPublishedInventory = if ($journalProof) { ,@($journalProof.Inventory) } else { $null }
             captures = if ($manifest) { $manifest.images.Count } else { 0 }
             sourceHashesBeforeImport = [ordered]@{ module = $moduleHash; worker = $workerHash; supervisor = $supervisorHash }

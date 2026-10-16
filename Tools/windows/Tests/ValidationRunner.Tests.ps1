@@ -4713,7 +4713,17 @@ if ($uiScenarioSummary.executed -isnot [long] -or $uiScenarioSummary.executed -l
 }
 $uiScenarioOutput | ForEach-Object { Write-Host $_ }
 
-$uiCaptureOutput = @(& $pwsh -NoProfile -File (Join-Path $PSScriptRoot "UiCaptureDriver.Tests.ps1"))
+$uiCaptureRoot = Join-Path ([IO.Path]::GetTempPath()) ("gc-ui-capture-" + [guid]::NewGuid().ToString("N"))
+$null = New-Item -ItemType Directory -Path $uiCaptureRoot
+$uiCapturePrebuilt = Join-Path $uiCaptureRoot "prebuilt"
+$uiCapturePrepareOutput = @(& $pwsh -NoProfile -File (Join-Path $PSScriptRoot "UiCaptureDriver.Tests.ps1") `
+    -PrepareFixturesOnly -ScratchRoot $uiCapturePrebuilt)
+if ($LASTEXITCODE -ne 0) { throw "RED: offline capture fixture preparation failed" }
+$uiCaptureManifestPath = Join-Path $uiCapturePrebuilt "fixtures.json"
+$uiCaptureManifestHash = (Get-FileHash -LiteralPath $uiCaptureManifestPath -Algorithm SHA256).Hash
+$uiCaptureOutput = @(& $pwsh -NoProfile -File (Join-Path $PSScriptRoot "UiCaptureDriver.Tests.ps1") `
+    -ScratchRoot (Join-Path $uiCaptureRoot "suite") `
+    -PrebuiltFixtureManifest $uiCaptureManifestPath -PrebuiltFixtureManifestSha256 $uiCaptureManifestHash)
 $uiCaptureOutput | ForEach-Object { Write-Host $_ }
 if ($LASTEXITCODE -ne 0) { throw "RED: offline real-launch capture child failed" }
 $uiCaptureSummaries = @($uiCaptureOutput | Where-Object { $_ -is [string] -and $_.StartsWith('{"suite":"UiCaptureDriver",') })
