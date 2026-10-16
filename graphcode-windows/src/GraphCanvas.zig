@@ -578,7 +578,7 @@ pub fn headerWorktreeNotice(model: *const GraphModel.Model, inspection: *const W
     if (!graph.project.isLocalFilesystem() or !std.mem.eql(u8, graph.project.path, inspection.project_path)) return false;
     return WorktreeStatus.noticeState(inspection.entries.items, policy) == .notice;
 }
-pub const AttentionAction = enum { reply, inspect };
+pub const AttentionAction = enum { none, reply, inspect };
 pub const ReclaimAction = enum { reclaim, keep };
 pub const ReclaimHit = struct { node_index: usize, action: ReclaimAction };
 
@@ -690,7 +690,9 @@ pub fn paint(
     _ = c.IntersectClipRect(hdc, graph_bounds.left, graph_bounds.top, graph_bounds.right, graph_bounds.bottom);
     drawGrid(hdc, graph_bounds, state);
     switch (surface) {
-        .overview => drawOverview(hdc, allocator, model, graph_bounds, state),
+        .overview => drawOverview(hdc, allocator, model, graph_bounds, state, declared_entries) catch |err| {
+            std.log.warn("Overview card role resolution failed: {s}", .{@errorName(err)});
+        },
         .quick_chats => drawQuickChats(hdc, allocator, model, graph_bounds, state),
         .project => if (model.graph) |graph| {
             drawProjectWorktreeChip(hdc, allocator, model, graph_bounds);
@@ -699,8 +701,25 @@ pub fn paint(
                 emptyGraph(hdc, allocator, graph, graph_bounds);
             } else {
                 drawEdges(hdc, graph, state);
-                for (graph.nodes.items, 0..) |node, index| {
-                    drawNode(hdc, allocator, node, index, model.selectedIndex(), graph.nodes.items, graph.edges.items, inspection, declared_entries, kept_worktrees, state);
+                if (resolveCardRoles(allocator, graph.nodes.items, graph.edges.items, declared_entries)) |roles| {
+                    defer allocator.free(roles);
+                    for (graph.nodes.items, 0..) |node, index| {
+                        drawNode(
+                            hdc,
+                            allocator,
+                            node,
+                            index,
+                            model.selectedIndex(),
+                            graph.nodes.items,
+                            graph.edges.items,
+                            roles[index],
+                            inspection,
+                            kept_worktrees,
+                            state,
+                        );
+                    }
+                } else |err| {
+                    std.log.warn("Project card role resolution failed: {s}", .{@errorName(err)});
                 }
 
                 drawEdgeLabels(hdc, allocator, graph, state);
@@ -813,7 +832,8 @@ fn drawOverview(
     model: *const GraphModel.Model,
     bounds: c.RECT,
     state: *const CanvasState,
-) void {
+    declared_entries: []const []const u8,
+) !void {
     if (model.graphs.items.len == 0) {
         const center_y = bounds.top + @divTrunc(bounds.bottom - bounds.top, 2) - 60;
         drawTextRect(hdc, allocator, "Nothing running yet", rect(bounds.left + 40, center_y, bounds.right - 40, center_y + 34), 20, 0x00F2F2F2, c.DT_CENTER | c.DT_SINGLELINE);
@@ -821,6 +841,12 @@ fn drawOverview(
         return;
     }
     for (model.graphs.items, 0..) |graph, graph_index| {
+        const active_declared_entries: []const []const u8 = if (model.graph) |active_graph|
+            if (std.mem.eql(u8, active_graph.project.path, graph.project.path)) declared_entries else &.{}
+        else
+            &.{};
+        const roles = try resolveCardRoles(allocator, graph.nodes.items, graph.edges.items, active_declared_entries);
+        defer allocator.free(roles);
         const lane = overviewLaneBounds(model, graph_index, bounds, state);
         roundedCard(hdc, lane, Tokens.workspace_rail, false);
         const caption = overviewLaneCaption(model, graph_index, bounds, state);
@@ -847,11 +873,20 @@ fn drawOverview(
         var index: usize = 0;
         while (index < graph.nodes.items.len) : (index += 1) {
             const card = overviewCardBounds(model, graph_index, index, bounds, state);
-            roundedCard(hdc, card, Tokens.loop_card_bottom, false);
-            fill(hdc, rect(card.left, card.top, card.left + scaledValue(4, state.zoom), card.bottom), loopTypeColor(graph.nodes.items[index].loop_type));
-            drawCardBody(hdc, allocator, graph.nodes.items[index], card, state.zoom, .interior, false, false) catch |err| {
-                std.log.warn("Overview card {s} presentation failed: {s}", .{ graph.nodes.items[index].id, @errorName(err) });
-            };
+            const node = graph.nodes.items[index];
+            drawLoopCard(
+                hdc,
+                allocator,
+                node,
+                card,
+                state,
+                roles[index],
+                needsAttention(node, graph.nodes.items, graph.edges.items),
+                primaryCardAction(node),
+                false,
+                false,
+                false,
+            );
         }
     }
 }
@@ -1662,40 +1697,70 @@ fn drawNode(
     selected: ?usize,
     nodes: []const GraphModel.Node,
     edges: []const GraphModel.Edge,
+    role: NodeRole,
     inspection: ?*const WorktreeStatus.Inspection,
-    declared_entries: []const []const u8,
     kept_worktrees: []const []const u8,
     state: *const CanvasState,
 ) void {
     const bounds = nodeBounds(index, state);
-    const x = bounds.left;
-    const y = bounds.top;
     const attention = needsAttention(node, nodes, edges);
     const selected_card = selected == index;
-    // Theme.loopCard's bottom stop (#232326), used for both states: selection is
-    // carried by the border/ring (Tokens.canvas_selection via roundedCard's
-    // `selected` flag), matching mac -- there is no "selected node fill" color in
-    // Theme.swift. Previously an ad-hoc 0x00345D8C blue with no Theme.swift source.
-    roundedCard(hdc, bounds, Tokens.loop_card_bottom, selected_card);
-    const stripe = loopTypeColor(node.loop_type);
-    fill(hdc, rect(x, y, x + scaled(Tokens.loop_card_stripe, state), y + bounds.bottom - y), stripe);
-    const role = nodeRole(edges, node.id, declared_entries);
     const reclaim_offer = hasReclaimOffer(node, inspection, kept_worktrees);
-    drawCardBody(hdc, allocator, node, bounds, state.zoom, role, attention, reclaim_offer) catch |err| {
-        std.log.warn("Project card {s} presentation failed: {s}", .{ node.id, @errorName(err) });
-    };
-    if (attentionActionVisible(node, nodes, edges)) {
-        const action = attentionActionBounds(bounds, state);
-        fill(hdc, action, 0x000A9FFF);
-        drawTextRect(hdc, allocator, attentionActionLabel(node), action, scaled(9, state), 0x00241703, c.DT_CENTER | c.DT_SINGLELINE | c.DT_VCENTER);
-    }
+    drawLoopCard(
+        hdc,
+        allocator,
+        node,
+        bounds,
+        state,
+        role,
+        attention,
+        primaryCardAction(node),
+        selected_card,
+        reclaim_offer,
+        true,
+    );
     if (state.hovered_connector == index) {
         const connector = connectorPositionForIndex(nodes, index, true, state);
         fill(hdc, rect(connector.x - connectorRadius(state), connector.y - connectorRadius(state), connector.x + connectorRadius(state), connector.y + connectorRadius(state)), 0x00FFCD7A);
         drawTextRect(hdc, allocator, "+", rect(connector.x - scaled(8, state), connector.y - scaled(8, state), connector.x + scaled(8, state), connector.y + scaled(8, state)), scaled(12, state), 0x00262626, c.DT_CENTER | c.DT_SINGLELINE | c.DT_VCENTER);
     }
+}
 
-    if (reclaim_offer) {
+fn drawLoopCard(
+    hdc: c.HDC,
+    allocator: std.mem.Allocator,
+    node: GraphModel.Node,
+    bounds: c.RECT,
+    state: *const CanvasState,
+    role: NodeRole,
+    attention: bool,
+    action: ?AttentionAction,
+    selected: bool,
+    reclaim: bool,
+    show_reclaim: bool,
+) void {
+    // Theme.loopCard's bottom stop (#232326), used for both states: selection is
+    // carried by the border/ring (Tokens.canvas_selection via roundedCard's
+    // `selected` flag), matching mac -- there is no "selected node fill" color in
+    // Theme.swift. Previously an ad-hoc 0x00345D8C blue with no Theme.swift source.
+    roundedCard(hdc, bounds, Tokens.loop_card_bottom, selected);
+    const stripe = loopTypeColor(node.loop_type);
+    const stripe_color = if (role == .unwired) blendCardColor(stripe, Tokens.loop_card_bottom, 35) else stripe;
+    fill(
+        hdc,
+        rect(bounds.left, bounds.top, bounds.left + scaled(Tokens.loop_card_stripe, state), bounds.bottom),
+        stripe_color,
+    );
+    drawCardBody(hdc, allocator, node, bounds, state.zoom, role, attention, action, reclaim) catch |err| {
+        std.log.warn("Card {s} presentation failed: {s}", .{ node.id, @errorName(err) });
+    };
+    if (action) |primary_action| {
+        const action_bounds = attentionActionBounds(bounds, state);
+        fill(hdc, action_bounds, 0x000A9FFF);
+        drawTextRect(hdc, allocator, attentionActionLabelFor(primary_action), action_bounds, scaled(9, state), 0x00241703, c.DT_CENTER | c.DT_SINGLELINE | c.DT_VCENTER);
+    }
+
+    if (show_reclaim and reclaim) {
         const offer = reclaimOfferBounds(bounds);
         fill(hdc, offer.reclaim, 0x003A3A44);
         drawTextRect(hdc, allocator, "Reclaim", offer.reclaim, scaled(9, state), 0x00E6E6E6, c.DT_CENTER | c.DT_SINGLELINE | c.DT_VCENTER);
@@ -1707,20 +1772,41 @@ pub fn attentionActionLabel(node: GraphModel.Node) []const u8 {
     return switch (attentionActionForNode(node)) {
         .reply => "Reply",
         .inspect => "Inspect",
+        .none => "",
     };
 }
 
 pub fn attentionActionForNode(node: GraphModel.Node) AttentionAction {
     if (std.mem.eql(u8, node.state, "running") and std.mem.eql(u8, node.presence, "awaitingInput")) return .reply;
-    return .inspect;
+    if (std.mem.eql(u8, node.state, "blocked")) return .inspect;
+    return .none;
+}
+
+fn attentionActionLabelFor(action: AttentionAction) []const u8 {
+    return switch (action) {
+        .reply => "Reply",
+        .inspect => "Inspect",
+        .none => "",
+    };
+}
+
+fn primaryCardAction(node: GraphModel.Node) ?AttentionAction {
+    const action = attentionActionForNode(node);
+    return if (action == .none) null else action;
 }
 
 pub fn attentionActionBounds(bounds: c.RECT, state: *const CanvasState) c.RECT {
-    return rect(bounds.right - scaled(77, state), bounds.top + scaled(51, state), bounds.right - scaled(11, state), bounds.top + scaled(68, state));
+    return attentionActionBoundsForZoom(bounds, state.zoom);
+}
+
+fn attentionActionBoundsForZoom(bounds: c.RECT, zoom: f32) c.RECT {
+    return rect(bounds.right - scaledValue(77, zoom), bounds.top + scaledValue(51, zoom), bounds.right - scaledValue(11, zoom), bounds.top + scaledValue(68, zoom));
 }
 
 pub fn attentionActionVisible(node: GraphModel.Node, nodes: []const GraphModel.Node, edges: []const GraphModel.Edge) bool {
-    return needsAttention(node, nodes, edges);
+    _ = nodes;
+    _ = edges;
+    return attentionActionForNode(node) != .none;
 }
 
 pub fn hitTestAttentionAction(
@@ -2128,7 +2214,17 @@ fn drawCardPill(hdc: c.HDC, allocator: std.mem.Allocator, presentation: CardStat
     try drawCardText(hdc, allocator, presentation.word, rect(dot_left + diameter + scaledValue(4, zoom), bounds.top, bounds.right - scaledValue(7, zoom), bounds.bottom), 10 * zoom, .card_state, presentation.ink, false);
 }
 
-fn drawCardBody(hdc: c.HDC, allocator: std.mem.Allocator, node: GraphModel.Node, bounds: c.RECT, zoom: f32, role: NodeRole, attention: bool, reclaim: bool) !void {
+fn drawCardBody(
+    hdc: c.HDC,
+    allocator: std.mem.Allocator,
+    node: GraphModel.Node,
+    bounds: c.RECT,
+    zoom: f32,
+    role: NodeRole,
+    attention: bool,
+    action: ?AttentionAction,
+    reclaim: bool,
+) !void {
     const presentation = cardState(node);
     const pill_width = blk: {
         const old = try selectCardFont(hdc, 10 * zoom, .card_state);
@@ -2141,43 +2237,189 @@ fn drawCardBody(hdc: c.HDC, allocator: std.mem.Allocator, node: GraphModel.Node,
     const live = try cardLiveLine(allocator, node);
     defer allocator.free(live);
     try drawCardText(hdc, allocator, live, layout.live, 10.5 * zoom, .card_mono, 0x009F9C9C, true);
+    const chip_in_detail = drawCardMetaRow(hdc, allocator, node, layout, zoom, role) catch |err| switch (err) {
+        error.CardMetadataTooWide => blk: {
+            std.log.warn("Card {s} fixed metadata does not fit: {s}", .{ node.id, @errorName(err) });
+            try drawCardText(hdc, allocator, "Metadata unavailable", layout.meta, 10.5 * zoom, .card_mono, Tokens.dialog_error_text, true);
+            break :blk false;
+        },
+        else => return err,
+    };
     const metric = try cardMetricDetail(allocator, node);
     defer allocator.free(metric);
     if (!attention and !reclaim) {
-        const entry_detail = if (role == .entry and metric.len != 0) try std.fmt.allocPrint(allocator, "START · {s}", .{metric}) else null;
-        defer if (entry_detail) |text| allocator.free(text);
-        const detail = if (role == .unwired) "UNWIRED · No connections · right-click to recover" else if (role == .entry) entry_detail orelse "START" else metric;
         var detail_bounds = layout.detail;
-        if (metric.len != 0 and role != .unwired) detail_bounds.bottom -= scaledValue(4, zoom);
-        try drawCardText(hdc, allocator, detail, detail_bounds, 10.5 * zoom, .card_mono, if (role == .unwired) 0x007ACDFF else 0x009F9C9C, true);
-        if (metric.len != 0 and role != .unwired) {
-            const track = rect(layout.detail.left, layout.detail.bottom - scaledValue(2, zoom), layout.detail.right, layout.detail.bottom);
+        if (chip_in_detail) {
+            const chip_width = try cardRoleChipWidth(hdc, allocator, role, zoom);
+            detail_bounds.left += chip_width + scaledValue(4, zoom);
+        }
+        if (action != null) {
+            detail_bounds.right = @min(detail_bounds.right, attentionActionBoundsForZoom(bounds, zoom).left - scaledValue(4, zoom));
+        }
+        if (metric.len != 0) detail_bounds.bottom -= scaledValue(4, zoom);
+        if (metric.len != 0 and detail_bounds.right > detail_bounds.left) {
+            try drawCardText(hdc, allocator, metric, detail_bounds, 10.5 * zoom, .card_mono, 0x009F9C9C, true);
+            const track = rect(detail_bounds.left, layout.detail.bottom - scaledValue(2, zoom), detail_bounds.right, layout.detail.bottom);
             fill(hdc, track, 0x00444141);
             const fraction = std.math.clamp(cardMetricRatio(node), 0, 1);
             const end = track.left + @as(i32, @intFromFloat(@as(f64, @floatFromInt(track.right - track.left)) * fraction));
             if (end > track.left) fill(hdc, rect(track.left, track.top, end, track.bottom), loopTypeColor(node.loop_type));
         }
-    } else if (role != .interior) {
-        const role_bounds = rect(if (reclaim) reclaimOfferBounds(bounds).keep.right + scaledValue(6, zoom) else layout.live.left, layout.detail.top, if (attention) attentionActionBounds(bounds, &.{ .zoom = zoom }).left - scaledValue(6, zoom) else layout.detail.right, layout.detail.bottom);
-        try drawCardText(hdc, allocator, if (role == .entry) "START" else "UNWIRED", role_bounds, 10.5 * zoom, .card_mono, 0x009F9C9C, true);
     }
-    const meta_text_bounds = rect(layout.meta.left + scaledValue(11, zoom), layout.meta.top, layout.meta.right, layout.meta.bottom);
-    const meta = blk: {
-        const old = try selectCardFont(hdc, 10.5 * zoom, .card_mono);
-        defer _ = c.SelectObject(hdc, old);
-        break :blk cardMetaForWidth(hdc, allocator, node, @intCast(@max(0, std.time.timestamp())), meta_text_bounds.right - meta_text_bounds.left) catch |err| switch (err) {
-            error.CardMetadataTooWide => {
-                std.log.warn("Card {s} fixed metadata does not fit: {s}", .{ node.id, @errorName(err) });
-                try drawCardText(hdc, allocator, "Metadata unavailable", layout.meta, 10.5 * zoom, .card_mono, Tokens.dialog_error_text, true);
-                return;
-            },
-            else => return err,
-        };
+}
+
+const CardRoleChip = struct {
+    label: []const u8,
+    fill: u32,
+    ink: u32,
+    stroke: ?u32,
+    padding: i32,
+    radius: i32,
+    font_size: f32,
+    font_style: AppFont.Style,
+};
+
+const CardMetaPresentation = struct {
+    text: []u8,
+    chip_in_detail: bool,
+};
+
+fn cardRoleChip(role: NodeRole) ?CardRoleChip {
+    return switch (role) {
+        .entry => .{
+            .label = "entry",
+            .fill = blendCardColor(0x00709E19, Tokens.loop_card_bottom, 18),
+            .ink = 0x00ABD36F,
+            .stroke = null,
+            .padding = 6,
+            .radius = 4,
+            .font_size = 10.5,
+            .font_style = .card_state,
+        },
+        .cycle_only => .{
+            .label = "cycle · no entry point",
+            .fill = blendCardColor(0x000A9FFF, Tokens.loop_card_bottom, 12),
+            .ink = blendCardColor(0x007ACDFF, Tokens.loop_card_bottom, 90),
+            .stroke = blendCardColor(0x000A9FFF, Tokens.loop_card_bottom, 28),
+            .padding = 6,
+            .radius = 5,
+            .font_size = 9.5,
+            .font_style = .card_mono,
+        },
+        .interior, .unwired => null,
     };
-    defer allocator.free(meta);
+}
+
+fn cardRoleChipWidth(hdc: c.HDC, allocator: std.mem.Allocator, role: NodeRole, zoom: f32) !i32 {
+    const chip = cardRoleChip(role) orelse return 0;
+    const old_font = try selectCardFont(hdc, chip.font_size * zoom, chip.font_style);
+    defer _ = c.SelectObject(hdc, old_font);
+    return (try measuredText(hdc, allocator, chip.label)) + scaledValue(chip.padding * 2, zoom);
+}
+
+fn cardMetaPresentation(
+    hdc: c.HDC,
+    allocator: std.mem.Allocator,
+    node: GraphModel.Node,
+    layout: CardTextLayout,
+    zoom: f32,
+    role: NodeRole,
+) !CardMetaPresentation {
+    const old_font = try selectCardFont(hdc, 10.5 * zoom, .card_mono);
+    defer _ = c.SelectObject(hdc, old_font);
+    const full_text_bounds = rect(layout.meta.left + scaledValue(11, zoom), layout.meta.top, layout.meta.right, layout.meta.bottom);
+    if (cardRoleChip(role) == null) return .{
+        .text = try cardMetaForWidth(
+            hdc,
+            allocator,
+            node,
+            @intCast(@max(0, std.time.timestamp())),
+            full_text_bounds.right - full_text_bounds.left,
+        ),
+        .chip_in_detail = false,
+    };
+
+    const chip_width = try cardRoleChipWidth(hdc, allocator, role, zoom);
+    const gap = scaledValue(5, zoom);
+    const reserved_bounds = rect(full_text_bounds.left, full_text_bounds.top, full_text_bounds.right - chip_width - gap, full_text_bounds.bottom);
+    const now: u64 = @intCast(@max(0, std.time.timestamp()));
+    const meta = cardMetaForWidth(hdc, allocator, node, now, reserved_bounds.right - reserved_bounds.left) catch |err| switch (err) {
+        error.CardMetadataTooWide => return .{
+            .text = try cardMetaForWidth(hdc, allocator, node, now, full_text_bounds.right - full_text_bounds.left),
+            .chip_in_detail = true,
+        },
+        else => return err,
+    };
+    return .{ .text = meta, .chip_in_detail = false };
+}
+
+fn drawCardRoleChip(
+    hdc: c.HDC,
+    allocator: std.mem.Allocator,
+    role: NodeRole,
+    bounds: c.RECT,
+    zoom: f32,
+) !void {
+    const chip = cardRoleChip(role) orelse return;
+    const brush = c.CreateSolidBrush(chip.fill) orelse return error.CardBrushCreationFailed;
+    defer _ = c.DeleteObject(brush);
+    const pen = c.CreatePen(c.PS_SOLID, scaledValue(1, zoom), chip.stroke orelse chip.fill) orelse return error.CardPenCreationFailed;
+    defer _ = c.DeleteObject(pen);
+    const old_brush = c.SelectObject(hdc, brush);
+    defer _ = c.SelectObject(hdc, old_brush);
+    const old_pen = c.SelectObject(hdc, pen);
+    defer _ = c.SelectObject(hdc, old_pen);
+    _ = c.RoundRect(hdc, bounds.left, bounds.top, bounds.right, bounds.bottom, scaledValue(chip.radius * 2, zoom), scaledValue(chip.radius * 2, zoom));
+    try drawCardText(
+        hdc,
+        allocator,
+        chip.label,
+        rect(bounds.left + scaledValue(chip.padding, zoom), bounds.top, bounds.right - scaledValue(chip.padding, zoom), bounds.bottom),
+        chip.font_size * zoom,
+        chip.font_style,
+        chip.ink,
+        false,
+    );
+}
+
+fn drawCardMetaRow(
+    hdc: c.HDC,
+    allocator: std.mem.Allocator,
+    node: GraphModel.Node,
+    layout: CardTextLayout,
+    zoom: f32,
+    role: NodeRole,
+) !bool {
     const square_top = @divTrunc(layout.meta.top + layout.meta.bottom - scaledValue(6, zoom), 2);
     fill(hdc, rect(layout.meta.left, square_top, layout.meta.left + scaledValue(6, zoom), square_top + scaledValue(6, zoom)), loopTypeColor(node.loop_type));
-    try drawCardText(hdc, allocator, meta, meta_text_bounds, 10.5 * zoom, .card_mono, blendCardColor(0x00FFFFFF, Tokens.loop_card_bottom, 52), false);
+    const meta = try cardMetaPresentation(hdc, allocator, node, layout, zoom, role);
+    defer allocator.free(meta.text);
+    const role_chip = cardRoleChip(role);
+    const text_right = if (meta.chip_in_detail or role_chip == null)
+        layout.meta.right
+    else blk: {
+        const chip_width = try cardRoleChipWidth(hdc, allocator, role, zoom);
+        break :blk layout.meta.right - chip_width - scaledValue(5, zoom);
+    };
+    const text_bounds = rect(layout.meta.left + scaledValue(11, zoom), layout.meta.top, text_right, layout.meta.bottom);
+    try drawCardText(hdc, allocator, meta.text, text_bounds, 10.5 * zoom, .card_mono, blendCardColor(0x00FFFFFF, Tokens.loop_card_bottom, 52), false);
+    if (role_chip) |_| {
+        const chip_width = try cardRoleChipWidth(hdc, allocator, role, zoom);
+        const chip_bounds = if (meta.chip_in_detail) blk: {
+            const chip_left = layout.detail.left;
+            const chip_right = chip_left + chip_width;
+            const chip_height = scaledValue(14, zoom);
+            const top = @divTrunc(layout.detail.top + layout.detail.bottom - chip_height, 2);
+            break :blk rect(chip_left, top, chip_right, top + chip_height);
+        } else blk: {
+            const chip_height = scaledValue(14, zoom);
+            const top = @divTrunc(layout.meta.top + layout.meta.bottom - chip_height, 2);
+            break :blk rect(layout.meta.right - chip_width, top, layout.meta.right, top + chip_height);
+        };
+        try drawCardRoleChip(hdc, allocator, role, chip_bounds, zoom);
+        return meta.chip_in_detail;
+    }
+    return false;
 }
 
 pub fn nodeBounds(index: usize, state: *const CanvasState) c.RECT {
@@ -2203,9 +2445,12 @@ fn stateColor(state: []const u8, attention: bool) u32 {
 }
 
 fn loopTypeColor(loop_type: []const u8) u32 {
-    if (std.mem.eql(u8, loop_type, "composite") or std.mem.eql(u8, loop_type, "proactive")) return 0x00C77DFF;
-    if (std.mem.eql(u8, loop_type, "goalBased")) return 0x000A84FF;
-    if (std.mem.eql(u8, loop_type, "turnBased")) return 0x00D6A649;
+    if (std.mem.eql(u8, loop_type, "sketch")) return 0x00E3DAD3;
+    if (std.mem.eql(u8, loop_type, "goalBased")) return 0x00709E19;
+    if (std.mem.eql(u8, loop_type, "timeBased")) return 0x000085C9;
+    if (std.mem.eql(u8, loop_type, "turnBased")) return 0x008151D5;
+    if (std.mem.eql(u8, loop_type, "composite")) return 0x00E98590;
+    if (std.mem.eql(u8, loop_type, "proactive")) return 0x00C77DFF;
     if (std.mem.eql(u8, loop_type, "message")) return 0x006BD58D;
     return 0x00909090;
 }
@@ -2236,19 +2481,111 @@ fn needsAttention(node: GraphModel.Node, nodes: []const GraphModel.Node, edges: 
     return false;
 }
 
-const NodeRole = enum { interior, entry, unwired };
+const NodeRole = enum { interior, entry, cycle_only, unwired };
 
-fn nodeRole(edges: []const GraphModel.Edge, node_id: []const u8, declared_entries: []const []const u8) NodeRole {
-    var inbound = false;
-    var outbound = false;
-    for (edges) |edge| {
-        if (std.mem.eql(u8, edge.to, node_id)) inbound = true;
-        if (std.mem.eql(u8, edge.from, node_id)) outbound = true;
+fn graphRoleTestNode(id: []const u8) GraphModel.Node {
+    return .{
+        .id = @constCast(id),
+        .title = @constCast("Role test"),
+        .loop_type = @constCast("sketch"),
+        .state = @constCast("idle"),
+        .activity = @constCast(""),
+        .presence = @constCast("idle"),
+    };
+}
+
+fn graphRoleTestEdge(from: []const u8, to: []const u8, kind: []const u8) GraphModel.Edge {
+    return .{
+        .from = @constCast(from),
+        .to = @constCast(to),
+        .kind = @constCast(kind),
+    };
+}
+
+fn resolveCardRoles(
+    allocator: std.mem.Allocator,
+    nodes: []const GraphModel.Node,
+    edges: []const GraphModel.Edge,
+    declared_entries: []const []const u8,
+) ![]NodeRole {
+    const no_edge = std.math.maxInt(usize);
+    const roles = try allocator.alloc(NodeRole, nodes.len);
+    errdefer allocator.free(roles);
+    const touched = try allocator.alloc(bool, nodes.len);
+    defer allocator.free(touched);
+    const has_handoff_incoming = try allocator.alloc(bool, nodes.len);
+    defer allocator.free(has_handoff_incoming);
+    const first_handoff = try allocator.alloc(usize, nodes.len);
+    defer allocator.free(first_handoff);
+    const next_handoff = try allocator.alloc(usize, edges.len);
+    defer allocator.free(next_handoff);
+    const handoff_targets = try allocator.alloc(usize, edges.len);
+    defer allocator.free(handoff_targets);
+    const reached = try allocator.alloc(bool, nodes.len);
+    defer allocator.free(reached);
+    const queue = try allocator.alloc(usize, nodes.len);
+    defer allocator.free(queue);
+    @memset(touched, false);
+    @memset(has_handoff_incoming, false);
+    @memset(first_handoff, no_edge);
+    @memset(reached, false);
+
+    var indices = std.StringHashMap(usize).init(allocator);
+    defer indices.deinit();
+    for (nodes, 0..) |node, index| {
+        const result = try indices.getOrPut(node.id);
+        if (result.found_existing) return error.DuplicateGraphNodeID;
+        result.value_ptr.* = index;
     }
-    if (inbound) return .interior;
-    if (outbound) return .entry;
-    for (declared_entries) |id| if (std.mem.eql(u8, id, node_id)) return .entry;
-    return .unwired;
+    var declared = std.StringHashMap(void).init(allocator);
+    defer declared.deinit();
+    for (declared_entries) |id| try declared.put(id, {});
+
+    var handoff_count: usize = 0;
+    for (edges) |edge| {
+        const source = indices.get(edge.from) orelse continue;
+        const target = indices.get(edge.to) orelse continue;
+        touched[source] = true;
+        touched[target] = true;
+        if (!std.mem.eql(u8, edge.kind, "handoff")) continue;
+        has_handoff_incoming[target] = true;
+        next_handoff[handoff_count] = first_handoff[source];
+        handoff_targets[handoff_count] = target;
+        first_handoff[source] = handoff_count;
+        handoff_count += 1;
+    }
+
+    var queue_head: usize = 0;
+    var queue_tail: usize = 0;
+    for (nodes, 0..) |node, index| {
+        if (declared.contains(node.id)) {
+            roles[index] = .entry;
+            reached[index] = true;
+            queue[queue_tail] = index;
+            queue_tail += 1;
+        } else if (!touched[index]) {
+            roles[index] = .unwired;
+        } else if (!has_handoff_incoming[index]) {
+            roles[index] = .entry;
+            reached[index] = true;
+            queue[queue_tail] = index;
+            queue_tail += 1;
+        } else {
+            roles[index] = .cycle_only;
+        }
+    }
+    while (queue_head < queue_tail) : (queue_head += 1) {
+        var edge_index = first_handoff[queue[queue_head]];
+        while (edge_index != no_edge) : (edge_index = next_handoff[edge_index]) {
+            const target = handoff_targets[edge_index];
+            if (reached[target]) continue;
+            reached[target] = true;
+            roles[target] = .interior;
+            queue[queue_tail] = target;
+            queue_tail += 1;
+        }
+    }
+    return roles;
 }
 
 pub fn hitTest(nodes: []const GraphModel.Node, x: i32, y: i32, state: *const CanvasState, graph_bounds: c.RECT) ?usize {
@@ -2959,7 +3296,7 @@ test "pinch continuation with a mismatched context resets instead of zooming" {
 
 test "loop card stripe follows loop type rather than lifecycle state" {
     try std.testing.expect(loopTypeColor("goalBased") != stateColor("failed", false));
-    try std.testing.expectEqual(@as(u32, 0x00C77DFF), loopTypeColor("composite"));
+    try std.testing.expectEqual(@as(u32, 0x00E98590), loopTypeColor("composite"));
 }
 
 test "dense edge labels move away from already placed labels" {
@@ -3908,17 +4245,19 @@ fn verifyPaintContract(dib: ParityDib, fixture: *const PaintExportFixture, alloc
 fn verifyPaint764Inventory(fixture: *const Paint764Fixture, scene: Paint764Scene) !void {
     const model = &fixture.model;
     const graph = model.graph orelse return error.Paint764ActiveGraphMissing;
+    const roles = try resolveCardRoles(std.testing.allocator, graph.nodes.items, graph.edges.items, &.{});
+    defer std.testing.allocator.free(roles);
     try std.testing.expectEqual(@as(usize, 6), graph.nodes.items.len);
     try std.testing.expectEqual(@as(usize, 3), graph.edges.items.len);
     try std.testing.expectEqual(@as(?u64, 1_704_067_200), graph.nodes.items[0].created_at);
     try std.testing.expectEqualStrings("review", graph.nodes.items[1].worktree_branch);
     try std.testing.expectEqual(@as(usize, 0), model.activity.items.len);
-    try std.testing.expectEqual(NodeRole.entry, nodeRole(graph.edges.items, "fixture-main-idle", &.{}));
-    try std.testing.expectEqual(NodeRole.interior, nodeRole(graph.edges.items, "fixture-goal-done", &.{}));
-    try std.testing.expectEqual(NodeRole.interior, nodeRole(graph.edges.items, "fixture-timed-stopped", &.{}));
-    try std.testing.expectEqual(NodeRole.entry, nodeRole(graph.edges.items, "fixture-turn-running", &.{}));
-    try std.testing.expectEqual(NodeRole.interior, nodeRole(graph.edges.items, "fixture-composite-blocked", &.{}));
-    try std.testing.expectEqual(NodeRole.unwired, nodeRole(graph.edges.items, "fixture-turn-needs-you", &.{}));
+    try std.testing.expectEqual(NodeRole.entry, roles[0]);
+    try std.testing.expectEqual(NodeRole.interior, roles[1]);
+    try std.testing.expectEqual(NodeRole.interior, roles[2]);
+    try std.testing.expectEqual(NodeRole.entry, roles[3]);
+    try std.testing.expectEqual(NodeRole.interior, roles[4]);
+    try std.testing.expectEqual(NodeRole.unwired, roles[5]);
     try std.testing.expect(attentionActionVisible(
         graph.nodes.items[2],
         graph.nodes.items,
@@ -4062,8 +4401,20 @@ fn verifyPaint764CardPixels(
         const action = attentionActionBounds(bounds, &.{ .zoom = 1 });
         try std.testing.expect(dib.count(action, 0x000A9FFF) > 0);
     }
-    if (!attention and (role == .entry or role == .unwired)) {
-        try std.testing.expect(dib.count(rows.detail, if (role == .unwired) 0x007ACDFF else 0x009F9C9C) > 0);
+    if (!attention and role == .entry) {
+        const chip = cardRoleChip(role) orelse return error.Paint764EntryRoleChipMissing;
+        const role_presentation = try cardMetaPresentation(dib.dc, allocator, node, rows, 1, role);
+        defer allocator.free(role_presentation.text);
+        const chip_width = try cardRoleChipWidth(dib.dc, allocator, role, 1);
+        const chip_height = scaledValue(14, 1);
+        const chip_row = if (role_presentation.chip_in_detail) rows.detail else rows.meta;
+        const chip_top = @divTrunc(chip_row.top + chip_row.bottom - chip_height, 2);
+        const chip_left = if (role_presentation.chip_in_detail) chip_row.left else chip_row.right - chip_width;
+        const chip_bounds = rect(chip_left, chip_top, chip_left + chip_width, chip_top + chip_height);
+        try std.testing.expect(dib.count(chip_bounds, chip.fill) > 20);
+    }
+    if (!attention and role == .unwired) {
+        try std.testing.expect(dib.count(rows.detail, 0x007ACDFF) > 0);
     }
 }
 
@@ -4093,6 +4444,8 @@ fn verifyPaint764Contract(
     const state = CanvasState{ .zoom = 1, .pan_x = 0, .pan_y = 0 };
     if (scene == .project) {
         const graph = fixture.model.graph orelse return error.Paint764ActiveGraphMissing;
+        const roles = try resolveCardRoles(allocator, graph.nodes.items, graph.edges.items, &.{});
+        defer allocator.free(roles);
         for (graph.nodes.items, 0..) |node, index| {
             const bounds = nodeBounds(index, &state);
             try std.testing.expect(bounds.left >= viewport.left and bounds.top >= viewport.top);
@@ -4102,7 +4455,7 @@ fn verifyPaint764Contract(
                 allocator,
                 node,
                 bounds,
-                nodeRole(graph.edges.items, node.id, &.{}),
+                roles[index],
                 needsAttention(node, graph.nodes.items, graph.edges.items),
                 age_observed_at,
             );
@@ -4683,6 +5036,366 @@ test "paint scene 764 overview inventory" {
     try verifyPaint764Inventory(&fixture, .overview);
 }
 
+var paint764TestRendererInitAttempted = false;
+var paint764TestRendererReady = false;
+
+fn initPaint764TestRenderer() !void {
+    if (paint764TestRendererReady) return;
+    if (paint764TestRendererInitAttempted) return error.Paint764TestGdiplusNotReady;
+    const export_root = std.process.getEnvVarOwned(std.testing.allocator, "GRAPHCODE_PAINT_EXPORT_DIR") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return,
+        else => return err,
+    };
+    defer std.testing.allocator.free(export_root);
+    if (export_root.len == 0) return error.PaintExportDirectoryEmpty;
+    paint764TestRendererInitAttempted = true;
+    GdiplusAA.init();
+    const deadline = std.time.nanoTimestamp() + 2_000_000_000;
+    while (!GdiplusAA.isReady()) {
+        if (std.time.nanoTimestamp() >= deadline) return error.Paint764TestGdiplusNotReady;
+        std.Thread.sleep(1_000_000);
+    }
+    paint764TestRendererReady = true;
+}
+
+fn paint764TestSurface(
+    dib: ParityDib,
+    fixture: *const Paint764Fixture,
+    allocator: std.mem.Allocator,
+    scene: Paint764Scene,
+) !void {
+    const surface: Surface = if (scene == .project) .project else .overview;
+    try paintExportFixture(dib, &fixture.model, allocator, surface, paint764HeaderContext(scene));
+}
+
+fn paint764ExpectedAccent(loop_type: []const u8) ?u32 {
+    if (std.mem.eql(u8, loop_type, "sketch")) return 0x00E3DAD3;
+    if (std.mem.eql(u8, loop_type, "goalBased")) return 0x00709E19;
+    if (std.mem.eql(u8, loop_type, "timeBased")) return 0x000085C9;
+    if (std.mem.eql(u8, loop_type, "turnBased")) return 0x008151D5;
+    if (std.mem.eql(u8, loop_type, "composite")) return 0x00E98590;
+    return null;
+}
+
+test "loop card parity paint 764 accents match Mac COLORREFs on both surfaces" {
+    const allocator = std.testing.allocator;
+    var fixture = try paint764FixtureModel(allocator, .overview);
+    defer fixture.model.deinit();
+    try initPaint764TestRenderer();
+
+    var project = try ParityDib.init(1280, 720);
+    defer project.deinit();
+    var overview = try ParityDib.init(1280, 720);
+    defer overview.deinit();
+    try paint764TestSurface(project, &fixture, allocator, .project);
+    try paint764TestSurface(overview, &fixture, allocator, .overview);
+
+    const state = CanvasState{};
+    const viewport_bounds = renderBounds(1280, 720, .{
+        .rail_visible = true,
+        .panel_visible = false,
+        .activity_enabled = false,
+    });
+    const graph_bounds = rect(
+        viewport_bounds.left,
+        viewport_bounds.top,
+        viewport_bounds.right,
+        viewport_bounds.bottom,
+    );
+    const graph = fixture.model.graphs.items[0];
+    const roles = try resolveCardRoles(allocator, graph.nodes.items, graph.edges.items, &.{});
+    defer allocator.free(roles);
+    for (graph.nodes.items, 0..) |node, index| {
+        const expected = paint764ExpectedAccent(node.loop_type) orelse
+            return error.Paint764UnexpectedLoopType;
+        const expected_stripe = if (roles[index] == .unwired)
+            blendCardColor(expected, Tokens.loop_card_bottom, 35)
+        else
+            expected;
+        const bounds = nodeBounds(index, &state);
+        const stripe = rect(
+            bounds.left,
+            bounds.top,
+            bounds.left + scaledValue(Tokens.loop_card_stripe, state.zoom),
+            bounds.bottom,
+        );
+        const actual = c.GetPixel(project.dc, stripe.left + 1, stripe.top + 8);
+        if (actual != expected_stripe) {
+            std.debug.print(
+                "paint764 accent RED surface=project node={s} type={s} expected=0x{x} actual=0x{x}\n",
+                .{ node.id, node.loop_type, expected_stripe, actual },
+            );
+            return error.Paint764CardStripeAccentMismatch;
+        }
+
+        const overview_bounds = overviewCardBounds(&fixture.model, 0, index, graph_bounds, &state);
+        const overview_stripe = rect(
+            overview_bounds.left,
+            overview_bounds.top,
+            overview_bounds.left + scaledValue(Tokens.loop_card_stripe, state.zoom),
+            overview_bounds.bottom,
+        );
+        const overview_actual = c.GetPixel(overview.dc, overview_stripe.left + 1, overview_stripe.top + 8);
+        if (overview_actual != expected_stripe) {
+            std.debug.print(
+                "paint764 accent RED surface=overview node={s} type={s} expected=0x{x} actual=0x{x}\n",
+                .{ node.id, node.loop_type, expected_stripe, overview_actual },
+            );
+            return error.Paint764OverviewStripeAccentMismatch;
+        }
+
+        const presentation = cardState(node);
+        const pill_width = blk: {
+            const old = try selectCardFont(project.dc, 10, .card_state);
+            defer _ = c.SelectObject(project.dc, old);
+            break :blk try measuredText(project.dc, allocator, presentation.word) + 22;
+        };
+        const project_rows = cardTextLayout(bounds, 1, pill_width);
+        const overview_rows = cardTextLayout(overview_bounds, 1, pill_width);
+        const project_square_top = @divTrunc(
+            project_rows.meta.top + project_rows.meta.bottom - scaledValue(6, state.zoom),
+            2,
+        );
+        const overview_square_top = @divTrunc(
+            overview_rows.meta.top + overview_rows.meta.bottom - scaledValue(6, state.zoom),
+            2,
+        );
+        try std.testing.expectEqual(
+            expected,
+            c.GetPixel(project.dc, project_rows.meta.left + 3, project_square_top + 3),
+        );
+        try std.testing.expectEqual(
+            expected,
+            c.GetPixel(overview.dc, overview_rows.meta.left + 3, overview_square_top + 3),
+        );
+    }
+}
+
+test "loop card parity paint 764 no-chip metadata paints its final glyph inside the measured width" {
+    const allocator = std.testing.allocator;
+    try initPaint764TestRenderer();
+
+    var actual = try ParityDib.init(640, 120);
+    defer actual.deinit();
+    var expected = try ParityDib.init(640, 120);
+    defer expected.deinit();
+    var clipped = try ParityDib.init(640, 120);
+    defer clipped.deinit();
+    fill(actual.dc, rect(0, 0, 640, 120), 0);
+    fill(expected.dc, rect(0, 0, 640, 120), 0);
+    fill(clipped.dc, rect(0, 0, 640, 120), 0);
+
+    var node = parityTestNode();
+    node.backend = @constCast("backendWWWWWWWW");
+    node.created_at = null;
+    const bounds = rect(20, 10, 600, 100);
+    var layout = cardTextLayout(bounds, 1, 0);
+    const initial = try cardMetaPresentation(actual.dc, allocator, node, layout, 1, .interior);
+    defer allocator.free(initial.text);
+    const old_font = try selectCardFont(actual.dc, 10.5, .card_mono);
+    defer _ = c.SelectObject(actual.dc, old_font);
+    const measured_width = try measuredText(actual.dc, allocator, initial.text);
+    layout.meta.right = layout.meta.left + scaledValue(11, 1) + measured_width;
+
+    const metadata = try cardMetaPresentation(expected.dc, allocator, node, layout, 1, .interior);
+    defer allocator.free(metadata.text);
+    try std.testing.expectEqualStrings(initial.text, metadata.text);
+    try std.testing.expect(std.mem.endsWith(u8, metadata.text, "WWWWWWWW"));
+    const expected_text_bounds = rect(
+        layout.meta.left + scaledValue(11, 1),
+        layout.meta.top,
+        layout.meta.right,
+        layout.meta.bottom,
+    );
+    try std.testing.expectEqual(measured_width, expected_text_bounds.right - expected_text_bounds.left);
+
+    const text_color = blendCardColor(0x00FFFFFF, Tokens.loop_card_bottom, 52);
+    try drawCardText(
+        expected.dc,
+        allocator,
+        metadata.text,
+        expected_text_bounds,
+        10.5,
+        .card_mono,
+        text_color,
+        false,
+    );
+    const clipped_text_bounds = rect(
+        expected_text_bounds.left,
+        expected_text_bounds.top,
+        expected_text_bounds.right - scaledValue(5, 1),
+        expected_text_bounds.bottom,
+    );
+    try drawCardText(
+        clipped.dc,
+        allocator,
+        metadata.text,
+        clipped_text_bounds,
+        10.5,
+        .card_mono,
+        text_color,
+        false,
+    );
+    try std.testing.expect(!try drawCardMetaRow(actual.dc, allocator, node, layout, 1, .interior));
+
+    var clipped_final_ink = false;
+    var y = expected_text_bounds.top;
+    while (y < expected_text_bounds.bottom) : (y += 1) {
+        var x = expected_text_bounds.left;
+        while (x < expected_text_bounds.right) : (x += 1) {
+            const full_pixel = c.GetPixel(expected.dc, x, y);
+            const shortened_pixel = c.GetPixel(clipped.dc, x, y);
+            if (x >= expected_text_bounds.right - scaledValue(5, 1) and
+                full_pixel != 0 and shortened_pixel == 0)
+            {
+                clipped_final_ink = true;
+            }
+            if (c.GetPixel(actual.dc, x, y) != full_pixel) return error.Paint764NoChipMetadataFinalGlyphClipped;
+        }
+    }
+    if (!clipped_final_ink) return error.Paint764FinalGlyphFixtureDidNotReachMeasuredEdge;
+}
+
+test "loop card parity paint 764 overview preserves entry role content" {
+    const allocator = std.testing.allocator;
+    var fixture = try paint764FixtureModel(allocator, .overview);
+    defer fixture.model.deinit();
+    try initPaint764TestRenderer();
+
+    var project = try ParityDib.init(1280, 720);
+    defer project.deinit();
+    var overview = try ParityDib.init(1280, 720);
+    defer overview.deinit();
+    try paint764TestSurface(project, &fixture, allocator, .project);
+    try paint764TestSurface(overview, &fixture, allocator, .overview);
+
+    const graph = fixture.model.graphs.items[0];
+    const node = graph.nodes.items[0];
+    const roles = try resolveCardRoles(allocator, graph.nodes.items, graph.edges.items, &.{});
+    defer allocator.free(roles);
+    try std.testing.expectEqual(NodeRole.entry, roles[0]);
+    const state = CanvasState{};
+    const viewport_bounds = renderBounds(1280, 720, .{
+        .rail_visible = true,
+        .panel_visible = false,
+        .activity_enabled = false,
+    });
+    const graph_bounds = rect(
+        viewport_bounds.left,
+        viewport_bounds.top,
+        viewport_bounds.right,
+        viewport_bounds.bottom,
+    );
+    const project_bounds = nodeBounds(0, &state);
+    const overview_bounds = overviewCardBounds(&fixture.model, 0, 0, graph_bounds, &state);
+    const presentation = cardState(node);
+    const pill_width = blk: {
+        const old = try selectCardFont(project.dc, 10, .card_state);
+        defer _ = c.SelectObject(project.dc, old);
+        break :blk try measuredText(project.dc, allocator, presentation.word) + 22;
+    };
+    const project_layout = cardTextLayout(project_bounds, 1, pill_width);
+    const overview_layout = cardTextLayout(overview_bounds, 1, pill_width);
+    const project_detail = project_layout.detail;
+    const overview_detail = overview_layout.detail;
+    const project_role = try cardMetaPresentation(project.dc, allocator, node, project_layout, 1, .entry);
+    defer allocator.free(project_role.text);
+    const overview_role = try cardMetaPresentation(overview.dc, allocator, node, overview_layout, 1, .entry);
+    defer allocator.free(overview_role.text);
+    const project_chip_width = try cardRoleChipWidth(project.dc, allocator, .entry, 1);
+    const overview_chip_width = try cardRoleChipWidth(overview.dc, allocator, .entry, 1);
+    const chip_height = scaledValue(14, 1);
+    const project_chip_row = if (project_role.chip_in_detail) project_detail else project_layout.meta;
+    const overview_chip_row = if (overview_role.chip_in_detail) overview_detail else overview_layout.meta;
+    const project_chip_top = @divTrunc(project_chip_row.top + project_chip_row.bottom - chip_height, 2);
+    const overview_chip_top = @divTrunc(overview_chip_row.top + overview_chip_row.bottom - chip_height, 2);
+    const entry_fill = cardRoleChip(.entry).?.fill;
+    const project_chip_left = if (project_role.chip_in_detail) project_chip_row.left else project_chip_row.right - project_chip_width;
+    const overview_chip_left = if (overview_role.chip_in_detail) overview_chip_row.left else overview_chip_row.right - overview_chip_width;
+    try std.testing.expect(project.count(rect(project_chip_left, project_chip_top, project_chip_left + project_chip_width, project_chip_top + chip_height), entry_fill) > 20);
+    try std.testing.expect(overview.count(rect(overview_chip_left, overview_chip_top, overview_chip_left + overview_chip_width, overview_chip_top + chip_height), entry_fill) > 20);
+    const detail_width = project_detail.right - project_detail.left;
+    const detail_height = project_detail.bottom - project_detail.top;
+    if (detail_width != overview_detail.right - overview_detail.left or
+        detail_height != overview_detail.bottom - overview_detail.top)
+    {
+        return error.Paint764RoleDetailGeometryMismatch;
+    }
+
+    var y: i32 = 0;
+    while (y < detail_height) : (y += 1) {
+        var x: i32 = 0;
+        while (x < detail_width) : (x += 1) {
+            const project_pixel = c.GetPixel(project.dc, project_detail.left + x, project_detail.top + y);
+            const overview_pixel = c.GetPixel(overview.dc, overview_detail.left + x, overview_detail.top + y);
+            if (project_pixel != overview_pixel) {
+                std.debug.print(
+                    "paint764 role RED node={s} role=entry detail-offset=({d},{d}) project=0x{x} overview=0x{x}\n",
+                    .{ node.id, x, y, project_pixel, overview_pixel },
+                );
+                return error.Paint764OverviewEntryRoleContentMismatch;
+            }
+        }
+    }
+}
+
+test "loop card parity paint 764 overview paints primary action within owning card" {
+    const allocator = std.testing.allocator;
+    var fixture = try paint764FixtureModel(allocator, .overview);
+    defer fixture.model.deinit();
+    try initPaint764TestRenderer();
+
+    var overview = try ParityDib.init(1280, 720);
+    defer overview.deinit();
+    try paint764TestSurface(overview, &fixture, allocator, .overview);
+
+    const graph = fixture.model.graphs.items[0];
+    const node_index = paint764NodeIndex(graph.nodes.items, "fixture-turn-needs-you") orelse
+        return error.Paint764AttentionNodeMissing;
+    const node = graph.nodes.items[node_index];
+    try std.testing.expect(needsAttention(node, graph.nodes.items, graph.edges.items));
+    const state = CanvasState{};
+    const viewport_bounds = renderBounds(1280, 720, .{
+        .rail_visible = true,
+        .panel_visible = false,
+        .activity_enabled = false,
+    });
+    const graph_bounds = rect(
+        viewport_bounds.left,
+        viewport_bounds.top,
+        viewport_bounds.right,
+        viewport_bounds.bottom,
+    );
+    const card = overviewCardBounds(&fixture.model, 0, node_index, graph_bounds, &state);
+    const action = attentionActionBounds(card, &state);
+    const action_pixels = overview.count(action, 0x000A9FFF);
+    if (action_pixels == 0) {
+        std.debug.print(
+            "paint764 overview action RED node={s} expected={s} pixels-inside-action={d}\n",
+            .{ node.id, attentionActionLabel(node), action_pixels },
+        );
+        return error.Paint764OverviewPrimaryActionMissing;
+    }
+    var label_pixels: usize = 0;
+    var y = action.top;
+    while (y < action.bottom) : (y += 1) {
+        var x = action.left;
+        while (x < action.right) : (x += 1) {
+            if (c.GetPixel(overview.dc, x, y) != 0x000A9FFF) label_pixels += 1;
+        }
+    }
+    if (label_pixels == 0) return error.Paint764OverviewPrimaryActionLabelMissing;
+    const hit = hitTestOverview(
+        &fixture.model,
+        action.left + @divTrunc(action.right - action.left, 2),
+        action.top + @divTrunc(action.bottom - action.top, 2),
+        &state,
+        graph_bounds,
+    ) orelse return error.Paint764OverviewActionHitMissing;
+    try std.testing.expectEqual(@as(usize, 0), hit.graph_index);
+    try std.testing.expectEqual(node_index, hit.node_index);
+}
+
 test "loop card parity both production renderers paint named pill and mono meta regions" {
     const allocator = std.testing.allocator;
     const dib = try ParityDib.init(2200, 500);
@@ -4696,7 +5409,7 @@ test "loop card parity both production renderers paint named pill and mono meta 
     const state = CanvasState{ .pan_x = 1200 };
     const viewport = rect(220, 34, 2200, 500);
     fill(dib.dc, rect(0, 0, 2200, 500), 0);
-    drawNode(dib.dc, allocator, node, 0, null, &.{node}, &.{}, null, &.{}, &.{}, &state);
+    drawNode(dib.dc, allocator, node, 0, null, &.{node}, &.{}, .unwired, null, &.{}, &state);
     const project = nodeBounds(0, &state);
     const presentation = cardState(node);
     const old = try selectCardFont(dib.dc, 10, .card_state);
@@ -4712,7 +5425,7 @@ test "loop card parity both production renderers paint named pill and mono meta 
     try std.testing.expect(dib.count(project_rows.meta, 0x00979595) > 0);
     const project_pill_pixels = dib.count(project_rows.pill, presentation.fill);
     fill(dib.dc, rect(0, 0, 2200, 500), 0);
-    drawOverview(dib.dc, allocator, &model, viewport, &state);
+    try drawOverview(dib.dc, allocator, &model, viewport, &state, &.{});
     const overview = overviewCardBounds(&model, 0, 0, viewport, &state);
     const overview_rows = cardTextLayout(overview, 1, pill_width);
     try std.testing.expect(c.GdiFlush() != 0);
@@ -4747,7 +5460,7 @@ test "loop card parity production long text and hollow pills paint across zoom a
             const bounds = nodeBounds(0, &state);
             fill(dib.dc, rect(0, 0, 1000, 450), 0);
             roundedCard(dib.dc, bounds, Tokens.loop_card_bottom, false);
-            try drawCardBody(dib.dc, allocator, node, bounds, zoom, .interior, false, false);
+            try drawCardBody(dib.dc, allocator, node, bounds, zoom, .interior, false, null, false);
             const old = try selectCardFont(dib.dc, 10 * zoom, .card_state);
             const pill_width = try measuredText(dib.dc, allocator, "STOPPED") + scaledValue(22, zoom);
             _ = c.SelectObject(dib.dc, old);
@@ -4772,7 +5485,7 @@ test "loop card parity compact composite metadata never blanks title or state" {
     node.created_at = @intCast(@max(0, std.time.timestamp() - 3900));
     const bounds = rect(20, 20, 270, 116);
     fill(dib.dc, rect(0, 0, 600, 240), 0);
-    try drawCardBody(dib.dc, allocator, node, bounds, 1, .interior, false, false);
+    try drawCardBody(dib.dc, allocator, node, bounds, 1, .interior, false, null, false);
     try std.testing.expect(c.GdiFlush() != 0);
     try std.testing.expect(dib.count(rect(31, 28, 170, 46), 0x00F4F4F4) > 0);
     try std.testing.expect(dib.count(rect(170, 28, 259, 46), cardState(node).fill) > 0);
@@ -4795,7 +5508,7 @@ test "loop card parity compact composite metadata never blanks title or state" {
     try std.testing.expectError(error.CardMetadataTooWide, cardMetaForWidth(dib.dc, allocator, node, node.created_at.? + 3900, fixed_width - 1));
     node.backend = @constCast("a backend identifier too wide to fit without lying");
     fill(dib.dc, rect(0, 0, 600, 240), 0);
-    try drawCardBody(dib.dc, allocator, node, bounds, 1, .interior, false, false);
+    try drawCardBody(dib.dc, allocator, node, bounds, 1, .interior, false, null, false);
     try std.testing.expect(c.GdiFlush() != 0);
     try std.testing.expect(dib.count(rect(31, 28, 170, 46), 0x00F4F4F4) > 0);
     try std.testing.expect(dib.count(rect(31, 52, 259, 65), 0x009F9C9C) > 0);
@@ -4840,7 +5553,7 @@ test "loop card parity existing action fills use hit bounds and never paint over
     for ([_]f32{ 0.55, 0.75, 1, 1.25, 1.8 }) |zoom| {
         const state = CanvasState{ .zoom = zoom };
         fill(dib.dc, rect(0, 0, 1200, 500), 0);
-        for (nodes, 0..) |node, index| drawNode(dib.dc, allocator, node, index, null, &nodes, &.{}, &inspection, &.{}, &.{}, &state);
+        for (nodes, 0..) |node, index| drawNode(dib.dc, allocator, node, index, null, &nodes, &.{}, .unwired, &inspection, &.{}, &state);
         const attention = attentionActionBounds(nodeBounds(0, &state), &state);
         const offer = reclaimOfferBounds(nodeBounds(1, &state));
         try std.testing.expect(c.GdiFlush() != 0);
@@ -5139,22 +5852,114 @@ test "attention cards expose reason-specific primary actions" {
         .activity = @constCast(""),
         .presence = @constCast("idle"),
     };
+    const blocked = graphRoleTestNode("blocked");
+    const upstream = graphRoleTestNode("upstream");
+    var running_upstream = upstream;
+    running_upstream.state = @constCast("running");
+    running_upstream.activity = @constCast("Building");
+    var waiting = blocked;
+    waiting.state = @constCast("blocked");
+    const nodes = [_]GraphModel.Node{ running_upstream, waiting };
+    const edges = [_]GraphModel.Edge{graphRoleTestEdge("upstream", "blocked", "handoff")};
     try std.testing.expectEqual(AttentionAction.reply, attentionActionForNode(awaiting));
     try std.testing.expectEqualStrings("Reply", attentionActionLabel(awaiting));
-    try std.testing.expectEqual(AttentionAction.inspect, attentionActionForNode(failed));
-    try std.testing.expectEqualStrings("Inspect", attentionActionLabel(failed));
+    try std.testing.expect(!needsAttention(waiting, &nodes, &edges));
+    try std.testing.expect(attentionActionVisible(waiting, &nodes, &edges));
+    try std.testing.expectEqual(AttentionAction.inspect, attentionActionForNode(waiting));
+    try std.testing.expectEqualStrings("Inspect", attentionActionLabel(waiting));
+    try std.testing.expect(needsAttention(failed, &.{failed}, &.{}));
+    try std.testing.expectEqual(AttentionAction.none, attentionActionForNode(failed));
+    try std.testing.expectEqualStrings("", attentionActionLabel(failed));
+    try std.testing.expect(!attentionActionVisible(failed, &.{failed}, &.{}));
 }
 
-test "unwired roles require explicit session entry acknowledgement" {
-    const no_edges = [_]GraphModel.Edge{};
-    try std.testing.expectEqual(NodeRole.unwired, nodeRole(&no_edges, "loose", &.{}));
-    try std.testing.expectEqual(NodeRole.entry, nodeRole(&no_edges, "loose", &.{"loose"}));
-    const edge = [_]GraphModel.Edge{.{
-        .from = @constCast("source"),
-        .to = @constCast("target"),
-    }};
-    try std.testing.expectEqual(NodeRole.entry, nodeRole(&edge, "source", &.{}));
-    try std.testing.expectEqual(NodeRole.interior, nodeRole(&edge, "target", &.{}));
+test "card roles use all-edge touchedness and handoff-only entry reachability" {
+    const allocator = std.testing.allocator;
+    const nodes = [_]GraphModel.Node{
+        graphRoleTestNode("root"),
+        graphRoleTestNode("child"),
+        graphRoleTestNode("message-source"),
+        graphRoleTestNode("message-target"),
+        graphRoleTestNode("spawn-source"),
+        graphRoleTestNode("spawn-target"),
+        graphRoleTestNode("closed-a"),
+        graphRoleTestNode("closed-b"),
+        graphRoleTestNode("cycle-tail"),
+        graphRoleTestNode("self-loop"),
+        graphRoleTestNode("declared"),
+        graphRoleTestNode("declared-target"),
+        graphRoleTestNode("open-a"),
+        graphRoleTestNode("open-b"),
+        graphRoleTestNode("loose"),
+    };
+    var edges = [_]GraphModel.Edge{
+        graphRoleTestEdge("root", "child", "handoff"),
+        graphRoleTestEdge("message-source", "message-target", "message"),
+        graphRoleTestEdge("spawn-source", "spawn-target", "spawn"),
+        graphRoleTestEdge("root", "closed-a", "message"),
+        graphRoleTestEdge("closed-a", "closed-b", "handoff"),
+        graphRoleTestEdge("closed-b", "closed-a", "handoff"),
+        graphRoleTestEdge("closed-b", "cycle-tail", "handoff"),
+        graphRoleTestEdge("self-loop", "self-loop", "handoff"),
+        graphRoleTestEdge("root", "declared", "handoff"),
+        graphRoleTestEdge("declared", "declared-target", "handoff"),
+        graphRoleTestEdge("root", "open-a", "handoff"),
+        graphRoleTestEdge("open-a", "open-b", "handoff"),
+        graphRoleTestEdge("open-b", "open-a", "handoff"),
+    };
+    const declared_entries = [_][]const u8{"declared"};
+    const roles = try resolveCardRoles(allocator, &nodes, &edges, &declared_entries);
+    defer allocator.free(roles);
+    try std.testing.expectEqual(NodeRole.entry, roles[0]);
+    try std.testing.expectEqual(NodeRole.interior, roles[1]);
+    try std.testing.expectEqual(NodeRole.entry, roles[2]);
+    try std.testing.expectEqual(NodeRole.entry, roles[3]);
+    try std.testing.expectEqual(NodeRole.entry, roles[4]);
+    try std.testing.expectEqual(NodeRole.entry, roles[5]);
+    try std.testing.expectEqual(NodeRole.cycle_only, roles[6]);
+    try std.testing.expectEqual(NodeRole.cycle_only, roles[7]);
+    try std.testing.expectEqual(NodeRole.cycle_only, roles[8]);
+    try std.testing.expectEqual(NodeRole.cycle_only, roles[9]);
+    try std.testing.expectEqual(NodeRole.entry, roles[10]);
+    try std.testing.expectEqual(NodeRole.interior, roles[11]);
+    try std.testing.expectEqual(NodeRole.interior, roles[12]);
+    try std.testing.expectEqual(NodeRole.interior, roles[13]);
+    try std.testing.expectEqual(NodeRole.unwired, roles[14]);
+
+    edges[0].fired = true;
+    const refired_roles = try resolveCardRoles(allocator, &nodes, &edges, &declared_entries);
+    defer allocator.free(refired_roles);
+    try std.testing.expectEqual(NodeRole.entry, refired_roles[0]);
+    try std.testing.expectEqual(NodeRole.interior, refired_roles[1]);
+    const dib = try ParityDib.init(480, 180);
+    defer dib.deinit();
+    const node = graphRoleTestNode("cycle-chip");
+    const bounds = rect(20, 20, 270, 116);
+    fill(dib.dc, rect(0, 0, 480, 180), 0);
+    try drawCardBody(dib.dc, allocator, node, bounds, 1, .cycle_only, false, null, false);
+    try std.testing.expect(c.GdiFlush() != 0);
+
+    const presentation = cardState(node);
+    const old_font = try selectCardFont(dib.dc, 10, .card_state);
+    defer _ = c.SelectObject(dib.dc, old_font);
+    const pill_width = try measuredText(dib.dc, allocator, presentation.word) + 22;
+    const meta = cardTextLayout(bounds, 1, pill_width).meta;
+    const chip_width = try cardRoleChipWidth(dib.dc, allocator, .cycle_only, 1);
+    const chip_height = scaledValue(14, 1);
+    const chip_top = @divTrunc(meta.top + meta.bottom - chip_height, 2);
+    const chip_bounds = rect(meta.right - chip_width, chip_top, meta.right, chip_top + chip_height);
+    const chip = cardRoleChip(.cycle_only).?;
+    try std.testing.expect(dib.count(chip_bounds, chip.fill) > 20);
+    const text_bounds = rect(chip_bounds.left + scaledValue(chip.padding, 1), chip_bounds.top, chip_bounds.right - scaledValue(chip.padding, 1), chip_bounds.bottom);
+    var label_pixels: usize = 0;
+    var y = text_bounds.top;
+    while (y < text_bounds.bottom) : (y += 1) {
+        var x = text_bounds.left;
+        while (x < text_bounds.right) : (x += 1) {
+            if (c.GetPixel(dib.dc, x, y) != chip.fill) label_pixels += 1;
+        }
+    }
+    try std.testing.expect(label_pixels > 0);
 }
 
 test "safe resolved worktrees expose distinct reclaim and keep targets" {
