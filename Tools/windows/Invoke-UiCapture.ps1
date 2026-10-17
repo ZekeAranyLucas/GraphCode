@@ -971,7 +971,9 @@ try {
                 $exemptWorkerPid = $null
                 if ($membersBeforeStop -contains $workerRun.Identity.Pid) {
                     try {
-                        $workerSnapshot = [CapNative]::Snapshot($workerRun.Identity.Process.Handle, $workerRun.Identity.Pid)
+                        $access = Read-CapProcessAccess -Process $workerRun.Identity.Process -Role $workerRun.Identity.Role `
+                            -CallSite 'Supervisor.UmbrellaWorkerSnapshot' -ExpectedPid $workerRun.Identity.Pid
+                        $workerSnapshot = [CapNative]::Snapshot($access.Handle, $access.Pid)
                         if (-not $workerSnapshot.IsExited -and
                             $workerSnapshot.CreationFileTimeUtc -eq $workerRun.Identity.CreationFileTimeUtc -and
                             $workerSnapshot.ImagePath -ieq $workerRun.Identity.ExpectedImagePath) {

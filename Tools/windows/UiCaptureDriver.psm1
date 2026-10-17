@@ -389,22 +389,25 @@ try {
     foreach ($property in $spec.environment.PSObject.Properties) { $info.Environment[$property.Name] = [string]$property.Value }
     $process = [Diagnostics.Process]::Start($info)
     if ($null -eq $process) { throw 'Contained normal Process.Start returned null.' }
-    $snapshot = [CapNative]::Snapshot($process.Handle, $process.Id)
+    $access = Read-CapProcessAccess -Process $process -Role 'contained-target' -CallSite 'JobLauncher.InitialSnapshot'
+    $snapshot = [CapNative]::Snapshot($access.Handle, $access.Pid)
     if (-not $snapshot.IsExited -and $snapshot.ImagePath -ine $spec.filePath) { throw 'Contained target image differs.' }
     $outPump = $process.StandardOutput.BaseStream.CopyToAsync($stdout)
     $errPump = $process.StandardError.BaseStream.CopyToAsync($stderr)
     $process.StandardInput.Close()
     $null = Write-CapImmutableJson -Root $spec.root -Path $spec.targetReceiptPath -Value ([pscustomobject]@{
-        jobId = $spec.jobId; specSha256 = $specHash; pid = [long]$process.Id
+        jobId = $spec.jobId; specSha256 = $specHash; pid = [long]$access.Pid
         creationFileTimeUtc = [long]$snapshot.CreationFileTimeUtc
         expectedImagePath = $spec.filePath; arguments = @($spec.arguments)
         attestation = 'NORMAL_START_RETAINED_HANDLE_NOT_PREEXECUTION_IDENTITY'
     })
     while (-not $process.WaitForExit(100)) {}
-    $exit = [CapNative]::Snapshot($process.Handle, $process.Id)
+    $access = Read-CapProcessAccess -Process $process -Role 'contained-target' `
+        -CallSite 'JobLauncher.ExitSnapshot' -ExpectedPid $snapshot.ProcessId
+    $exit = [CapNative]::Snapshot($access.Handle, $access.Pid)
     if (-not $exit.IsExited) { throw 'Contained target exit lacks a signalled original handle.' }
     $null = Write-CapImmutableJson -Root $spec.root -Path $spec.exitReceiptPath -Value ([pscustomobject]@{
-        jobId = $spec.jobId; specSha256 = $specHash; pid = [long]$process.Id
+        jobId = $spec.jobId; specSha256 = $specHash; pid = [long]$access.Pid
         creationFileTimeUtc = [long]$snapshot.CreationFileTimeUtc; exitCode = [long]$process.ExitCode; kernelExited = $true
     })
     # The job owner may terminate this host while daemon descendants still hold
@@ -611,10 +614,12 @@ function Get-CapJobMembers {
         }
         $retained = $false
         try {
-            if (-not [CapProcessJob]::Contains($Run.Job, $process.Handle)) {
+            $access = Read-CapProcessAccess -Process $process -Role 'job-member' `
+                -CallSite 'Get-CapJobMembers.Snapshot' -ExpectedPid $memberPid
+            if (-not [CapProcessJob]::Contains($Run.Job, $access.Handle)) {
                 throw 'Census PID does not identify a held job-member generation.'
             }
-            $snapshot = [CapNative]::Snapshot($process.Handle, $memberPid)
+            $snapshot = [CapNative]::Snapshot($access.Handle, $access.Pid)
             if ($snapshot.IsExited) { continue }
             $existing = @($Run.Members | Where-Object { $_.Pid -eq $memberPid -and
                 $_.CreationFileTimeUtc -eq $snapshot.CreationFileTimeUtc })
@@ -1595,6 +1600,66 @@ function ConvertTo-CapImagePath {
     return [IO.Path]::GetFullPath($value)
 }
 
+function Read-CapProcessAccess {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][Diagnostics.Process]$Process,
+        [Parameter(Mandatory)][string]$Role,
+        [Parameter(Mandatory)][string]$CallSite,
+        [Nullable[int]]$ExpectedPid = $null
+    )
+    $handle = $null
+    $processId = $null
+    $handleState = $null
+    $idState = $null
+    $failures = [Collections.Generic.List[Exception]]::new()
+    # Explicit accessors preserve failures that PowerShell's adapted properties
+    # otherwise turn into null before the native method binder sees them.
+    try { $handle = $Process.get_Handle() }
+    catch [Management.Automation.MethodInvocationException], [InvalidOperationException], [ComponentModel.Win32Exception] {
+        $handleState = 'GetterException'
+        $failures.Add($_.Exception)
+    }
+    try { $processId = $Process.get_Id() }
+    catch [Management.Automation.MethodInvocationException], [InvalidOperationException], [ComponentModel.Win32Exception] {
+        $idState = 'GetterException'
+        $failures.Add($_.Exception)
+    }
+    if ($null -eq $handleState) {
+        $handleState = if ($null -eq $handle) { 'Null' }
+            elseif ($handle -isnot [IntPtr] -or $handle -eq [IntPtr]::Zero -or $handle -eq [IntPtr]::new(-1)) { 'Invalid' }
+            else { 'Available' }
+    }
+    if ($null -eq $idState) {
+        $idState = if ($null -eq $processId) { 'Null' }
+            elseif ($processId -isnot [int] -or $processId -le 0) { 'Invalid' }
+            else { 'Available' }
+    }
+    if ($handleState -cne 'Available' -or $idState -cne 'Available') {
+        $inner = if ($failures.Count -eq 1) { $failures[0] }
+            elseif ($failures.Count -gt 1) { [AggregateException]::new('Process accessor failures.', $failures.ToArray()) }
+            else { $null }
+        $failure = [InvalidOperationException]::new(
+            "ProcessIdentityUnavailable: $Role at $CallSite; Handle=$handleState; Id=$idState; kernel exit and EOF are UNPROVEN.", $inner)
+        $failure.Data['CapCaptureCode'] = 'ProcessIdentityUnavailable'
+        $failure.Data['Role'] = $Role
+        $failure.Data['CallSite'] = $CallSite
+        $failure.Data['HandleState'] = $handleState
+        $failure.Data['IdState'] = $idState
+        $failure.Data['AcquiredPid'] = if ($idState -ceq 'Available') { $processId } else { $null }
+        $failure.Data['ExpectedPid'] = $ExpectedPid
+        throw $failure
+    }
+    if ($null -ne $ExpectedPid -and $processId -ne $ExpectedPid) {
+        $failure = [InvalidOperationException]::new("Tracked PID changed for $Role at $CallSite; acquired=$processId expected=$ExpectedPid.")
+        $failure.Data['CapCaptureCode'] = 'ProcessIdentityMismatch'
+        $failure.Data['AcquiredPid'] = $processId
+        $failure.Data['ExpectedPid'] = $ExpectedPid
+        throw $failure
+    }
+    return [pscustomobject]@{ Handle = $handle; Pid = $processId }
+}
+
 function Get-CapProcessIdentity {
     [CmdletBinding()]
     param(
@@ -1607,8 +1672,9 @@ function Get-CapProcessIdentity {
     Write-CapTrace -Command $MyInvocation.MyCommand.Name -Parameters $PSBoundParameters
 
 
-    $snapshot = [CapNative]::Snapshot($Process.Handle, $Process.Id)
-    if ($snapshot.ProcessId -ne $Process.Id) { throw "Kernel PID changed while tracking $Role." }
+    $access = Read-CapProcessAccess -Process $Process -Role $Role -CallSite 'Get-CapProcessIdentity.InitialSnapshot'
+    $snapshot = [CapNative]::Snapshot($access.Handle, $access.Pid)
+    if ($snapshot.ProcessId -ne $access.Pid) { throw "Kernel PID changed while tracking $Role." }
     $expected = ConvertTo-CapImagePath -Path $ExpectedImagePath
     if (-not $snapshot.IsExited -and (ConvertTo-CapImagePath -Path $snapshot.ImagePath) -ine $expected) {
         throw "Live $Role executable mismatch: $($snapshot.ImagePath) != $expected."
@@ -1621,12 +1687,14 @@ function Get-CapProcessIdentity {
     $concludedGoneByKernelExit = [bool]$snapshot.IsExited
     if (-not $snapshot.IsExited) {
         for ($attempt = 0; $attempt -lt 20; $attempt++) {
-            $state = Read-CapProcessMetadataState -Pid $Process.Id
+            $state = Read-CapProcessMetadataState -Pid $access.Pid
             # The retained kernel handle governs an Absent/Incomplete reading. EOF is
             # proven later by the launch caller, so the loop passes BothStreamsEofReached
             # = $false and treats either exited disposition as "break and defer the EOF
             # gate to the caller".
-            $snapshot = [CapNative]::Snapshot($Process.Handle, $Process.Id)
+            $access = Read-CapProcessAccess -Process $Process -Role $Role `
+                -CallSite 'Get-CapProcessIdentity.MetadataSnapshot' -ExpectedPid $snapshot.ProcessId
+            $snapshot = [CapNative]::Snapshot($access.Handle, $access.Pid)
             $disposition = Resolve-CapAttestationDisposition -State $state.State `
                 -KernelExited ([bool]$snapshot.IsExited) -BothStreamsEofReached $false
             $terminalState = if ($snapshot.IsExited) { "KernelExitedWith$($state.State)" } else { $state.State }
@@ -1637,14 +1705,14 @@ function Get-CapProcessIdentity {
             if ($disposition -eq 'RefuseLiveIncomplete') {
                 # A torn-down row on a still-live owned child is refused outright,
                 # exactly as main did; it is never retried into a passing outcome.
-                throw "Live $Role PID $($Process.Id) has incomplete current CIM metadata; refusing ownership inference."
+                throw "Live $Role PID $($access.Pid) has incomplete current CIM metadata; refusing ownership inference."
             }
             # RetryAbsent: not yet listed on a live child -> bounded startup re-poll.
             Start-Sleep -Milliseconds 50
         }
         if ($null -eq $metadata -and -not $concludedGoneByKernelExit -and -not $snapshot.IsExited -and
             ($ExpectedParentPid -lt 0 -or $ExpectedSessionId -lt 0)) {
-            throw "Live $Role PID $($Process.Id) has no current CIM metadata."
+            throw "Live $Role PID $($access.Pid) has no current CIM metadata."
         }
     }
     $expectedMetadataMatches = if ($metadata) {
@@ -1819,8 +1887,9 @@ function Assert-CapProcessIdentity {
     Write-CapTrace -Command $MyInvocation.MyCommand.Name -Parameters $PSBoundParameters
 
 
-    if ($Identity.Pid -ne $Identity.Process.Id) { throw "Tracked PID changed for $($Identity.Role)." }
-    $snapshot = [CapNative]::Snapshot($Identity.Process.Handle, $Identity.Pid)
+    $access = Read-CapProcessAccess -Process $Identity.Process -Role $Identity.Role `
+        -CallSite 'Assert-CapProcessIdentity.Snapshot' -ExpectedPid $Identity.Pid
+    $snapshot = [CapNative]::Snapshot($access.Handle, $access.Pid)
     if ($snapshot.IsExited) { return [pscustomobject]@{ State = 'Exited'; Snapshot = $snapshot; Metadata = $null } }
     if ($snapshot.ProcessId -ne $Identity.Pid -or
         $snapshot.CreationFileTimeUtc -ne [long]$Identity.CreationFileTimeUtc -or
@@ -1834,7 +1903,9 @@ function Assert-CapProcessIdentity {
         # never treated as proof of death on its own. If the owned generation has
         # exited, report it exited; if it is still live, an incomplete/absent row
         # is a refusal, not a silent pass.
-        if ([CapNative]::IsExited($Identity.Process.Handle, $Identity.Pid)) { return [pscustomobject]@{ State = 'Exited'; Snapshot = $snapshot; Metadata = $null } }
+        $access = Read-CapProcessAccess -Process $Identity.Process -Role $Identity.Role `
+            -CallSite 'Assert-CapProcessIdentity.MetadataExit' -ExpectedPid $Identity.Pid
+        if ([CapNative]::IsExited($access.Handle, $access.Pid)) { return [pscustomobject]@{ State = 'Exited'; Snapshot = $snapshot; Metadata = $null } }
         throw "Live PID $($Identity.Pid) has no complete current CIM row; refusing."
     }
     $metadata = $state.Metadata
@@ -1856,8 +1927,10 @@ function Stop-CapManagedProcess {
     if ($verified.State -eq 'Exited') {
         return [pscustomobject]@{ Pid = $Identity.Pid; Role = $Identity.Role; Result = 'SKIP_GENUINELY_EXITED_KERNEL' }
     }
-    $terminated = [CapNative]::Terminate($Identity.Process.Handle, $Identity.Pid, $ExitCode, $TimeoutMilliseconds)
-    if (-not [CapNative]::IsExited($Identity.Process.Handle, $Identity.Pid)) { throw "Owned process PID $($Identity.Pid) remains live after guarded termination." }
+    $access = Read-CapProcessAccess -Process $Identity.Process -Role $Identity.Role `
+        -CallSite 'Stop-CapManagedProcess.Terminate' -ExpectedPid $Identity.Pid
+    $terminated = [CapNative]::Terminate($access.Handle, $access.Pid, $ExitCode, $TimeoutMilliseconds)
+    if (-not [CapNative]::IsExited($access.Handle, $access.Pid)) { throw "Owned process PID $($Identity.Pid) remains live after guarded termination." }
     return [pscustomobject]@{ Pid = $Identity.Pid; Role = $Identity.Role
         Result = if ($terminated) { 'TERMINATED_GUARDED_HANDLE' } else { 'EXITED_DURING_GUARDED_STOP' } }
 }
@@ -1873,7 +1946,8 @@ function Wait-CapManagedProcess {
 
 
     $process = $Run.Identity.Process
-    if ($process.Id -ne $Run.Identity.Pid) { throw "Held process PID changed for $($Run.Identity.Role)." }
+    $null = Read-CapProcessAccess -Process $process -Role $Run.Identity.Role `
+        -CallSite 'Wait-CapManagedProcess.Wait' -ExpectedPid $Run.Identity.Pid
     while ([DateTime]::UtcNow -lt $DeadlineUtc) {
         $remaining = [int][Math]::Max(1, [Math]::Min(
             $PollMilliseconds,
@@ -1897,36 +1971,41 @@ function Invoke-CapLaunchRollback {
 
 
     $process = $LaunchRecord.Process
-    $snapshot = [CapNative]::Snapshot($process.Handle, $process.Id)
+    $access = Read-CapProcessAccess -Process $process -Role $LaunchRecord.Role `
+        -CallSite 'Invoke-CapLaunchRollback.InitialSnapshot' -ExpectedPid $LaunchRecord.AcquiredPid
+    $LaunchRecord.AcquiredPid = $access.Pid
+    $snapshot = [CapNative]::Snapshot($access.Handle, $access.Pid)
     $result = $null
     if ($snapshot.IsExited) {
         $result = 'SKIP_GENUINELY_EXITED_KERNEL'
     } else {
         $metadata = $null
         for ($attempt = 0; $attempt -lt 20; $attempt++) {
-            $metadata = Get-CapCurrentMetadata -Pid $process.Id
+            $metadata = Get-CapCurrentMetadata -Pid $access.Pid
             if ($metadata) { break }
-            $snapshot = [CapNative]::Snapshot($process.Handle, $process.Id)
+            $access = Read-CapProcessAccess -Process $process -Role $LaunchRecord.Role `
+                -CallSite 'Invoke-CapLaunchRollback.MetadataSnapshot' -ExpectedPid $snapshot.ProcessId
+            $snapshot = [CapNative]::Snapshot($access.Handle, $access.Pid)
             if ($snapshot.IsExited) { break }
             Start-Sleep -Milliseconds 50
         }
         if ($snapshot.IsExited) {
             $result = 'SKIP_GENUINELY_EXITED_KERNEL'
         } elseif ($null -eq $metadata) {
-            throw "Rollback refused for live PID $($process.Id): current process metadata is unavailable."
+            throw "Rollback refused for live PID $($access.Pid): current process metadata is unavailable."
         } else {
             $expectedPath = ConvertTo-CapImagePath -Path $LaunchRecord.ExpectedImagePath
-            if ($metadata.Pid -ne $process.Id -or
+            if ($metadata.Pid -ne $access.Pid -or
                 [Math]::Abs([double]([long]$metadata.CreationFileTimeUtc - [long]$snapshot.CreationFileTimeUtc)) -gt
                 [TimeSpan]::FromMilliseconds(100).Ticks -or
                 $metadata.ImagePath -ine $expectedPath -or
                 $metadata.ParentPid -ne $LaunchRecord.ExpectedParentPid -or
                 $metadata.SessionId -ne $LaunchRecord.ExpectedSessionId) {
-                throw "Rollback refused for live PID $($process.Id): current kernel/CIM identity differs from the held launch record."
+                throw "Rollback refused for live PID $($access.Pid): current kernel/CIM identity differs from the held launch record."
             }
             $identity = [pscustomobject]@{
                 Process = $process
-                Pid = $process.Id
+                Pid = $access.Pid
                 CreationFileTimeUtc = $snapshot.CreationFileTimeUtc
                 ImagePath = $expectedPath
                 ExpectedImagePath = $expectedPath
@@ -1943,13 +2022,15 @@ function Invoke-CapLaunchRollback {
     }
     if ($null -eq $LaunchRecord.StdoutTask) { $LaunchRecord.StdoutTask = $process.StandardOutput.ReadToEndAsync() }
     if ($null -eq $LaunchRecord.StderrTask) { $LaunchRecord.StderrTask = $process.StandardError.ReadToEndAsync() }
-    if (-not $LaunchRecord.StdoutTask.Wait(2000)) { throw "Rollback stdout reader did not reach bounded EOF for PID $($process.Id)." }
-    if (-not $LaunchRecord.StderrTask.Wait(2000)) { throw "Rollback stderr reader did not reach bounded EOF for PID $($process.Id)." }
+    if (-not $LaunchRecord.StdoutTask.Wait(2000)) { throw "Rollback stdout reader did not reach bounded EOF for PID $($access.Pid)." }
+    if (-not $LaunchRecord.StderrTask.Wait(2000)) { throw "Rollback stderr reader did not reach bounded EOF for PID $($access.Pid)." }
     $stdout = [string]$LaunchRecord.StdoutTask.Result
     $stderr = [string]$LaunchRecord.StderrTask.Result
-    if (-not [CapNative]::IsExited($process.Handle, $process.Id)) { throw "Rollback left live PID $($process.Id)." }
+    $access = Read-CapProcessAccess -Process $process -Role $LaunchRecord.Role `
+        -CallSite 'Invoke-CapLaunchRollback.FinalExit' -ExpectedPid $snapshot.ProcessId
+    if (-not [CapNative]::IsExited($access.Handle, $access.Pid)) { throw "Rollback left live PID $($access.Pid)." }
     return [pscustomobject]@{
-        Pid = $process.Id
+        Pid = $access.Pid
         Role = $LaunchRecord.Role
         ExpectedPath = $LaunchRecord.ExpectedImagePath
         CreationFileTimeUtc = $snapshot.CreationFileTimeUtc
@@ -1960,6 +2041,46 @@ function Invoke-CapLaunchRollback {
         StdoutBytes = [Text.Encoding]::UTF8.GetByteCount($stdout)
         StderrBytes = [Text.Encoding]::UTF8.GetByteCount($stderr)
     }
+}
+
+function Complete-CapFailedLaunch {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$LaunchRecord, [Parameter(Mandatory)][Exception]$StartFailure)
+    $LaunchRecord.StartFailure = $StartFailure.Message
+    $LaunchRecord.StartFailureException = $StartFailure
+    if ($null -eq $LaunchRecord.AcquiredPid -and $StartFailure.Data['AcquiredPid'] -is [int]) {
+        $LaunchRecord.AcquiredPid = $StartFailure.Data['AcquiredPid']
+    }
+    $pidText = if ($null -ne $LaunchRecord.AcquiredPid) { [string]$LaunchRecord.AcquiredPid } else { 'UNAVAILABLE' }
+    try {
+        $rollback = Invoke-CapLaunchRollback -LaunchRecord $LaunchRecord
+        $script:CapLastRollbackReceipt = $rollback
+        $null = $script:CapPendingLaunches.Remove($LaunchRecord)
+        $LaunchRecord.Process.Dispose()
+    } catch {
+        $LaunchRecord.RollbackFailure = $_.Exception.Message
+        $LaunchRecord.RollbackFailureException = $_.Exception
+        $script:CapLastRollbackReceipt = [pscustomobject]@{
+            Pid = $LaunchRecord.AcquiredPid
+            Role = $LaunchRecord.Role
+            ExpectedPath = $LaunchRecord.ExpectedImagePath
+            CreationFileTimeUtc = if ($LaunchRecord.Snapshot) { $LaunchRecord.Snapshot.CreationFileTimeUtc } else { $null }
+            KernelExited = if ($LaunchRecord.Snapshot) { [bool]$LaunchRecord.Snapshot.IsExited } else { $null }
+            RollbackFailure = $LaunchRecord.RollbackFailure
+            RefusedUnsafeTermination = $true
+        }
+        $failure = [InvalidOperationException]::new(
+            "Process.Start identity attestation failed for $($LaunchRecord.Role) PID ${pidText}: $($StartFailure.Message); guarded rollback also failed: $($LaunchRecord.RollbackFailure).",
+            [AggregateException]::new('Primary attestation and guarded rollback failures.',
+                [Exception[]]@($StartFailure, $LaunchRecord.RollbackFailureException)))
+        foreach ($key in $StartFailure.Data.Keys) { $failure.Data[$key] = $StartFailure.Data[$key] }
+        throw $failure
+    }
+    $failure = [InvalidOperationException]::new(
+        "Process.Start identity attestation failed for $($LaunchRecord.Role) PID ${pidText}: $($StartFailure.Message); guarded rollback=$($rollback.Result), stdoutEOF=$($rollback.StdoutEof), stderrEOF=$($rollback.StderrEof).",
+        $StartFailure)
+    foreach ($key in $StartFailure.Data.Keys) { $failure.Data[$key] = $StartFailure.Data[$key] }
+    throw $failure
 }
 
 function Start-CapManagedProcessCore {
@@ -2007,21 +2128,26 @@ function Start-CapManagedProcessCore {
         Role = $Role
         StartInfo = $startInfo
         Snapshot = $null
+        AcquiredPid = $null
         StdoutTask = $null
         StderrTask = $null
         Identity = $null
         StartFailure = $null
         RollbackFailure = $null
+        StartFailureException = $null
+        RollbackFailureException = $null
     }
     $script:CapPendingLaunches.Add($launchRecord)
     try {
-        $launchRecord.Snapshot = [CapNative]::Snapshot($process.Handle, $process.Id)
+        $access = Read-CapProcessAccess -Process $process -Role $Role -CallSite 'Start-CapManagedProcessCore.InitialSnapshot'
+        $launchRecord.AcquiredPid = $access.Pid
+        $launchRecord.Snapshot = [CapNative]::Snapshot($access.Handle, $access.Pid)
         $launchRecord.StdoutTask = $process.StandardOutput.ReadToEndAsync()
         $launchRecord.StderrTask = $process.StandardError.ReadToEndAsync()
         Write-CapTrace -Command 'Process.Start' -Parameters @{
             FilePath = $fullPath; ArgumentList = $ArgumentList; Role = $Role
-            Pid = $process.Id; CreationFileTimeUtc = $launchRecord.Snapshot.CreationFileTimeUtc
-            HeldKernelHandle = $process.Handle.ToInt64(); ExpectedParentPid = $PID
+            Pid = $access.Pid; CreationFileTimeUtc = $launchRecord.Snapshot.CreationFileTimeUtc
+            HeldKernelHandle = $access.Handle.ToInt64(); ExpectedParentPid = $PID
             ExpectedSessionId = $parentMetadata.SessionId
         }
         if (-not $launchRecord.Snapshot.IsExited -and
@@ -2034,13 +2160,15 @@ function Start-CapManagedProcessCore {
             Get-CapProcessIdentity -Process $process -ExpectedImagePath $fullPath -Role $Role `
                 -ExpectedParentPid $PID -ExpectedSessionId $parentMetadata.SessionId
         }
-        if ($identity.Pid -ne $process.Id -or $identity.CreationFileTimeUtc -ne $launchRecord.Snapshot.CreationFileTimeUtc) {
+        if ($identity.Pid -ne $launchRecord.AcquiredPid -or $identity.CreationFileTimeUtc -ne $launchRecord.Snapshot.CreationFileTimeUtc) {
             throw "Identity attestor returned a different kernel generation for $Role."
         }
-        $exitedDuringAttestation = [CapNative]::IsExited($process.Handle, $process.Id)
+        $access = Read-CapProcessAccess -Process $process -Role $Role `
+            -CallSite 'Start-CapManagedProcessCore.AttestationExit' -ExpectedPid $launchRecord.AcquiredPid
+        $exitedDuringAttestation = [CapNative]::IsExited($access.Handle, $access.Pid)
         if (-not $exitedDuringAttestation) {
             if (-not $identity.InitialMetadataObserved -or -not $identity.InitialMetadataMatchesExpected) {
-                throw "Live $Role PID $($process.Id) lacks a complete expected-parent/session attestation."
+                throw "Live $Role PID $($launchRecord.AcquiredPid) lacks a complete expected-parent/session attestation."
             }
             # Consume the verification result: the child can exit during this final
             # assertion, and that exit must also be routed through the shared EOF gate
@@ -2058,34 +2186,14 @@ function Start-CapManagedProcessCore {
             $bothEof = $launchRecord.StdoutTask.Wait(2000) -and $launchRecord.StderrTask.Wait(2000)
             $final = Resolve-CapAttestationDisposition -State 'Absent' -KernelExited $true -BothStreamsEofReached $bothEof
             if ($final -cne 'GoneByKernelExit') {
-                throw "Exited $Role PID $($process.Id) did not reach bounded stdout/stderr EOF; cannot attest it genuinely gone."
+                throw "Exited $Role PID $($launchRecord.AcquiredPid) did not reach bounded stdout/stderr EOF; cannot attest it genuinely gone."
             }
         }
         $launchRecord.Identity = $identity
         if ($CloseStdin) { $process.StandardInput.Close() }
         $null = $script:CapPendingLaunches.Remove($launchRecord)
     } catch {
-        $startFailure = $_.Exception
-        $launchRecord.StartFailure = $startFailure.Message
-        try {
-            $rollback = Invoke-CapLaunchRollback -LaunchRecord $launchRecord
-            $script:CapLastRollbackReceipt = $rollback
-            $null = $script:CapPendingLaunches.Remove($launchRecord)
-            $process.Dispose()
-        } catch {
-            $launchRecord.RollbackFailure = $_.Exception.Message
-            $script:CapLastRollbackReceipt = [pscustomobject]@{
-                Pid = $process.Id
-                Role = $Role
-                ExpectedPath = $fullPath
-                CreationFileTimeUtc = if ($launchRecord.Snapshot) { $launchRecord.Snapshot.CreationFileTimeUtc } else { $null }
-                KernelExited = if ($launchRecord.Snapshot) { [bool]$launchRecord.Snapshot.IsExited } else { $null }
-                RollbackFailure = $launchRecord.RollbackFailure
-                RefusedUnsafeTermination = $true
-            }
-            throw "Process.Start identity attestation failed for $Role PID $($process.Id): $($startFailure.Message); guarded rollback also failed: $($launchRecord.RollbackFailure)."
-        }
-        throw "Process.Start identity attestation failed for $Role PID $($process.Id): $($startFailure.Message); guarded rollback=$($rollback.Result), stdoutEOF=$($rollback.StdoutEof), stderrEOF=$($rollback.StderrEof)."
+        Complete-CapFailedLaunch -LaunchRecord $launchRecord -StartFailure $_.Exception
     }
     return [pscustomobject]@{
         Identity = $identity
@@ -2165,10 +2273,18 @@ function Get-CapPendingLaunches {
         $record = $_
         $kernelExited = $null
         $kernelProbeFailure = $null
-        try { $kernelExited = [CapNative]::IsExited($record.Process.Handle, $record.Process.Id) }
-        catch [InvalidOperationException], [ComponentModel.Win32Exception] { $kernelProbeFailure = $_.Exception.ToString() }
+        $kernelProbeFailureDetails = $null
+        try {
+            $access = Read-CapProcessAccess -Process $record.Process -Role $record.Role `
+                -CallSite 'Get-CapPendingLaunches.KernelProbe' -ExpectedPid $record.AcquiredPid
+            $kernelExited = [CapNative]::IsExited($access.Handle, $access.Pid)
+        }
+        catch [InvalidOperationException], [ComponentModel.Win32Exception] {
+            $kernelProbeFailure = $_.Exception.ToString()
+            $kernelProbeFailureDetails = $_.Exception.Data
+        }
         [pscustomobject]@{
-            Pid = $record.Process.Id
+            Pid = $record.AcquiredPid
             Role = $record.Role
             ExpectedPath = $record.ExpectedImagePath
             CreationFileTimeUtc = if ($record.Snapshot) { $record.Snapshot.CreationFileTimeUtc } else { $null }
@@ -2176,8 +2292,11 @@ function Get-CapPendingLaunches {
             ExpectedSessionId = $record.ExpectedSessionId
             StartFailure = $record.StartFailure
             RollbackFailure = $record.RollbackFailure
+            StartFailureDetails = if ($record.StartFailureException) { $record.StartFailureException.Data } else { $null }
+            RollbackFailureDetails = if ($record.RollbackFailureException) { $record.RollbackFailureException.Data } else { $null }
             KernelExited = $kernelExited
             KernelProbeFailure = $kernelProbeFailure
+            KernelProbeFailureDetails = $kernelProbeFailureDetails
         }
     })
 }
@@ -2199,6 +2318,7 @@ function Resolve-CapPendingLaunches {
 
     $results = [Collections.Generic.List[object]]::new()
     $failures = [Collections.Generic.List[string]]::new()
+    $exceptions = [Collections.Generic.List[Exception]]::new()
     foreach ($record in $script:CapPendingLaunches.ToArray()) {
         try {
             $receipt = Invoke-CapLaunchRollback -LaunchRecord $record
@@ -2206,10 +2326,15 @@ function Resolve-CapPendingLaunches {
             $null = $script:CapPendingLaunches.Remove($record)
             $record.Process.Dispose()
         } catch {
-            $failures.Add("PID $($record.Process.Id) role=$($record.Role): $($_.Exception.Message)")
+            $pidText = if ($null -ne $record.AcquiredPid) { [string]$record.AcquiredPid } else { 'UNAVAILABLE' }
+            $failures.Add("PID $pidText role=$($record.Role): $($_.Exception.Message)")
+            $exceptions.Add($_.Exception)
         }
     }
-    if ($failures.Count) { throw "Pending launch rollback refused or failed: $($failures -join '; ')" }
+    if ($failures.Count) {
+        throw [InvalidOperationException]::new("Pending launch rollback refused or failed: $($failures -join '; ')",
+            [AggregateException]::new('Pending launch rollback failures.', $exceptions.ToArray()))
+    }
     return @($results)
 }
 
@@ -2246,7 +2371,9 @@ function Get-CapOwnedDescendants {
             $verified = Assert-CapProcessIdentity -Identity $identity
             if ($verified.State -eq 'Exited') { $process.Dispose(); continue }
             $meta = $verified.Metadata
-            $parentSnapshot = [CapNative]::Snapshot($parent.Process.Handle, $parent.Pid)
+            $parentAccess = Read-CapProcessAccess -Process $parent.Process -Role $parent.Role `
+                -CallSite 'Get-CapOwnedDescendants.ParentSnapshot' -ExpectedPid $parent.Pid
+            $parentSnapshot = [CapNative]::Snapshot($parentAccess.Handle, $parentAccess.Pid)
             $parentExitFileTimeUtc = [long]$parentSnapshot.ExitFileTimeUtc
             $outsideParentLifetime =
                 ([long]$meta.CreationFileTimeUtc -lt [long]$parent.CreationFileTimeUtc) -or
@@ -3689,6 +3816,7 @@ Export-ModuleMember -Function @(
     'Find-CapTopLevelWindow',
     'Capture-CapWindow',
     'Get-CapProcessIdentity',
+    'Read-CapProcessAccess',
     'Read-CapProcessMetadataState',
     'Resolve-CapAttestationDisposition',
     'Get-CapCurrentMetadata',

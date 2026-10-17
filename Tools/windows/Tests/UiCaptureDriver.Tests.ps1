@@ -11,6 +11,7 @@ param(
     [switch]$JournalObservationContractOnly,
     [switch]$PreflightReportContractOnly,
     [switch]$SelectorRefusalContractOnly,
+    [switch]$IdentityContractOnly,
     [string]$PrebuiltFixtureManifest = '',
     [string]$PrebuiltFixtureManifestSha256 = '',
     [switch]$RequireRealSeed,
@@ -2699,6 +2700,204 @@ function Invoke-CapSelectorRefusalContracts {
     Set-CapTracePath -Path (Join-Path $scratch 'test-calls.jsonl')
 }
 
+function Assert-CapIdentityUnavailable {
+    param([scriptblock]$Action)
+    try { $null = & $Action }
+    catch {
+        Assert-CapTest ($_.Exception -is [InvalidOperationException] -and
+            $_.Exception.Data['CapCaptureCode'] -ceq 'ProcessIdentityUnavailable') `
+            "Expected typed identity unavailability, got $($_.Exception.ToString())"
+        return $_.Exception
+    }
+    throw 'Unavailable identity unexpectedly returned a result.'
+}
+
+function Invoke-CapIdentityContracts {
+    foreach ($kind in @('not-started', 'disposed-self-wrapper')) {
+        Invoke-CapTest "actual $kind identity refuses unavailable Handle and Id before Snapshot binding" {
+            $process = if ($kind -ceq 'not-started') { [Diagnostics.Process]::new() }
+                else { [Diagnostics.Process]::GetProcessById($PID) }
+            if ($kind -ceq 'disposed-self-wrapper') { $process.Dispose() }
+            try {
+                $failure = Assert-CapIdentityUnavailable {
+                    Get-CapProcessIdentity -Process $process -ExpectedImagePath ([Environment]::ProcessPath) -Role $kind
+                }
+                Assert-CapTest ($failure.Data['HandleState'] -ceq 'GetterException' -and
+                    $failure.Data['IdState'] -ceq 'GetterException' -and
+                    $null -eq $failure.Data['AcquiredPid'] -and $null -eq $failure.Data['ExpectedPid'] -and
+                    $failure.Data['CallSite'] -ceq 'Get-CapProcessIdentity.InitialSnapshot' -and
+                    $failure.InnerException -is [AggregateException] -and
+                    $failure.InnerException.InnerExceptions.Count -eq 2) 'Getter failures or unknown PID evidence was lost.'
+                return @{ code = $failure.Data['CapCaptureCode']; details = $failure.Data
+                    originalExceptions = @($failure.InnerException.InnerExceptions | ForEach-Object { $_.ToString() })
+                    historicalCause = 'UNOBSERVED; controlled object condition only' }
+            } finally { $process.Dispose() }
+        }
+    }
+    Invoke-CapTest 'synthetic accessor states reject null invalid values and independent getter failures without defaults' {
+        $self = [Diagnostics.Process]::GetProcessById($PID)
+        try {
+            $handle = $self.get_Handle()
+            $rows = @(
+                @{ h = $null; i = $PID; hs = 'Null'; ids = 'Available' }
+                @{ h = [IntPtr]::Zero; i = $PID; hs = 'Invalid'; ids = 'Available' }
+                @{ h = [IntPtr]::new(-1); i = $PID; hs = 'Invalid'; ids = 'Available' }
+                @{ h = 123; i = $PID; hs = 'Invalid'; ids = 'Available' }
+                @{ h = $handle; i = $null; hs = 'Available'; ids = 'Null' }
+                @{ h = $handle; i = 0; hs = 'Available'; ids = 'Invalid' }
+                @{ h = $handle; i = [string]$PID; hs = 'Available'; ids = 'Invalid' }
+                @{ h = $handle; i = $PID; hs = 'GetterException'; ids = 'Available' }
+                @{ h = $handle; i = $PID; hs = 'Available'; ids = 'GetterException' }
+            )
+            $details = foreach ($row in $rows) {
+                $probe = [Diagnostics.Process]::new()
+                $probe | Add-Member -NotePropertyName CapAccessorProbe -NotePropertyValue @{
+                    row = $row; handleReads = 0; idReads = 0
+                }
+                $probe | Add-Member -MemberType ScriptMethod -Name get_Handle -Force -Value {
+                    $this.CapAccessorProbe.handleReads++
+                    if ($this.CapAccessorProbe.row.hs -ceq 'GetterException') { throw [InvalidOperationException]::new('SYNTHETIC_HANDLE_GETTER') }
+                    return $this.CapAccessorProbe.row.h
+                }
+                $probe | Add-Member -MemberType ScriptMethod -Name get_Id -Force -Value {
+                    $this.CapAccessorProbe.idReads++
+                    if ($this.CapAccessorProbe.row.ids -ceq 'GetterException') { throw [InvalidOperationException]::new('SYNTHETIC_ID_GETTER') }
+                    return $this.CapAccessorProbe.row.i
+                }
+                try {
+                    $failure = Assert-CapIdentityUnavailable {
+                        Read-CapProcessAccess -Process $probe -Role 'synthetic-accessor' -CallSite 'SyntheticContract' -ExpectedPid $PID
+                    }
+                    Assert-CapTest ($failure.Data['HandleState'] -ceq $row.hs -and $failure.Data['IdState'] -ceq $row.ids -and
+                        $probe.CapAccessorProbe.handleReads -eq 1 -and $probe.CapAccessorProbe.idReads -eq 1 -and
+                        $failure.Data['ExpectedPid'] -eq $PID) 'Accessor states/counts/expected context changed.'
+                    if ($row.ids -ceq 'Available') {
+                        Assert-CapTest ($failure.Data['AcquiredPid'] -eq $PID) 'Actually read PID was lost when Handle was unavailable.'
+                    } else {
+                        Assert-CapTest ($null -eq $failure.Data['AcquiredPid']) 'Expected PID was misrepresented as acquired.'
+                    }
+                    if ($row.hs -ceq 'GetterException' -or $row.ids -ceq 'GetterException') {
+                        Assert-CapTest ($null -ne $failure.InnerException) 'Original synthetic getter exception was discarded.'
+                    }
+                    @{ handleState = $row.hs; idState = $row.ids; handleReads = 1; idReads = 1 }
+                } finally { $probe.Dispose() }
+            }
+            Assert-CapTest ($details.Count -eq 9) 'Synthetic accessor state inventory changed.'
+            return @{ executed = $details.Count; rows = @($details); scope = 'Synthetic accessors; not a historical-cause reproduction' }
+        } finally { $self.Dispose() }
+    }
+    Invoke-CapTest 'valid self identity preserves actual kernel CIM generation and explicit acquisition' {
+        $self = [Diagnostics.Process]::GetProcessById($PID)
+        try {
+            $access = Read-CapProcessAccess -Process $self -Role 'valid-self' -CallSite 'ValidSelfContract' -ExpectedPid $PID
+            $snapshot = [CapNative]::Snapshot($access.Handle, $access.Pid)
+            $identity = Get-CapProcessIdentity -Process $self -ExpectedImagePath ([Environment]::ProcessPath) -Role 'valid-self'
+            $verified = Assert-CapProcessIdentity $identity
+            Assert-CapTest ($access.Pid -eq $PID -and $snapshot.ProcessId -eq $PID -and -not $snapshot.IsExited -and
+                $snapshot.CreationFileTimeUtc -eq $identity.CreationFileTimeUtc -and
+                $identity.InitialMetadataObserved -and $verified.State -ceq 'Live') 'Valid kernel/CIM ownership behavior changed.'
+            return @{ pid = $identity.Pid; creationFileTimeUtc = $identity.CreationFileTimeUtc; state = $verified.State }
+        } finally { $self.Dispose() }
+    }
+    Invoke-CapTest 'acquired PID mismatch and native handle PID mismatch still refuse without adoption' {
+        $self = [Diagnostics.Process]::GetProcessById($PID)
+        try {
+            $failure = $null
+            try { $null = Read-CapProcessAccess -Process $self -Role 'pid-mismatch' -CallSite 'MismatchContract' -ExpectedPid ($PID + 1) }
+            catch [InvalidOperationException] { $failure = $_.Exception }
+            Assert-CapTest ($null -ne $failure -and $failure.Data['CapCaptureCode'] -ceq 'ProcessIdentityMismatch' -and
+                $failure.Data['AcquiredPid'] -eq $PID -and $failure.Data['ExpectedPid'] -eq ($PID + 1)) 'Expected PID replaced the acquired PID.'
+            $null = Assert-CapRejects { [CapNative]::Snapshot($self.get_Handle(), ($PID + 1)) } 'Process handle/PID mismatch'
+            $null = Assert-CapRejects { [CapNative]::Snapshot([IntPtr]::Zero, $PID) } 'handle'
+            return @{ acquired = $PID; expected = $PID + 1; nativeMismatchRefused = $true; nativeZeroRefused = $true }
+        } finally { $self.Dispose() }
+    }
+    Invoke-CapTest 'disposed tracked identity refuses assert stop and wait rather than claiming exit' {
+        $self = [Diagnostics.Process]::GetProcessById($PID)
+        $identity = Get-CapProcessIdentity -Process $self -ExpectedImagePath ([Environment]::ProcessPath) -Role 'disposed-tracked-self'
+        $self.Dispose()
+        $failures = @(
+            Assert-CapIdentityUnavailable { Assert-CapProcessIdentity $identity }
+            Assert-CapIdentityUnavailable { Stop-CapManagedProcess $identity }
+            Assert-CapIdentityUnavailable { Wait-CapManagedProcess -Run ([pscustomobject]@{ Identity = $identity }) -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(1)) }
+        )
+        Assert-CapTest ($failures.Count -eq 3 -and @($failures | Where-Object {
+            $_.Data['ExpectedPid'] -eq $PID -and $null -eq $_.Data['AcquiredPid']
+        }).Count -eq 3) 'Disposed tracked identity was accepted, stopped, or treated as gone.'
+        return @{ refused = 3; killAttempts = 0; exitInference = 'UNPROVEN' }
+    }
+    Invoke-CapTest 'unavailable launch rollback retains typed primary secondary pending evidence and unknown PID' {
+        $module = Get-Module UiCaptureDriver
+        $details = foreach ($knownPid in @($false, $true)) {
+            $process = if ($knownPid) { [Diagnostics.Process]::GetProcessById($PID) } else { [Diagnostics.Process]::new() }
+            $acquiredPid = if ($knownPid) { $process.get_Id() } else { $null }
+            $process.Dispose()
+            $primary = Assert-CapIdentityUnavailable {
+                Get-CapProcessIdentity -Process $process -ExpectedImagePath ([Environment]::ProcessPath) -Role 'unavailable-launch-contract'
+            }
+            $record = [pscustomobject]@{
+                Process = $process; AcquiredPid = $acquiredPid; Role = 'unavailable-launch-contract'
+                ExpectedImagePath = [Environment]::ProcessPath; ExpectedParentPid = $PID; ExpectedSessionId = 0
+                Snapshot = $null; StdoutTask = $null; StderrTask = $null; StartFailure = $null; RollbackFailure = $null
+                StartFailureException = $null; RollbackFailureException = $null
+            }
+            $outcome = & $module {
+                param($Record, $Primary)
+                $previous = $script:CapLastRollbackReceipt
+                $script:CapPendingLaunches.Add($Record)
+                try {
+                    $outer = $null
+                    try { Complete-CapFailedLaunch -LaunchRecord $Record -StartFailure $Primary }
+                    catch [InvalidOperationException] { $outer = $_.Exception }
+                    $pending = @(Get-CapPendingLaunches | Where-Object Role -CEQ 'unavailable-launch-contract')
+                    $resolve = $null
+                    try { $null = Resolve-CapPendingLaunches }
+                    catch { $resolve = $_.Exception }
+                    [pscustomobject]@{ Outer = $outer; Pending = $pending; ResolveFailure = $resolve
+                        Receipt = $script:CapLastRollbackReceipt; StillPending = $script:CapPendingLaunches.Contains($Record) }
+                } finally {
+                    $null = $script:CapPendingLaunches.Remove($Record)
+                    $script:CapLastRollbackReceipt = $previous
+                }
+            } $record $primary
+            Assert-CapTest ($outcome.Outer.Data['CapCaptureCode'] -ceq 'ProcessIdentityUnavailable' -and
+                $outcome.Outer.InnerException -is [AggregateException] -and
+                $outcome.Outer.InnerException.InnerExceptions.Count -eq 2 -and
+                [object]::ReferenceEquals($outcome.Outer.InnerException.InnerExceptions[0], $primary) -and
+                $outcome.Pending.Count -eq 1 -and $null -eq $outcome.Pending[0].KernelExited -and
+                $outcome.Pending[0].KernelProbeFailure.Contains('ProcessIdentityUnavailable') -and
+                $outcome.Pending[0].KernelProbeFailureDetails['CapCaptureCode'] -ceq 'ProcessIdentityUnavailable' -and
+                $null -ne $outcome.ResolveFailure -and $outcome.StillPending -and
+                $outcome.Receipt.RefusedUnsafeTermination -and $null -eq $outcome.Receipt.KernelExited) `
+                'Unavailable cleanup lost a failure, removed pending evidence, or invented kernel exit.'
+            $pidText = if ($knownPid) { [string]$acquiredPid } else { 'UNAVAILABLE' }
+            Assert-CapTest ($outcome.Outer.Message.Contains("PID ${pidText}:") -and
+                $outcome.Pending[0].Pid -eq $acquiredPid -and
+                $outcome.ResolveFailure.Message.Contains("PID $pidText role=")) 'Failure formatting reread unavailable PID or invented zero.'
+            @{ acquiredPid = $acquiredPid; outer = $outcome.Outer.ToString()
+                pending = $outcome.Pending; kernelExit = 'UNPROVEN'; eof = 'UNPROVEN' }
+        }
+        Assert-CapTest ($details.Count -eq 2 -and @(Get-CapPendingLaunches).Count -eq 0) 'Synthetic-only pending test records were not removed.'
+        return @{ cases = @($details); processStarts = 0; scope = 'Actual failed-launch handler and rollback with controlled wrappers; no target' }
+    }
+}
+
+if ($IdentityContractOnly) {
+    Invoke-CapIdentityContracts
+    foreach ($path in $sourceHashesBefore.Keys) {
+        Assert-CapTest ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ceq $sourceHashesBefore[$path]) "Source changed during identity contracts: $path"
+    }
+    $passed = @($results | Where-Object passed -EQ $true).Count
+    $failed = @($results | Where-Object passed -EQ $false).Count
+    $report = [pscustomobject]@{ suite = 'UiCaptureIdentityContracts'; executed = $results.Count; passed = $passed; failed = $failed
+        cases = @($results); sourceHashesBeforeImport = $sourceHashesBefore
+        mode = 'SELF_PROCESS_AND_SYNTHETIC_ACCESSORS_NO_CHILD_FIXTURE_OR_KILL' }
+    $report | ConvertTo-Json -Depth 25 | Set-Content -LiteralPath (Join-Path $scratch 'report.json') -Encoding utf8NoBOM
+    $report | Select-Object suite,executed,passed,failed | ConvertTo-Json -Compress
+    if ($results.Count -ne 7 -or $passed -ne 7 -or $failed -ne 0) { exit 1 }
+    exit 0
+}
+
 if ($SelectorRefusalContractOnly) {
     Invoke-CapSelectorRefusalContracts
     $passed = @($results | Where-Object passed -EQ $true).Count
@@ -2780,6 +2979,7 @@ try {
     } else {
     $cimRaceTarget = $prebuilt.CimRace
     if (-not $LaunchContractOnly) {
+        Invoke-CapIdentityContracts
         Invoke-CapSelectorRefusalContracts
         Invoke-CapTest 'prebuilt fixture binder accepts exact artifacts and refuses missing or tampered bytes' { Invoke-CapPrebuiltFixtureContract }
         Invoke-CapTest 'journal phase timing records open copy total without changing budget or retry limits' { Invoke-CapJournalTimingContract }
@@ -3784,6 +3984,6 @@ try {
 }
 [ordered]@{ suite = $suiteName; executed = $results.Count; passed = $passed; failed = $failed; artifacts = $scratch } |
     ConvertTo-Json -Compress
-$expectedCount = if ($JournalContractOnly) { 10 } elseif ($LaunchContractOnly) { 2 } elseif ($RequireRealSeed) { 88 } else { 85 }
+$expectedCount = if ($JournalContractOnly) { 10 } elseif ($LaunchContractOnly) { 2 } elseif ($RequireRealSeed) { 95 } else { 92 }
 if ($results.Count -ne $expectedCount -or $failed -ne 0 -or $passed -ne $results.Count) { exit 1 }
 exit 0

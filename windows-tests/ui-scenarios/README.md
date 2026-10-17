@@ -386,13 +386,13 @@ Test definitions retain the original 59 cases (the native export contract is
 updated to 26), adding three contained harmless normal/nonzero/timeout cases,
 one STD source-ordering check, and N1's full numbered-final-proof synthetic
 output-descendant accept/refusal fixture, plus one negative umbrella safety-net
-release assertion, lease-path and receipt-IO groups, prebuilt binding, journal-phase timing, first-Open, buffered-observation and selector-refusal contracts: 85 expected cases. N1 is not real
+release assertion, lease-path and receipt-IO groups, prebuilt binding, journal-phase timing, first-Open, buffered-observation, selector-refusal and identity-acquisition contracts: 92 expected cases. N1 is not real
 seed evidence. `-RequireRealSeed` additionally defines three actual-command
 cases: two real zmx phases before a normal, nonzero, or timed-out harmless
-target, for 88 expected cases. It requires explicit `-RealSeedZmxPath` and
+target, for 95 expected cases. It requires explicit `-RealSeedZmxPath` and
 `-RealSeedZmxSha256` inputs admitted against the pinned provider; there is no
 PATH or stale-candidate fallback. Without those cases, the repaired report
-gate refuses live admission even if the 85 offline cases pass.
+gate refuses live admission even if the 92 offline cases pass.
 
 None of these new native cases ran during M1. Parse/compile-only evidence
 does not establish job nesting, gate timing, output transport, native STD
@@ -475,7 +475,7 @@ test override. Retry trace observations assert actual sharing/parse retries.
 release case for discriminating RED/GREEN evidence.
 
 These five contracts are registered as one full-suite case within the current
-85/88 prospective counts above. Focused reports are named
+92/95 prospective counts above. Focused reports are named
 `UiCaptureReceiptContracts` and cannot stand in for a complete capture
 preflight. A file-IO GREEN is not native lifecycle or job-zero GREEN.
 The strict outer job-zero gate remains unchanged; there is no vctip exemption.
@@ -631,7 +631,8 @@ The two prior #845 setup groups gave the historical 69 offline / 72 real-seed
 inventory. The two #851 first-Open groups brought that inventory to 71 offline / 74
 real-seed cases. The #852 buffered-observation group brought that inventory
 to 72 offline / 75 real-seed cases. The thirteen #848 selector-refusal groups
-bring current full-suite expectations to 85 offline / 88 real-seed cases. Historical run counts are not
+bring that inventory to 85 offline / 88 real-seed cases. The seven identity-acquisition
+groups bring current full-suite expectations to 92 offline / 95 real-seed cases. Historical run counts are not
 relabelled by these additions. A focused
 setup-contract pass is not a complete capture, native job-zero or parity pass.
 
@@ -723,10 +724,56 @@ not an instantiated WPF rectangle or live UIA evidence. Structural
 classification uses the four already-read primitive coordinates, without
 adding a WindowsBase dependency or changing assembly loading.
 
-All thirteen cases are also registered in the normal suite: exactly 85 ordinary
-or 88 real-seed cases, preserving all 75 real-seed case names from the merged
+All thirteen cases are also registered in the normal suite: currently 92 ordinary
+or 95 real-seed cases, preserving all 75 real-seed case names from the merged
 journal base. The four timing
 subcases and journal success path are unchanged. This diagnostic evidence is
 not live UIA, graph-delivery, rendering, input, B-scene or parity evidence;
 the live refusal's root cause remains unclassified until separately admitted
 retained runtime evidence is available.
+
+### Typed Process identity acquisition
+
+`Read-CapProcessAccess` explicitly invokes `Process.get_Handle()` and
+`Process.get_Id()` once each per acquisition boundary. Unlike PowerShell's
+adapted property reads, these invocations retain accessor exceptions instead
+of passing a null value to the `Snapshot` argument binder. The shared helper is
+exported for the bound embedded launcher and supervisor; it does not open or
+adopt a different process.
+
+Unavailable, null or invalid access is an `InvalidOperationException` with
+`Data.CapCaptureCode=ProcessIdentityUnavailable`, role, callsite, independent
+Handle/Id states, and the original accessor exception(s). A valid acquired
+PID and a caller's expected PID are separate nullable evidence fields; an
+expected PID is never substituted for an unavailable acquired PID. Only an
+actual nonzero/non-minus-one `IntPtr` and positive `Int32` reach `Snapshot`.
+An acquired/expected PID mismatch refuses ownership. The native snapshot's
+PID, creation-time, image and kernel checks are unchanged.
+
+Launch error formatting uses retained acquired PID evidence or the explicit
+word `UNAVAILABLE`, not another read of a disposed object. The original typed
+attestation error and any secondary rollback error remain observable.
+Unavailable rollback retains its pending record, reports kernel exit as
+unproven, and refuses unsafe termination. Pending probe failure details remain
+typed, with `KernelExited=null`; neither this value, a missing CIM row nor a
+getter exception proves exit or bounded stdout/stderr EOF. Existing strict
+generation, current metadata, parent/session, deadline and EOF gates remain
+in force.
+
+The seven registered focused cases exercise actual not-started/disposed
+self-process wrappers, synthetic null/invalid/independent-failure accessor
+states, valid self kernel/CIM identity, PID/native mismatches, disposed tracked
+assert/stop/wait refusal, and the actual failed-launch handler/rollback/pending
+formatting path without starting a child:
+
+```powershell
+pwsh -NoProfile -File Tools\windows\Tests\UiCaptureDriver.Tests.ps1 `
+  -IdentityContractOnly -ScratchRoot C:\owned\fresh-identity-contracts
+```
+
+The unchanged-source RED reaches the actual initial `Get-CapProcessIdentity`
+Snapshot binder with a null Handle; it does not enter the native method body.
+Controlled disposal demonstrates that reproduction mechanism, not the cause
+of either historical #849 occurrence. These self-process and synthetic
+contracts are not native child-lifecycle, full-suite, UIA, live B or parity
+evidence.
