@@ -1,0 +1,57 @@
+#!/bin/sh
+# Builds .build/sdk/<name>-zig.sdk when no macOS 15 SDK is available — the case on
+# GitHub's macos-26 runners since image 20261013, and on any Mac whose Command Line
+# Tools no longer ship one.
+#
+# The result is the newest installed SDK seen through symlinks, except for
+# usr/lib/libSystem.B.tbd: every document in it that lists `arm64e-macos` but not
+# `arm64-macos` gets `arm64-macos` added, which is the fallback Apple's ld makes on
+# its own and zig 0.15.2's linker doesn't (see ./xcrun). Nothing is copied but that
+# one text file.
+set -eu
+
+shim_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(CDPATH= cd -- "$shim_dir/../.." && pwd)
+
+if "$shim_dir/xcrun" --sdk macosx --show-sdk-path >/dev/null 2>&1; then
+  exit 0
+fi
+
+# 26.x first: zig 0.15.2's bundled libc++ doesn't compile against the macOS 27
+# headers (`INFINITY` undeclared in __random/clamp_to_integral.h).
+source_sdk=$(ls -d /Library/Developer/CommandLineTools/SDKs/MacOSX26.*.sdk \
+  "$(/usr/bin/xcode-select -p)"/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.*.sdk \
+  2>/dev/null | sort -t/ -k1 -V | tail -1)
+[ -n "$source_sdk" ] || source_sdk=$(/usr/bin/xcrun --sdk macosx --show-sdk-path)
+source_sdk=$(CDPATH= cd -- "$source_sdk" && pwd -P)
+name=$(basename "$source_sdk" .sdk)
+[ "$name" != MacOSX ] || name="MacOSX$(/usr/bin/xcrun --sdk macosx --show-sdk-version)"
+mkdir -p "$repo_root/.build/sdk"
+destination="$repo_root/.build/sdk/$name-zig.sdk"
+staging=$(mktemp -d "$repo_root/.build/sdk/.staging.XXXXXX")
+trap 'rm -rf "$staging"' EXIT
+
+sdk="$staging/sdk"
+mkdir -p "$sdk/usr/lib"
+for entry in "$source_sdk"/*; do
+  [ "$(basename "$entry")" = usr ] || ln -s "$entry" "$sdk/"
+done
+for entry in "$source_sdk"/usr/*; do
+  [ "$(basename "$entry")" = lib ] || ln -s "$entry" "$sdk/usr/"
+done
+for entry in "$source_sdk"/usr/lib/*; do
+  case "$(basename "$entry")" in
+    libSystem.B.tbd | libSystem.tbd) ;;
+    *) ln -s "$entry" "$sdk/usr/lib/" ;;
+  esac
+done
+perl -0777 -pe 's{(--- !tapi-tbd.*?)(?=--- !tapi-tbd|\z)}{
+  my $doc = $1;
+  $doc =~ s/\barm64e-macos\b/arm64-macos, arm64e-macos/g unless $doc =~ /\barm64-macos\b/;
+  $doc
+}gse' "$source_sdk/usr/lib/libSystem.B.tbd" >"$sdk/usr/lib/libSystem.B.tbd"
+ln -s libSystem.B.tbd "$sdk/usr/lib/libSystem.tbd"
+
+rm -rf "$destination"
+mv "$sdk" "$destination"
+echo "zig SDK: $destination (from $source_sdk)"
