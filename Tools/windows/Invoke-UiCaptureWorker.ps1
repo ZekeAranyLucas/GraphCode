@@ -495,18 +495,28 @@ function Wait-CapVisibleElement {
     )
     Write-CapTrace -Command $MyInvocation.MyCommand.Name -Parameters $PSBoundParameters
 
+    $lastSnapshot = $null
+    $lastPollUtc = $null
+    try {
     while ([DateTime]::UtcNow -lt $leaseDeadlineUtc) {
         Assert-CapWorkerDeadline "UIA element $Name"
+        $lastPollUtc = [DateTime]::UtcNow
         try {
             return Find-CapAutomationElement -RootHandle $Window -ProcessIdentity $ProcessIdentity `
                 -Name $Name -AutomationId $AutomationId -AutomationIdPrefix $AutomationIdPrefix `
-                -AllowOffscreen:$AllowOffscreen
+                -AllowOffscreen:$AllowOffscreen -RefusalSnapshot ([ref]$lastSnapshot)
         } catch {
             if ($_.Exception.Message -notmatch 'found=0\.') { throw }
             Start-Sleep -Milliseconds 100
         }
     }
     throw "UIA element '$Name' did not become available before the reserved deadline."
+    } catch {
+        Write-CapTerminalSelectorRefusal -Snapshot $lastSnapshot -Refusal $_ -PollUtc $lastPollUtc `
+            -DeadlineUtc $leaseDeadlineUtc -Window $Window -ProcessIdentity $ProcessIdentity `
+            -Name $Name -AutomationId $AutomationId -AutomationIdPrefix $AutomationIdPrefix -AllowOffscreen:$AllowOffscreen
+        throw
+    }
 }
 
 function Invoke-CapSceneAction {

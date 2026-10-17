@@ -10,6 +10,7 @@ param(
     [switch]$JournalFirstOpenContractOnly,
     [switch]$JournalObservationContractOnly,
     [switch]$PreflightReportContractOnly,
+    [switch]$SelectorRefusalContractOnly,
     [string]$PrebuiltFixtureManifest = '',
     [string]$PrebuiltFixtureManifestSha256 = '',
     [switch]$RequireRealSeed,
@@ -2216,6 +2217,501 @@ function Invoke-CapPreflightReportContract {
             [Text.Encoding]::UTF8.GetBytes($definition.Extent.Text))) }
 }
 
+function Invoke-CapSelectorRefusalContracts {
+    function New-SelectorCandidate {
+        param([string]$CandidateName = 'Alpha', [string]$Id = 'open-project-alpha',
+            [int]$CandidateProcessId = 4242, [bool]$Offscreen = $false, [double]$Width = 200)
+        return [pscustomobject]@{ Name = $CandidateName; AutomationId = $Id; ProcessId = $CandidateProcessId
+            IsOffscreen = $Offscreen; BoundingRectangle = [pscustomobject]@{
+                Left = 12.0; Top = 20.0; Width = $Width; Height = 24.0 }; ControlType = 'ControlType.Button' }
+    }
+    function Read-SelectorEvidence {
+        param([string]$Path)
+        $rows = @(Get-Content -LiteralPath $Path | ForEach-Object { ConvertFrom-Json $_ -DateKind String } |
+            Where-Object command -CEQ 'CapSelectorRefusal')
+        Assert-CapTest ($rows.Count -eq 1) 'Expected exactly one retained refusal diagnostic.'
+        return ConvertFrom-Json $rows[0].parameters.diagnosticJson -DateKind String
+    }
+    Invoke-CapTest 'selector refusal zero retains typed stage and candidate evidence' {
+        $candidate = [pscustomobject]@{
+            Name = 'Beta'; AutomationId = 'open-project-beta'; ProcessId = 4242
+            IsOffscreen = $false
+            BoundingRectangle = [pscustomobject]@{ Left = 12.0; Top = 20.0; Width = 200.0; Height = 24.0 }
+            ControlType = 'ControlType.Button'
+        }
+        $message = Assert-CapRejects {
+            Resolve-CapAutomationCandidate -Candidates @($candidate) -ExpectedProcessId 4242 `
+                -Name Alpha -AutomationIdPrefix 'open-project-'
+        } "Expected exactly one visible UIA element Name='Alpha' id='' prefix='open-project-'; found=0."
+        $records = @(Get-Content -LiteralPath (Join-Path $scratch 'test-calls.jsonl') |
+            ForEach-Object { ConvertFrom-Json $_ -DateKind String } |
+            Where-Object command -CEQ 'CapSelectorRefusal')
+        Assert-CapTest ($records.Count -eq 1) `
+            'Existing zero-match refusal occurred, but retained CapSelectorRefusal evidence is missing.'
+        $evidence = ConvertFrom-Json $records[0].parameters.diagnosticJson -DateKind String
+        Assert-CapTest ($evidence.schema -ceq 'CapSelectorRefusal/1' -and
+            $evidence.refusal.message -ceq $message -and $evidence.expectedProcessId -eq 4242 -and
+            $evidence.stageCounts.total -eq 1 -and $evidence.stageCounts.processOwned -eq 1 -and
+            $evidence.stageCounts.nameMatch -eq 0 -and $evidence.stageCounts.prefixMatch -eq 0 -and
+            $evidence.stageCounts.visible -eq 0 -and $evidence.stageCounts.bounds -eq 0) `
+            'Retained refusal does not bind the original message and cumulative exact selector stages.'
+        Assert-CapTest ($evidence.observedProcessIds.Count -eq 1 -and
+            $evidence.observedProcessIds[0] -is [long] -and $evidence.observedProcessIds[0] -eq 4242 -and
+            $evidence.candidates.Count -eq 1 -and $evidence.candidates[0].Name.value -ceq 'Beta' -and
+            $evidence.candidates[0].AutomationId.value -ceq 'open-project-beta' -and
+            $evidence.candidates[0].ProcessId.value -is [long] -and
+            $evidence.candidates[0].IsOffscreen.value -is [bool] -and
+            $evidence.candidates[0].BoundingRectangle.value.Width -eq 200 -and
+            $evidence.candidates[0].ControlType.value -ceq 'ControlType.Button') `
+            'Candidate evidence must contain actual typed scalar values, not CLR type names.'
+        return @{ originalRefusal = $message; evidence = $evidence; mode = 'Synthetic candidates; actual resolver and retained trace sink; no desktop.' }
+    }
+    Invoke-CapTest 'selector refusal ambiguity preserves original outcome and held context' {
+        $path = Join-Path $scratch 'selector-ambiguous.jsonl'
+        Set-CapTracePath $path
+        $context = @{ RootHandle = [IntPtr]77; RootProcessId = 4242; Scope = 'Descendants'; ParameterSet = 'Window'
+            ProcessIdentity = [pscustomobject]@{ Pid = 4242; CreationFileTimeUtc = 123456789L
+                ExpectedImagePath = 'C:\owned\fixture.exe'; Role = 'synthetic-held-generation' } }
+        $message = Assert-CapRejects {
+            Resolve-CapAutomationCandidate -Candidates @((New-SelectorCandidate), (New-SelectorCandidate)) `
+                -ExpectedProcessId 4242 -Name Alpha -AutomationIdPrefix 'open-project-' -RefusalContext $context
+        } "found=2."
+        $data = Read-SelectorEvidence $path
+        Assert-CapTest ($data.refusal.message -ceq $message -and $data.stageCounts.bounds -eq 2 -and
+            $data.heldContext.rootHandle -eq 77 -and $data.heldContext.identity.Pid.value -eq 4242 -and
+            $data.heldContext.identity.CreationFileTimeUtc.value -eq 123456789L -and
+            $data.stageCountsComplete -and $data.observedProcessIdRawCount -eq 2 -and
+            $data.observedProcessIdDistinctCount -eq 1) 'Ambiguity, held generation or actual PID multiplicity changed.'
+        $legacy = @(Get-Content $path | ForEach-Object { ConvertFrom-Json $_ } |
+            Where-Object command -CEQ 'Resolve-CapAutomationCandidate')
+        Assert-CapTest (-not $legacy[0].parameters.PSObject.Properties['RefusalContext']) 'Diagnostic context leaked into legacy trace.'
+        return $data
+    }
+    Invoke-CapTest 'selector refusal ownership records the full set without adopting foreign candidates' {
+        $path = Join-Path $scratch 'selector-ownership.jsonl'
+        Set-CapTracePath $path
+        $message = Assert-CapRejects {
+            Resolve-CapAutomationCandidate -Candidates @(
+                (New-SelectorCandidate -CandidateProcessId 9999),
+                (New-SelectorCandidate -Offscreen $true), (New-SelectorCandidate -CandidateName Beta)
+            ) -ExpectedProcessId 4242 -Name Alpha -AutomationIdPrefix 'open-project-'
+        } 'UIA subtree process 9999 does not match owned PID 4242.'
+        $data = Read-SelectorEvidence $path
+        Assert-CapTest ($data.refusal.message -ceq $message -and $data.stageCounts.total -eq 3 -and
+            $data.stageCounts.processOwned -eq 2 -and $data.stageCounts.nameMatch -eq 1 -and
+            $data.stageCounts.prefixMatch -eq 1 -and $data.stageCounts.visible -eq 0 -and
+            ($data.observedProcessIds -join ',') -ceq '9999,4242' -and $data.observedProcessIdRawCount -eq 3 -and
+            $data.heldContext.status -ceq 'NotObserved') 'Ownership refusal lost actual full-set stages/PIDs or invented held context.'
+        return $data
+    }
+    Invoke-CapTest 'selector refusal stages preserve exact optional ID prefix and offscreen rules' {
+        $candidates = @(
+            (New-SelectorCandidate -CandidateName Beta), (New-SelectorCandidate -Id unrelated),
+            (New-SelectorCandidate -Offscreen $true), (New-SelectorCandidate -Offscreen $true),
+            (New-SelectorCandidate -Width 0), (New-SelectorCandidate -Width 0)
+        )
+        $details = @()
+        foreach ($variant in @('prefix','offscreen','exact-id','inactive')) {
+            $path = Join-Path $scratch ("selector-stages-$variant.jsonl")
+            Set-CapTracePath $path
+            $parameters = @{ Candidates = $candidates; ExpectedProcessId = 4242; Name = 'Alpha' }
+            if ($variant -ne 'inactive') { $parameters.AutomationIdPrefix = 'open-project-' }
+            if ($variant -in @('offscreen','inactive')) { $parameters.AllowOffscreen = $true }
+            if ($variant -ceq 'exact-id') { $parameters.AutomationId = 'OPEN-PROJECT-alpha' }
+            $null = Assert-CapRejects { Resolve-CapAutomationCandidate @parameters } 'Expected exactly one visible UIA element'
+            $data = Read-SelectorEvidence $path
+            Assert-CapTest ($data.stageCounts.total -eq 6 -and $data.stageCounts.processOwned -eq 6 -and
+                $data.stageCounts.nameMatch -eq 5 -and $data.stageCountsComplete) 'Full-set process/name stage counts changed.'
+            switch ($variant) {
+                'prefix' { Assert-CapTest ($data.stageCounts.automationIdMatch -eq 5 -and
+                    $data.stageCounts.prefixMatch -eq 4 -and $data.stageCounts.visible -eq 2 -and $data.stageCounts.bounds -eq 0) 'Prefix/visibility/bounds counts changed.' }
+                'offscreen' { Assert-CapTest ($data.stageCounts.visible -eq 4 -and $data.stageCounts.bounds -eq 2) 'AllowOffscreen must count rule passage, not actual visibility.' }
+                'exact-id' { Assert-CapTest ($data.stageCounts.automationIdMatch -eq 0 -and $data.stageCounts.prefixMatch -eq 0) 'Exact ID must remain case-sensitive before prefix.' }
+                'inactive' { Assert-CapTest ($data.stageCounts.automationIdMatch -eq 5 -and
+                    $data.stageCounts.prefixMatch -eq 5 -and $data.stageCounts.visible -eq 5 -and $data.stageCounts.bounds -eq 3) 'Inactive rules must propagate their predecessor count.' }
+            }
+            $details += $data
+        }
+        return @{ subcases = $details.Count; evidence = $details }
+    }
+    Invoke-CapTest 'selector refusal caps retain deterministic near matches typed PIDs and Unicode boundaries' {
+        $path = Join-Path $scratch 'selector-caps.jsonl'
+        Set-CapTracePath $path
+        $unicode = ('x' * 511) + [char]0xd83d + [char]0xde80 + 'z'
+        $candidates = @(
+            foreach ($i in 0..97) {
+                New-SelectorCandidate -CandidateProcessId (7000 + $i) -CandidateName $unicode -Id $unicode
+            }
+            New-SelectorCandidate -Offscreen $true
+            New-SelectorCandidate -Offscreen $true
+        )
+        $null = Assert-CapRejects {
+            Resolve-CapAutomationCandidate -Candidates $candidates -ExpectedProcessId 4242 -Name Alpha -AutomationIdPrefix 'open-project-'
+        } 'UIA subtree process 7000'
+        $data = Read-SelectorEvidence $path
+        Assert-CapTest ($data.stageCounts.total -eq 100 -and $data.stageCounts.processOwned -eq 2 -and
+            $data.stageCounts.prefixMatch -eq 2 -and $data.candidates.Count -eq 16 -and
+            $data.candidatesOmitted -eq 84 -and
+            ($data.candidates.sourceIndex -join ',') -ceq '98,99,0,1,2,3,4,5,6,7,8,9,10,11,12,13') 'Candidate cap/order must prefer deepest stages with stable source ties.'
+        $nameField = $data.candidates[2].Name
+        Assert-CapTest ($nameField.value.Length -eq 511 -and $nameField.originalLength -eq 514 -and
+            $nameField.truncated -and -not [char]::IsHighSurrogate($nameField.value[-1]) -and
+            $data.candidates[2].AutomationId.value.Length -eq 511) 'Scalar truncation split a Unicode surrogate pair.'
+        $null = [Text.UTF8Encoding]::new($false, $true).GetBytes($nameField.value)
+        Assert-CapTest ($data.observedProcessIdRawCount -eq 100 -and $data.observedProcessIdDistinctCount -eq 99 -and
+            $data.observedProcessIdSampleCount -eq 64 -and $data.observedProcessIds.Count -eq 64 -and
+            $data.observedProcessIdsTruncated -and -not $data.observedProcessIdsComplete -and
+            $data.observedProcessIds[0] -eq 7000 -and $data.observedProcessIds[-1] -eq 7063 -and
+            @($data.observedProcessIds | Where-Object { $_ -isnot [long] }).Count -eq 0) 'PID sample is not a bounded typed actual primitive sample with honest counts.'
+        return $data
+    }
+    Invoke-CapTest 'selector refusal distinguishes missing null and property read errors' {
+        $path = Join-Path $scratch 'selector-errors.jsonl'
+        Set-CapTracePath $path
+        $missing = New-SelectorCandidate -CandidateName Beta
+        $missing.PSObject.Properties.Remove('ControlType')
+        $nullValue = New-SelectorCandidate -CandidateName Beta
+        $nullValue.ControlType = $null
+        $errorValue = New-SelectorCandidate -CandidateName Beta
+        $errorValue.PSObject.Properties.Remove('ControlType')
+        $errorValue | Add-Member -MemberType ScriptProperty -Name ControlType -Value { throw 'controltype-observation-error' }
+        $boundsError = New-SelectorCandidate -CandidateName Beta
+        $boundsError.BoundingRectangle = [pscustomobject]@{ Left = 1; Top = 2; Height = 3 }
+        $null = Assert-CapRejects {
+            Resolve-CapAutomationCandidate -Candidates @($missing,$nullValue,$errorValue,$boundsError) -ExpectedProcessId 4242 -Name Alpha
+        } 'found=0.'
+        $data = Read-SelectorEvidence $path
+        Assert-CapTest ($data.candidates[0].ControlType.status -ceq 'Missing' -and
+            $data.candidates[1].ControlType.status -ceq 'Null' -and
+            $data.candidates[2].ControlType.status -ceq 'ReadError' -and
+            $data.candidates[2].ControlType.error.value.Contains('controltype-observation-error') -and
+            $data.candidates[3].BoundingRectangle.status -ceq 'ReadError') 'Unavailable properties were fabricated or collapsed into empty scalar values.'
+        $badName = New-SelectorCandidate
+        $badName.PSObject.Properties.Remove('Name')
+        $path2 = Join-Path $scratch 'selector-stage-error.jsonl'
+        Set-CapTracePath $path2
+        $null = Assert-CapRejects {
+            Resolve-CapAutomationCandidate -Candidates @($badName) -ExpectedProcessId 4242 -Name Alpha
+        } "property 'Name'"
+        $incomplete = Read-SelectorEvidence $path2
+        Assert-CapTest (-not $incomplete.stageCountsComplete -and $incomplete.stageReadErrors.nameMatch -eq 1 -and
+            $incomplete.candidates[0].Name.status -ceq 'Missing') 'Stage read error was reported as complete negative matching.'
+        return @{ evidence = $data; incomplete = $incomplete }
+    }
+    Invoke-CapTest 'selector success performs no new diagnostic write property read or serialization' {
+        $path = Join-Path $scratch 'selector-success.jsonl'
+        Set-CapTracePath $path
+        $candidate = New-SelectorCandidate
+        $candidate.PSObject.Properties.Remove('ControlType')
+        $candidate | Add-Member -MemberType ScriptProperty -Name ControlType -Value { throw 'Success must not read diagnostic-only ControlType.' }
+        $module = Get-Module UiCaptureDriver
+        $serializationCount = & $module {
+            param($Candidate)
+            $script:SelectorSerializationCount = 0
+            function script:ConvertTo-Json {
+                [CmdletBinding()]
+                param([Parameter(ValueFromPipeline)]$InputObject, [int]$Depth, [switch]$Compress)
+                process {
+                    $script:SelectorSerializationCount++
+                    Microsoft.PowerShell.Utility\ConvertTo-Json -InputObject $InputObject -Depth $Depth -Compress:$Compress
+                }
+            }
+            try {
+                $selected = Resolve-CapAutomationCandidate -Candidates @($Candidate) -ExpectedProcessId 4242 -Name Alpha `
+                    -AutomationIdPrefix 'open-project-' -RefusalContext @{ NotReadOnSuccess = $true }
+                if (-not [object]::ReferenceEquals($selected, $Candidate)) { throw 'Success selection changed.' }
+                return $script:SelectorSerializationCount
+            } finally {
+                Remove-Item Function:\ConvertTo-Json
+                $restored = Get-Command ConvertTo-Json
+                if ($restored.CommandType -ne [Management.Automation.CommandTypes]::Cmdlet -or
+                    $restored.ModuleName -cne 'Microsoft.PowerShell.Utility') { throw 'Serialization spy command resolution was not restored.' }
+                Remove-Variable SelectorSerializationCount -Scope Script
+            }
+        } $candidate
+        $rows = @(Get-Content $path | ForEach-Object { ConvertFrom-Json $_ })
+        Assert-CapTest ($serializationCount -eq 2 -and $rows.Count -eq 2 -and
+            @($rows | Where-Object command -CEQ 'CapSelectorRefusal').Count -eq 0 -and
+            -not $rows[0].parameters.PSObject.Properties['RefusalContext']) `
+            'Successful selector added diagnostic serialization/writes beyond its two original legacy traces.'
+        return @{ actualSerializations = $serializationCount; legacyTraceWrites = $rows.Count; diagnosticWrites = 0 }
+    }
+    Invoke-CapTest 'selector observer failure surfaces explicitly without replacing original ErrorRecord' {
+        $path = Join-Path $scratch 'selector-observer-error.jsonl'
+        Set-CapTracePath $path
+        $before = @(Get-CapTraceFailures).Count
+        $errorRecord = $null
+        try {
+            try {
+                $null = Resolve-CapAutomationCandidate -Candidates @((New-SelectorCandidate -CandidateName Beta)) `
+                    -ExpectedProcessId 4242 -Name Alpha -RefusalContext @{
+                        RootProcessId = $null; RootHandle = 'deliberately-invalid-observer-context'
+                        Scope = 'Descendants'; ParameterSet = 'Window' }
+            } catch { $errorRecord = $_ }
+            $failures = @(Get-CapTraceFailures)
+            $invocation = if ($errorRecord) { $errorRecord.InvocationInfo } else { $null }
+            $invocationCommand = if ($null -ne $invocation) { $invocation.MyCommand } else { $null }
+            $commandNameProperty = if ($null -ne $invocationCommand) { $invocationCommand.PSObject.Properties['Name'] } else { $null }
+            Write-JournalContractJson (Join-Path $scratch 'selector-observer-error-fields.json') @{
+                errorObserved = ($null -ne $errorRecord)
+                exceptionType = if ($errorRecord) { $errorRecord.Exception.GetType().FullName } else { $null }
+                message = if ($errorRecord) { $errorRecord.Exception.Message } else { $null }
+                fullyQualifiedErrorId = if ($errorRecord) { $errorRecord.FullyQualifiedErrorId } else { $null }
+                category = if ($errorRecord) { [string]$errorRecord.CategoryInfo.Category } else { $null }
+                invocationObserved = ($null -ne $invocation)
+                invocationCommandObserved = ($null -ne $invocationCommand)
+                invocationCommandType = if ($null -ne $invocationCommand) { $invocationCommand.GetType().FullName } else { $null }
+                invocationCommandNameObserved = ($null -ne $commandNameProperty)
+                invocationCommand = if ($null -ne $commandNameProperty) { $commandNameProperty.Value } else { $null }
+                invocationPosition = if ($null -ne $invocation) { $invocation.PositionMessage } else { $null }
+                scriptStackTrace = if ($errorRecord) { $errorRecord.ScriptStackTrace } else { $null }
+                traceFailuresBefore = $before; traceFailuresAfter = $failures.Count; traceFailures = $failures
+            }
+            Assert-CapTest ($null -ne $errorRecord -and $errorRecord.Exception -is [Management.Automation.RuntimeException] -and
+                $errorRecord.Exception.Message -ceq "Expected exactly one visible UIA element Name='Alpha' id='' prefix=''; found=0." -and
+                $errorRecord.FullyQualifiedErrorId -ceq $errorRecord.Exception.Message -and
+                $errorRecord.CategoryInfo.Category -eq [Management.Automation.ErrorCategory]::OperationStopped -and
+                $errorRecord.InvocationInfo.ScriptName -ceq $modulePath -and
+                $errorRecord.InvocationInfo.PositionMessage.Contains('throw "Expected exactly one visible UIA element') -and
+                $errorRecord.ScriptStackTrace.StartsWith('at Resolve-CapAutomationCandidate,', [StringComparison]::Ordinal) -and
+                $failures.Count -eq ($before + 1) -and $failures[-1].command -ceq 'CapSelectorRefusal') `
+                'Observer error masked the original selector ErrorRecord or failed silently.'
+            return @{ originalMessage = $errorRecord.Exception.Message; originalType = $errorRecord.Exception.GetType().FullName
+                surfacedObserverFailure = $failures[-1]; note = 'Deliberate invalid diagnostic context only; selector unchanged.' }
+        } finally {
+            & (Get-Module UiCaptureDriver) { param($Count)
+                while ($script:CapTraceFailures.Count -gt $Count) { $script:CapTraceFailures.RemoveAt($script:CapTraceFailures.Count - 1) }
+            } $before
+        }
+    }
+    function Invoke-SelectorWaitFixture {
+        param([string]$CaseName, [switch]$EventuallySucceeds, [switch]$NoSink, [switch]$BrokenObserver,
+            [switch]$StaleLastPoll)
+        $path = Join-Path $scratch ("selector-wait-$CaseName.jsonl")
+        Set-CapTracePath $path
+        $meter = [pscustomobject]@{ polls = 0; diagnosticReads = 0; diagnosticSerializations = 0; currentReads = 0
+            inBudgetReads = 0; deadline = [DateTime]::UtcNow.AddSeconds(2); lastCandidate = $null
+            lastPoll = $null; failure = $null; selected = $null; snapshot = $null }
+        $module = Get-Module UiCaptureDriver
+        $failuresBefore = @(Get-CapTraceFailures).Count
+        & $module {
+            param($Meter, [bool]$NoSink)
+            $script:SelectorWaitMeter = $Meter
+            if ($NoSink) { $script:CapTracePath = $null }
+            function script:ConvertTo-Json {
+                [CmdletBinding()]
+                param([Parameter(ValueFromPipeline)]$InputObject, [int]$Depth, [switch]$Compress)
+                process {
+                    if ($InputObject -is [Collections.IDictionary] -and $InputObject.Contains('schema') -and
+                        $InputObject['schema'] -ceq 'CapSelectorRefusal/1') { $script:SelectorWaitMeter.diagnosticSerializations++ }
+                    Microsoft.PowerShell.Utility\ConvertTo-Json -InputObject $InputObject -Depth $Depth -Compress:$Compress
+                }
+            }
+        } $meter $NoSink.IsPresent
+        try {
+            $ast = [Management.Automation.Language.Parser]::ParseFile($workerPath,[ref]$null,[ref]$null)
+            foreach ($functionName in @('Wait-CapVisibleElement','Assert-CapWorkerDeadline')) {
+                $definitions = @($ast.FindAll({ param($node)
+                    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $functionName
+                },$true))
+                Assert-CapTest ($definitions.Count -eq 1) 'Actual worker wait/deadline function is missing or duplicated.'
+                . ([scriptblock]::Create($definitions[0].Extent.Text))
+            }
+            function Find-CapAutomationElement {
+                param([IntPtr]$RootHandle, $ProcessIdentity, [string]$Name, [string]$AutomationId,
+                    [string]$AutomationIdPrefix, [switch]$AllowOffscreen, [ref]$RefusalSnapshot)
+                $meter.polls++
+                $meter.lastPoll = [DateTime]::UtcNow
+                $candidate = New-SelectorCandidate -CandidateName ("Beta-" + $meter.polls)
+                if ($EventuallySucceeds -and $meter.polls -ge 2) { $candidate.Name = 'Alpha' }
+                $candidate.PSObject.Properties.Remove('ControlType')
+                $capturedMeter = $meter
+                $getter = {
+                    $capturedMeter.diagnosticReads++
+                    if ([DateTime]::UtcNow -lt $capturedMeter.deadline) { $capturedMeter.inBudgetReads++ }
+                    return 'ControlType.Button'
+                }.GetNewClosure()
+                $candidate | Add-Member -MemberType ScriptProperty -Name ControlType -Value $getter
+                $meter.lastCandidate = $candidate
+                $parameters = @{ Candidates = @($candidate); ExpectedProcessId = 4242; Name = $Name
+                    AutomationId = $AutomationId; AutomationIdPrefix = $AutomationIdPrefix; AllowOffscreen = $AllowOffscreen
+                    RefusalContext = @{ RootHandle = $RootHandle; RootProcessId = 4242; ProcessIdentity = $ProcessIdentity
+                        Scope = 'Descendants'; ParameterSet = 'Window' } }
+                if ($null -ne $RefusalSnapshot) { $parameters.RefusalSnapshot = $RefusalSnapshot }
+                if ($BrokenObserver) {
+                    $parameters.RefusalContext = @{ RootProcessId = $null; RootHandle = 'deliberately-invalid-observer-context'
+                        Scope = 'Descendants'; ParameterSet = 'Window' }
+                }
+                try { return Resolve-CapAutomationCandidate @parameters }
+                catch {
+                    if ($null -ne $RefusalSnapshot) { $meter.snapshot = $RefusalSnapshot.Value }
+                    if ($StaleLastPoll) {
+                        $staleGetter = { $capturedMeter.currentReads++; throw 'last-poll-element-vanished' }.GetNewClosure()
+                        $candidate | Add-Member -MemberType ScriptProperty -Name Current -Value $staleGetter
+                    }
+                    throw
+                }
+            }
+            $leaseDeadlineUtc = $meter.deadline
+            try {
+                $meter.selected = Wait-CapVisibleElement -Window ([IntPtr]77) -ProcessIdentity ([pscustomobject]@{ Pid = 4242 }) `
+                    -Name Alpha -AutomationIdPrefix 'open-project-'
+            } catch { $meter.failure = $_ }
+            $rows = @()
+            if (Test-Path $path) { $rows = @(Get-Content $path | ForEach-Object { ConvertFrom-Json $_ -DateKind String }) }
+            $caught = $meter.failure
+            $fixtureFailures = @(Get-CapTraceFailures)
+            Write-JournalContractJson (Join-Path $scratch ("selector-wait-$CaseName-fields.json")) ([ordered]@{
+                polls = $meter.polls; diagnosticReads = $meter.diagnosticReads; currentReads = $meter.currentReads
+                diagnosticSerializations = $meter.diagnosticSerializations; inBudgetReads = $meter.inBudgetReads
+                deadlineUtc = $meter.deadline.ToString('o')
+                lastQueryUtc = if ($null -ne $meter.lastPoll) { $meter.lastPoll.ToString('o') } else { $null }
+                snapshotObserved = ($null -ne $meter.snapshot)
+                emissionAttempted = if ($null -ne $meter.snapshot -and $meter.snapshot.Contains('EmissionAttempted')) {
+                    $meter.snapshot.EmissionAttempted
+                } else { $null }
+                selectedObserved = ($null -ne $meter.selected); errorObserved = ($null -ne $caught)
+                exceptionType = if ($null -ne $caught) { $caught.Exception.GetType().FullName } else { $null }
+                message = if ($null -ne $caught) { $caught.Exception.Message } else { $null }
+                fullyQualifiedErrorId = if ($null -ne $caught) { $caught.FullyQualifiedErrorId } else { $null }
+                category = if ($null -ne $caught) { [string]$caught.CategoryInfo.Category } else { $null }
+                scriptStackTrace = if ($null -ne $caught) { $caught.ScriptStackTrace } else { $null }
+                traceRows = $rows.Count; traceFailuresBefore = $failuresBefore
+                traceFailuresAfter = $fixtureFailures.Count
+                traceFailures = @($fixtureFailures | Select-Object command,path,failure)
+            })
+            return [pscustomobject]@{ meter = $meter; tracePath = $path; rows = $rows
+                traceFailures = $fixtureFailures; traceFailuresBefore = $failuresBefore }
+        } finally {
+            & $module {
+                param($Count)
+                Remove-Item Function:\ConvertTo-Json
+                if ((Get-Command ConvertTo-Json).CommandType -ne [Management.Automation.CommandTypes]::Cmdlet) {
+                    throw 'Wait serialization spy was not removed.'
+                }
+                Remove-Variable SelectorWaitMeter -Scope Script
+                while ($script:CapTraceFailures.Count -gt $Count) { $script:CapTraceFailures.RemoveAt($script:CapTraceFailures.Count - 1) }
+            } $failuresBefore
+            Set-CapTracePath -Path (Join-Path $scratch 'test-calls.jsonl')
+        }
+    }
+    Invoke-CapTest 'actual worker wait eventual success performs zero refusal observation work' {
+        $run = Invoke-SelectorWaitFixture -CaseName success -EventuallySucceeds
+        Assert-CapTest ($null -eq $run.meter.failure -and $run.meter.polls -eq 2 -and
+            [object]::ReferenceEquals($run.meter.selected, $run.meter.lastCandidate)) 'Actual worker wait did not select its second synthetic query result.'
+        Assert-CapTest ($run.meter.diagnosticReads -eq 0 -and $run.meter.diagnosticSerializations -eq 0 -and
+            @($run.rows | Where-Object command -CEQ 'CapSelectorRefusal').Count -eq 0) `
+            'Eventually successful actual worker wait performed refusal diagnostic reads, serialization or writes inside polling.'
+        return @{ polls = $run.meter.polls; diagnosticReads = $run.meter.diagnosticReads
+            diagnosticSerializations = $run.meter.diagnosticSerializations; diagnosticWrites = 0
+            mode = 'Actual worker wait/deadline and resolver; synthetic query leaf only; real 100ms cadence.' }
+    }
+    Invoke-CapTest 'actual worker terminal refusal observes only last poll references after deadline' {
+        $run = Invoke-SelectorWaitFixture -CaseName terminal
+        Assert-CapTest ($run.meter.polls -ge 2 -and $null -ne $run.meter.failure -and
+            $run.meter.failure.Exception.Message -ceq "UIA element 'Alpha' did not become available before the reserved deadline.") `
+            'Actual worker did not preserve its original terminal timeout refusal.'
+        $data = Read-SelectorEvidence $run.tracePath
+        $observedAt = [DateTime]::Parse($data.propertyReadStartedUtc).ToUniversalTime()
+        $polledAt = [DateTime]::Parse($data.terminalObservation.lastPollUtc).ToUniversalTime()
+        Assert-CapTest ($run.meter.diagnosticReads -eq 1 -and $run.meter.diagnosticSerializations -eq 1 -and
+            $run.meter.inBudgetReads -eq 0 -and $data.evidenceKind -ceq 'TERMINAL_LAST_POLL_SNAPSHOT' -and
+            $data.candidates[0].Name.value -ceq ("Beta-" + $run.meter.polls) -and
+            $observedAt -ge $run.meter.deadline -and $polledAt -le $run.meter.lastPoll -and
+            [DateTime]::Parse($data.terminalObservation.waitDeadlineUtc).ToUniversalTime() -eq $run.meter.deadline -and
+            $data.heldContext.rootHandle -eq 77 -and $data.heldContext.identity.Pid.value -eq 4242) `
+            'Terminal observation queried again, observed a prior poll, or read properties inside the wait budget.'
+        $stale = Invoke-SelectorWaitFixture -CaseName stale -StaleLastPoll
+        $staleData = Read-SelectorEvidence $stale.tracePath
+        Assert-CapTest ($stale.meter.polls -ge 2 -and $stale.meter.currentReads -eq 1 -and
+            $staleData.candidates[0].currentStatus -ceq 'ReadError' -and
+            $staleData.candidates[0].current.error.value.Contains('last-poll-element-vanished') -and
+            $staleData.candidates[0].Name.status -ceq 'ReadError' -and
+            -not $staleData.stageCountsComplete -and $staleData.observedProcessIds.Count -eq 0) `
+            'Stale Current getter was collapsed into null/missing or caused a fresh query/invented PID.'
+        return @{ polls = $run.meter.polls; evidence = $data; staleEvidence = $staleData
+            staleCurrentReads = $stale.meter.currentReads; queriesAfterLastPoll = 0 }
+    }
+    Invoke-CapTest 'selector special rectangle values retain successful reads and the original raw predicate' {
+        $path = Join-Path $scratch 'selector-special-bounds.jsonl'
+        Set-CapTracePath $path
+        $empty = New-SelectorCandidate
+        $empty.BoundingRectangle = [pscustomobject]@{
+            Left = [double]::PositiveInfinity; Top = [double]::PositiveInfinity
+            Width = [double]::NegativeInfinity; Height = [double]::NegativeInfinity
+        }
+        $nan = New-SelectorCandidate
+        $nan.BoundingRectangle.Width = [double]::NaN
+        $infinity = New-SelectorCandidate
+        $infinity.BoundingRectangle.Width = [double]::PositiveInfinity
+        $candidates = @($empty,$nan,$nan,$infinity,$infinity)
+        $expected = 0
+        foreach ($candidate in $candidates) {
+            $rect = $candidate.BoundingRectangle
+            if ($null -eq $rect -or $rect.Width -le 0 -or $rect.Height -le 0) { continue }
+            $expected++
+        }
+        $null = Assert-CapRejects {
+            Resolve-CapAutomationCandidate -Candidates $candidates -ExpectedProcessId 4242 -Name Alpha
+        } "found=$expected."
+        $data = Read-SelectorEvidence $path
+        $byIndex = @($data.candidates | Sort-Object sourceIndex)
+        Assert-CapTest ($data.stageCounts.bounds -eq $expected -and $data.stageCountsComplete -and
+            $data.stageReadErrors.bounds -eq 0 -and
+            @($data.candidates | Where-Object { $_.BoundingRectangle.status -cne 'Value' -or
+                -not $_.BoundingRectangle.propertyReadSucceeded }).Count -eq 0 -and
+            $byIndex[0].BoundingRectangle.rectangleKind -ceq 'Empty' -and
+            $byIndex[0].BoundingRectangle.value.Width.numberKind -ceq 'NegativeInfinity' -and
+            $byIndex[0].BoundingRectangle.value.Left.numberKind -ceq 'PositiveInfinity' -and
+            $byIndex[1].BoundingRectangle.value.Width.numberKind -ceq 'NaN' -and
+            $byIndex[3].BoundingRectangle.value.Width.numberKind -ceq 'PositiveInfinity') `
+            'Successful special-number reads were mislabeled ReadError or changed the original raw bounds predicate.'
+        return @{ expectedByOriginalPredicate = $expected; evidence = $data
+            fixture = 'SYNTHETIC canonical Rect.Empty numeric shape; not a genuine WPF instance or live UIA.' }
+    }
+    Invoke-CapTest 'actual worker no sink terminal refusal performs zero observation or serialization work' {
+        $run = Invoke-SelectorWaitFixture -CaseName no-sink -NoSink
+        Assert-CapTest ($run.meter.polls -ge 2 -and $null -ne $run.meter.failure -and
+            $run.meter.diagnosticReads -eq 0 -and $run.meter.currentReads -eq 0 -and
+            $run.meter.diagnosticSerializations -eq 0 -and $null -eq $run.meter.snapshot -and
+            $run.rows.Count -eq 0 -and -not (Test-Path $run.tracePath)) `
+            'Missing trace sink still retained/prepared diagnostic context, read properties, serialized or wrote.'
+        return @{ polls = $run.meter.polls; diagnosticReads = 0; diagnosticSerializations = 0; writes = 0 }
+    }
+    Invoke-CapTest 'actual worker observer failure is attempted once per wait and preserves terminal refusal' {
+        $run = Invoke-SelectorWaitFixture -CaseName observer-error -BrokenObserver
+        Assert-CapTest ($run.meter.polls -ge 2 -and $null -ne $run.meter.failure -and
+            $run.meter.failure.Exception.Message -ceq "UIA element 'Alpha' did not become available before the reserved deadline." -and
+            $run.meter.failure.FullyQualifiedErrorId -ceq $run.meter.failure.Exception.Message -and
+            $run.meter.failure.CategoryInfo.Category -eq [Management.Automation.ErrorCategory]::OperationStopped -and
+            $run.meter.diagnosticReads -eq 1 -and $run.meter.inBudgetReads -eq 0 -and
+            $run.traceFailures.Count -eq ($run.traceFailuresBefore + 1) -and
+            $run.traceFailures[-1].command -ceq 'CapSelectorRefusal' -and $run.meter.snapshot.EmissionAttempted) `
+            'Observer failure ran inside polling, repeated, or masked the original worker terminal refusal.'
+        $before = @(Get-CapTraceFailures).Count
+        Write-CapTerminalSelectorRefusal -Snapshot $run.meter.snapshot -Refusal $run.meter.failure `
+            -PollUtc $run.meter.lastPoll -DeadlineUtc $run.meter.deadline
+        Assert-CapTest ($run.meter.diagnosticReads -eq 1 -and @(Get-CapTraceFailures).Count -eq $before) `
+            'Already attempted wait snapshot emitted or failed a second time.'
+        return @{ polls = $run.meter.polls; originalMessage = $run.meter.failure.Exception.Message
+            observerAttempts = 1; explicitFailure = $run.traceFailures[-1] }
+    }
+    Set-CapTracePath -Path (Join-Path $scratch 'test-calls.jsonl')
+}
+
+if ($SelectorRefusalContractOnly) {
+    Invoke-CapSelectorRefusalContracts
+    $passed = @($results | Where-Object passed -EQ $true).Count
+    $failed = @($results | Where-Object passed -EQ $false).Count
+    $report = [pscustomobject]@{ suite = 'UiCaptureSelectorRefusalContracts'; executed = $results.Count
+        passed = $passed; failed = $failed; cases = @($results); sourceHashesBeforeImport = $sourceHashesBefore
+        mode = 'SYNTHETIC_CANDIDATES_ACTUAL_RESOLVER_AND_TRACE_NO_DESKTOP' }
+    $report | ConvertTo-Json -Depth 25 | Set-Content -LiteralPath (Join-Path $scratch 'report.json') -Encoding utf8NoBOM
+    $report | Select-Object suite,executed,passed,failed | ConvertTo-Json -Compress
+    if ($results.Count -ne 13 -or $passed -ne 13 -or $failed -ne 0) { exit 1 }
+    exit 0
+}
+
 if ($PreflightReportContractOnly) {
     Invoke-CapTest 'actual rehearsal data satisfies the repaired report gate and refuses stale proof' { Invoke-CapPreflightReportContract }
     $passed = @($results | Where-Object passed -EQ $true).Count
@@ -2284,6 +2780,7 @@ try {
     } else {
     $cimRaceTarget = $prebuilt.CimRace
     if (-not $LaunchContractOnly) {
+        Invoke-CapSelectorRefusalContracts
         Invoke-CapTest 'prebuilt fixture binder accepts exact artifacts and refuses missing or tampered bytes' { Invoke-CapPrebuiltFixtureContract }
         Invoke-CapTest 'journal phase timing records open copy total without changing budget or retry limits' { Invoke-CapJournalTimingContract }
         Invoke-CapFirstOpenGroups
@@ -3287,6 +3784,6 @@ try {
 }
 [ordered]@{ suite = $suiteName; executed = $results.Count; passed = $passed; failed = $failed; artifacts = $scratch } |
     ConvertTo-Json -Compress
-$expectedCount = if ($JournalContractOnly) { 10 } elseif ($LaunchContractOnly) { 2 } elseif ($RequireRealSeed) { 75 } else { 72 }
+$expectedCount = if ($JournalContractOnly) { 10 } elseif ($LaunchContractOnly) { 2 } elseif ($RequireRealSeed) { 88 } else { 85 }
 if ($results.Count -ne $expectedCount -or $failed -ne 0 -or $passed -ne $results.Count) { exit 1 }
 exit 0

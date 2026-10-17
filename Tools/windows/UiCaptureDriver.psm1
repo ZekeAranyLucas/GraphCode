@@ -930,6 +930,266 @@ function Assert-CapUiaProcessIds {
     return $true
 }
 
+function Write-CapSelectorRefusal {
+    param($Candidates, [bool]$CandidatesObserved, [Nullable[int]]$ExpectedProcessId, [string]$Name,
+        [string]$AutomationId, [string]$AutomationIdPrefix, [bool]$AllowOffscreen,
+        [Management.Automation.ErrorRecord]$Refusal, $Context, $TerminalObservation)
+    if (-not $script:CapTracePath) { return }
+    try {
+        $propertyReadStartedUtc = [DateTime]::UtcNow.ToString('o')
+        function Limit-RefusalString {
+            param([string]$Value, [int]$Limit = 512)
+            $length = $Value.Length
+            $take = [Math]::Min($length, $Limit)
+            if ($take -gt 0 -and $take -lt $length -and [char]::IsHighSurrogate($Value[$take - 1])) { $take-- }
+            $text = [Text.StringBuilder]::new($take)
+            $replaced = $false
+            for ($i = 0; $i -lt $take; $i++) {
+                $character = $Value[$i]
+                if ([char]::IsHighSurrogate($character) -and $i + 1 -lt $take -and [char]::IsLowSurrogate($Value[$i + 1])) {
+                    $null = $text.Append($character).Append($Value[++$i])
+                } elseif ([char]::IsSurrogate($character)) {
+                    $null = $text.Append([char]0xfffd)
+                    $replaced = $true
+                } else { $null = $text.Append($character) }
+            }
+            return [ordered]@{ value = $text.ToString(); originalLength = $length; truncated = ($take -lt $length)
+                invalidSurrogatesReplaced = $replaced }
+        }
+        function Read-RefusalField {
+            param($Object, [string]$Property, [string]$Kind = 'String', [int]$Limit = 512)
+            $record = [ordered]@{ status = 'Missing'; value = $null; propertyReadSucceeded = $null }
+            $raw = $null
+            try {
+                if ($null -ne $Object -and $Object.PSObject.Properties[$Property]) {
+                    $raw = $Object.PSObject.Properties[$Property].get_Value()
+                    $record.propertyReadSucceeded = $true
+                    if ($null -eq $raw) { $record.status = 'Null' }
+                    else {
+                        $record.status = 'Value'
+                        switch ($Kind) {
+                            'Current' { }
+                            'Int' {
+                                if (($raw -isnot [int] -and $raw -isnot [long]) -or
+                                    $raw -lt [int]::MinValue -or $raw -gt [int]::MaxValue) { throw 'Not an Int32 primitive.' }
+                                $record.value = [int]$raw
+                            }
+                            'Long' {
+                                if ($raw -isnot [int] -and $raw -isnot [long]) { throw 'Not an Int64 primitive.' }
+                                $record.value = [long]$raw
+                            }
+                            'Bool' {
+                                if ($raw -isnot [bool]) { throw 'Not a Boolean primitive.' }
+                                $record.value = $raw
+                            }
+                            'Rectangle' {
+                                $rectangle = [ordered]@{}
+                                $numbers = [ordered]@{}
+                                foreach ($part in @('Left','Top','Width','Height')) {
+                                    $partProperty = $raw.PSObject.Properties[$part]
+                                    if ($null -eq $partProperty) { throw "Rectangle property '$part' is missing." }
+                                    $number = [double]$partProperty.get_Value()
+                                    $numbers[$part] = $number
+                                    $rectangle[$part] = if ([double]::IsNaN($number)) {
+                                        [ordered]@{ numberKind = 'NaN' }
+                                    } elseif ([double]::IsPositiveInfinity($number)) {
+                                        [ordered]@{ numberKind = 'PositiveInfinity' }
+                                    } elseif ([double]::IsNegativeInfinity($number)) {
+                                        [ordered]@{ numberKind = 'NegativeInfinity' }
+                                    } else { $number }
+                                }
+                                $record.value = $rectangle
+                                $record.rectangleKind = if ([double]::IsPositiveInfinity($numbers.Left) -and
+                                    [double]::IsPositiveInfinity($numbers.Top) -and
+                                    [double]::IsNegativeInfinity($numbers.Width) -and
+                                    [double]::IsNegativeInfinity($numbers.Height)) { 'Empty' } else { 'Rectangle' }
+                            }
+                            default {
+                                $text = if ($Kind -ceq 'ControlType' -and $raw -isnot [string]) {
+                                    [string]$raw.ProgrammaticName
+                                } else { [string]$raw }
+                                $bounded = Limit-RefusalString $text $Limit
+                                $record.value = $bounded.value
+                                $record.originalLength = $bounded.originalLength
+                                $record.truncated = $bounded.truncated
+                                $record.invalidSurrogatesReplaced = $bounded.invalidSurrogatesReplaced
+                            }
+                        }
+                    }
+                }
+            } catch {
+                $record.status = 'ReadError'
+                $record.value = $null
+                $record.propertyReadSucceeded = $false
+                $record.error = Limit-RefusalString $_.Exception.Message 256
+                $record.errorType = (Limit-RefusalString $_.Exception.GetType().FullName 128).value
+            }
+            return [pscustomobject]@{ Raw = $raw; Record = $record }
+        }
+        $counts = [ordered]@{ total = $null; processOwned = $null; nameMatch = $null; automationIdMatch = $null
+            prefixMatch = $null; visible = $null; bounds = $null }
+        $stageErrors = [ordered]@{ processOwned = 0; nameMatch = 0; automationIdMatch = 0; prefixMatch = 0; visible = 0; bounds = 0 }
+        $sample = [Collections.Generic.List[object]]::new()
+        $pids = [Collections.Generic.HashSet[int]]::new()
+        $pidSample = [Collections.Generic.List[int]]::new()
+        $rawPidCount = 0
+        $pidUnavailableCount = 0
+        if ($CandidatesObserved) {
+            foreach ($key in @($counts.Keys)) { $counts[$key] = 0 }
+            $index = 0
+            foreach ($candidate in $Candidates) {
+                $counts.total++
+                $current = $candidate
+                $currentStatus = 'Value'
+                $currentRecord = [ordered]@{ status = 'DirectCandidate'; propertyReadSucceeded = $null }
+                if ($null -eq $candidate) { $currentStatus = 'Null' }
+                elseif ($candidate.PSObject.Properties['Current']) {
+                    $reading = Read-RefusalField $candidate 'Current' 'Current'
+                    $current = $reading.Raw
+                    $currentRecord = $reading.Record
+                    $currentStatus = $reading.Record.status
+                }
+                $fields = [ordered]@{}
+                foreach ($spec in @(
+                    @('Name','String',512), @('AutomationId','String',512), @('ProcessId','Int',512),
+                    @('IsOffscreen','Bool',512), @('BoundingRectangle','Rectangle',512), @('ControlType','ControlType',128)
+                )) {
+                    $field = Read-RefusalField $current $spec[0] $spec[1] $spec[2]
+                    if ($currentStatus -ceq 'ReadError') {
+                        $field.Record.status = 'ReadError'
+                        $field.Record.propertyReadSucceeded = $false
+                        $field.Record.error = $currentRecord.error
+                        $field.Record.errorType = $currentRecord.errorType
+                    }
+                    $fields[$spec[0]] = $field
+                }
+                $pidField = $fields.ProcessId
+                if ($pidField.Record.status -ceq 'Value') {
+                    $rawPidCount++
+                    if ($pids.Add([int]$pidField.Raw) -and $pidSample.Count -lt 64) { $pidSample.Add([int]$pidField.Raw) }
+                } else { $pidUnavailableCount++ }
+                $eligible = $true
+                $rank = 0
+                foreach ($stage in @('processOwned','nameMatch','automationIdMatch','prefixMatch','visible','bounds')) {
+                    if (-not $eligible) { break }
+                    $fieldName = switch ($stage) {
+                        'processOwned' { 'ProcessId' }
+                        'nameMatch' { 'Name' }
+                        'automationIdMatch' { 'AutomationId' }
+                        'prefixMatch' { 'AutomationId' }
+                        'visible' { 'IsOffscreen' }
+                        'bounds' { 'BoundingRectangle' }
+                    }
+                    $inactive = ($stage -ceq 'automationIdMatch' -and -not $AutomationId) -or
+                        ($stage -ceq 'prefixMatch' -and -not $AutomationIdPrefix) -or
+                        ($stage -ceq 'visible' -and $AllowOffscreen)
+                    $field = $fields[$fieldName]
+                    if (-not $inactive -and $field.Record.status -in @('Missing','ReadError')) {
+                        $stageErrors[$stage]++
+                        $eligible = $false
+                        break
+                    }
+                    $eligible = $inactive -or $(switch ($stage) {
+                        'processOwned' { $field.Record.status -ceq 'Value' -and [int]$field.Raw -eq $ExpectedProcessId -and [int]$field.Raw -gt 0 }
+                        'nameMatch' { [string]$field.Raw -ceq $Name }
+                        'automationIdMatch' { [string]$field.Raw -ceq $AutomationId }
+                        'prefixMatch' { ([string]$field.Raw).StartsWith($AutomationIdPrefix, [StringComparison]::Ordinal) }
+                        'visible' { -not [bool]$field.Raw }
+                        'bounds' { -not ($null -eq $field.Raw -or $field.Raw.Width -le 0 -or $field.Raw.Height -le 0) }
+                    })
+                    if ($eligible) { $counts[$stage]++; $rank++ }
+                }
+                $row = [ordered]@{ sourceIndex = $index; passedStages = $rank; currentStatus = $currentStatus
+                    current = $currentRecord }
+                foreach ($key in $fields.Keys) { $row[$key] = $fields[$key].Record }
+                $sample.Add([pscustomobject]$row)
+                if ($sample.Count -gt 16) {
+                    $worst = 0
+                    for ($i = 1; $i -lt $sample.Count; $i++) {
+                        if ($sample[$i].passedStages -lt $sample[$worst].passedStages -or
+                            ($sample[$i].passedStages -eq $sample[$worst].passedStages -and
+                                $sample[$i].sourceIndex -gt $sample[$worst].sourceIndex)) { $worst = $i }
+                    }
+                    $sample.RemoveAt($worst)
+                }
+                $index++
+            }
+        }
+        $held = [ordered]@{ status = 'NotObserved' }
+        if ($null -ne $Context) {
+            $held = [ordered]@{ status = 'Observed'; rootHandle = $null; rootProcessId = $Context.RootProcessId
+                rootProcessIdStatus = if ($null -eq $Context.RootProcessId) { 'NotObserved' } else { 'Observed' }
+                parameterSet = [string]$Context.ParameterSet; scope = [string]$Context.Scope
+                identity = [ordered]@{} }
+            if ($null -ne $Context.RootHandle) { $held.rootHandle = $Context.RootHandle.ToInt64() }
+            foreach ($property in @('Pid','CreationFileTimeUtc','ExpectedImagePath','Role')) {
+                $kind = if ($property -ceq 'Pid') { 'Int' } elseif ($property -ceq 'CreationFileTimeUtc') { 'Long' } else { 'String' }
+                $held.identity[$property] = (Read-RefusalField $Context.ProcessIdentity $property $kind).Record
+            }
+        }
+        $complete = $CandidatesObserved
+        foreach ($key in $stageErrors.Keys) { if ($stageErrors[$key] -gt 0) { $complete = $false } }
+        $diagnostic = [ordered]@{
+            schema = 'CapSelectorRefusal/1'
+            evidenceKind = if ($null -ne $TerminalObservation) { 'TERMINAL_LAST_POLL_SNAPSHOT' } else { 'DIRECT_SELECTOR_REFUSAL' }
+            terminalObservation = $TerminalObservation
+            propertyReadStartedUtc = $propertyReadStartedUtc
+            selector = [ordered]@{ Name = Limit-RefusalString $Name; AutomationId = Limit-RefusalString $AutomationId
+                AutomationIdPrefix = Limit-RefusalString $AutomationIdPrefix; allowOffscreen = $AllowOffscreen }
+            expectedProcessId = $ExpectedProcessId; heldContext = $held
+            refusal = [ordered]@{ type = $Refusal.Exception.GetType().FullName
+                message = (Limit-RefusalString $Refusal.Exception.Message 1024).value
+                messageLength = $Refusal.Exception.Message.Length; messageTruncated = ($Refusal.Exception.Message.Length -gt 1024) }
+            candidatesObserved = $CandidatesObserved; stageCounts = $counts; stageReadErrors = $stageErrors
+            stageCountsComplete = $complete
+            samplePolicy = 'deepest-passed-stage-then-source-index'; candidateLimit = 16
+            candidateSampleCount = $sample.Count
+            candidatesOmitted = if ($CandidatesObserved) { $counts.total - $sample.Count } else { $null }
+            candidates = @($sample | Sort-Object @{ Expression = 'passedStages'; Descending = $true }, sourceIndex)
+            observedProcessIds = @($pidSample.ToArray()); observedProcessIdLimit = 64
+            observedProcessIdRawCount = $rawPidCount; observedProcessIdDistinctCount = $pids.Count
+            observedProcessIdSampleCount = $pidSample.Count; observedProcessIdsTruncated = ($pids.Count -gt 64)
+            observedProcessIdsComplete = ($CandidatesObserved -and $pidUnavailableCount -eq 0 -and $pids.Count -le 64)
+            observedProcessIdUnavailableCount = $pidUnavailableCount
+        }
+        $json = ConvertTo-Json -InputObject $diagnostic -Depth 16 -Compress
+        Write-CapTrace -Command 'CapSelectorRefusal' -Parameters @{ diagnosticJson = $json }
+    } catch {
+        if (-not @($script:CapTraceFailures | Where-Object command -CEQ 'CapSelectorRefusal').Count) {
+            $script:CapTraceFailures.Add([pscustomobject]@{
+                command = 'CapSelectorRefusal'; path = $script:CapTracePath; failure = $_.Exception.ToString()
+            })
+            [Console]::Error.WriteLine("CAP_TRACE_FAILURE command=CapSelectorRefusal: $($_.Exception.Message)")
+        }
+    }
+}
+
+function Write-CapTerminalSelectorRefusal {
+    [CmdletBinding()]
+    param($Snapshot, [Management.Automation.ErrorRecord]$Refusal, [Nullable[DateTime]]$PollUtc,
+        [DateTime]$DeadlineUtc, [IntPtr]$Window, $ProcessIdentity, [string]$Name,
+        [string]$AutomationId, [string]$AutomationIdPrefix, [switch]$AllowOffscreen)
+    if (-not $script:CapTracePath) { return }
+    if ($null -ne $Snapshot) {
+        if ($Snapshot.EmissionAttempted) { return }
+        $Snapshot.EmissionAttempted = $true
+    } else {
+        $Snapshot = @{ Candidates = $null; CandidatesObserved = $false
+            ExpectedProcessId = $null; Name = $Name; AutomationId = $AutomationId
+            AutomationIdPrefix = $AutomationIdPrefix; AllowOffscreen = $AllowOffscreen.IsPresent
+            Context = @{ RootHandle = $Window; RootProcessId = $null; ProcessIdentity = $ProcessIdentity
+                Scope = 'Descendants'; ParameterSet = 'Window' } }
+    }
+    Write-CapSelectorRefusal -Candidates $Snapshot.Candidates -CandidatesObserved $Snapshot.CandidatesObserved `
+        -ExpectedProcessId $Snapshot.ExpectedProcessId -Name $Snapshot.Name -AutomationId $Snapshot.AutomationId `
+        -AutomationIdPrefix $Snapshot.AutomationIdPrefix -AllowOffscreen $Snapshot.AllowOffscreen `
+        -Refusal $Refusal -Context $Snapshot.Context -TerminalObservation ([ordered]@{
+            lastPollUtc = if ($null -ne $PollUtc) { $PollUtc.ToString('o') } else { $null }
+            waitDeadlineUtc = $DeadlineUtc.ToString('o'); failureObservedUtc = [DateTime]::UtcNow.ToString('o')
+            meaning = 'Last poll references; property values are read after terminal failure, not frozen at poll time.'
+        })
+}
+
 function Resolve-CapAutomationCandidate {
     [CmdletBinding()]
     param(
@@ -938,11 +1198,17 @@ function Resolve-CapAutomationCandidate {
         [Parameter(Mandatory)][string]$Name,
         [string]$AutomationId,
         [string]$AutomationIdPrefix,
-        [switch]$AllowOffscreen
+        [switch]$AllowOffscreen,
+        [System.Collections.IDictionary]$RefusalContext,
+        [ref]$RefusalSnapshot
     )
-    Write-CapTrace -Command $MyInvocation.MyCommand.Name -Parameters $PSBoundParameters
+    $traceParameters = [ordered]@{}
+    foreach ($key in $PSBoundParameters.Keys) {
+        if ($key -cnotin @('RefusalContext','RefusalSnapshot')) { $traceParameters[$key] = $PSBoundParameters[$key] }
+    }
+    Write-CapTrace -Command $MyInvocation.MyCommand.Name -Parameters $traceParameters
 
-
+    try {
     $found = [Collections.Generic.List[object]]::new()
     foreach ($candidate in $Candidates) {
         if ($null -eq $candidate) { throw 'UIA resolver returned a null candidate.' }
@@ -960,6 +1226,20 @@ function Resolve-CapAutomationCandidate {
         throw "Expected exactly one visible UIA element Name='$Name' id='$AutomationId' prefix='$AutomationIdPrefix'; found=$($found.Count)."
     }
     return $found[0]
+    } catch {
+        if ($script:CapTracePath) {
+            if ($null -ne $RefusalSnapshot) {
+                $RefusalSnapshot.Value = @{ Candidates = $Candidates; CandidatesObserved = $true; ExpectedProcessId = $ExpectedProcessId
+                    Name = $Name; AutomationId = $AutomationId; AutomationIdPrefix = $AutomationIdPrefix
+                    AllowOffscreen = $AllowOffscreen.IsPresent; Context = $RefusalContext; EmissionAttempted = $false }
+            } else {
+                Write-CapSelectorRefusal -Candidates $Candidates -CandidatesObserved $true -ExpectedProcessId $ExpectedProcessId `
+                    -Name $Name -AutomationId $AutomationId -AutomationIdPrefix $AutomationIdPrefix `
+                    -AllowOffscreen $AllowOffscreen.IsPresent -Refusal $_ -Context $RefusalContext
+            }
+        }
+        throw
+    }
 }
 
 function Find-CapAutomationElement {
@@ -973,11 +1253,19 @@ function Find-CapAutomationElement {
         [string]$AutomationId,
         [string]$AutomationIdPrefix,
         [System.Windows.Automation.TreeScope]$Scope = [System.Windows.Automation.TreeScope]::Descendants,
-        [switch]$AllowOffscreen
+        [switch]$AllowOffscreen,
+        [ref]$RefusalSnapshot
     )
-    Write-CapTrace -Command $MyInvocation.MyCommand.Name -Parameters $PSBoundParameters
+    $traceParameters = [ordered]@{}
+    foreach ($key in $PSBoundParameters.Keys) {
+        if ($key -cne 'RefusalSnapshot') { $traceParameters[$key] = $PSBoundParameters[$key] }
+    }
+    Write-CapTrace -Command $MyInvocation.MyCommand.Name -Parameters $traceParameters
 
 
+    $resolving = $false
+    $rootProcessId = $null
+    try {
     $rootElement = if ($PSCmdlet.ParameterSetName -eq 'Window') {
         [System.Windows.Automation.AutomationElement]::FromHandle($RootHandle)
     } else {
@@ -997,8 +1285,30 @@ function Find-CapAutomationElement {
     }
     $null = Assert-CapUiaProcessIds -ExpectedProcessId $ExpectedProcessId -ObservedProcessIds @($rootProcessId)
     $elements = $rootElement.FindAll($Scope, [System.Windows.Automation.Condition]::TrueCondition)
+    $resolving = $true
     return Resolve-CapAutomationCandidate -Candidates @($elements) -ExpectedProcessId $ExpectedProcessId `
-        -Name $Name -AutomationId $AutomationId -AutomationIdPrefix $AutomationIdPrefix -AllowOffscreen:$AllowOffscreen
+        -Name $Name -AutomationId $AutomationId -AutomationIdPrefix $AutomationIdPrefix -AllowOffscreen:$AllowOffscreen `
+        -RefusalSnapshot $RefusalSnapshot -RefusalContext $(if ($script:CapTracePath) {
+            @{ RootHandle = if ($PSCmdlet.ParameterSetName -eq 'Window') { $RootHandle } else { $null }
+                ProcessIdentity = $ProcessIdentity; RootProcessId = $rootProcessId; Scope = $Scope; ParameterSet = $PSCmdlet.ParameterSetName }
+        } else { $null })
+    } catch {
+        if (-not $resolving -and $script:CapTracePath) {
+            $context = @{
+                    RootHandle = if ($PSCmdlet.ParameterSetName -eq 'Window') { $RootHandle } else { $null }
+                    ProcessIdentity = $ProcessIdentity; RootProcessId = $rootProcessId; Scope = $Scope; ParameterSet = $PSCmdlet.ParameterSetName }
+            if ($null -ne $RefusalSnapshot) {
+                $RefusalSnapshot.Value = @{ Candidates = $null; CandidatesObserved = $false; ExpectedProcessId = $ExpectedProcessId
+                    Name = $Name; AutomationId = $AutomationId; AutomationIdPrefix = $AutomationIdPrefix
+                    AllowOffscreen = $AllowOffscreen.IsPresent; Context = $context; EmissionAttempted = $false }
+            } else {
+                Write-CapSelectorRefusal -Candidates $null -CandidatesObserved $false -ExpectedProcessId $ExpectedProcessId `
+                    -Name $Name -AutomationId $AutomationId -AutomationIdPrefix $AutomationIdPrefix `
+                    -AllowOffscreen $AllowOffscreen.IsPresent -Refusal $_ -Context $context
+            }
+        }
+        throw
+    }
 }
 
 function Get-CapDirectChildren {
@@ -3353,6 +3663,7 @@ Export-ModuleMember -Function @(
     'Assert-CapNoWorkerTransientArtifacts',
     'Set-CapTracePath',
     'Write-CapTrace',
+    'Write-CapTerminalSelectorRefusal',
     'Get-CapTraceFailures',
     'Assert-CapArtifactPath',
     'Assert-CapZmxLeasePath',

@@ -386,13 +386,13 @@ Test definitions retain the original 59 cases (the native export contract is
 updated to 26), adding three contained harmless normal/nonzero/timeout cases,
 one STD source-ordering check, and N1's full numbered-final-proof synthetic
 output-descendant accept/refusal fixture, plus one negative umbrella safety-net
-release assertion, lease-path and receipt-IO groups, prebuilt binding, journal-phase timing, first-Open and buffered-observation contracts: 72 expected cases. N1 is not real
+release assertion, lease-path and receipt-IO groups, prebuilt binding, journal-phase timing, first-Open, buffered-observation and selector-refusal contracts: 85 expected cases. N1 is not real
 seed evidence. `-RequireRealSeed` additionally defines three actual-command
 cases: two real zmx phases before a normal, nonzero, or timed-out harmless
-target, for 75 expected cases. It requires explicit `-RealSeedZmxPath` and
+target, for 88 expected cases. It requires explicit `-RealSeedZmxPath` and
 `-RealSeedZmxSha256` inputs admitted against the pinned provider; there is no
 PATH or stale-candidate fallback. Without those cases, the repaired report
-gate refuses live admission even if the 72 offline cases pass.
+gate refuses live admission even if the 85 offline cases pass.
 
 None of these new native cases ran during M1. Parse/compile-only evidence
 does not establish job nesting, gate timing, output transport, native STD
@@ -475,7 +475,7 @@ test override. Retry trace observations assert actual sharing/parse retries.
 release case for discriminating RED/GREEN evidence.
 
 These five contracts are registered as one full-suite case within the current
-72/75 prospective counts above. Focused reports are named
+85/88 prospective counts above. Focused reports are named
 `UiCaptureReceiptContracts` and cannot stand in for a complete capture
 preflight. A file-IO GREEN is not native lifecycle or job-zero GREEN.
 The strict outer job-zero gate remains unchanged; there is no vctip exemption.
@@ -629,8 +629,9 @@ pwsh -NoProfile -File Tools\windows\Tests\UiCaptureDriver.Tests.ps1 `
 
 The two prior #845 setup groups gave the historical 69 offline / 72 real-seed
 inventory. The two #851 first-Open groups brought that inventory to 71 offline / 74
-real-seed cases. The #852 buffered-observation group brings current full-suite
-expectations to 72 offline / 75 real-seed cases. Historical run counts are not
+real-seed cases. The #852 buffered-observation group brought that inventory
+to 72 offline / 75 real-seed cases. The thirteen #848 selector-refusal groups
+bring current full-suite expectations to 85 offline / 88 real-seed cases. Historical run counts are not
 relabelled by these additions. A focused
 setup-contract pass is not a complete capture, native job-zero or parity pass.
 
@@ -641,3 +642,91 @@ does not add a suite job; precompilation there preserves the same input
 contract, not a claim of vctip containment. An isolated execution of its
 capture-caller slice is not the full ValidationRunner or the separate
 real-zmx qualification run.
+
+## Selector refusal diagnostics (issue 848)
+
+An already-refusing direct selector writes one `CapSelectorRefusal` record through the
+existing trace sink. Its `parameters.diagnosticJson` string is bounded JSON with
+schema `CapSelectorRefusal/1`; consumers parse that string as JSON rather than
+treating legacy CLR type names as candidate or PID evidence. The original
+exception type, message and ErrorRecord are rethrown unchanged. An observer
+failure is surfaced as `CAP_TRACE_FAILURE` and by `Get-CapTraceFailures`, not
+substituted for the selector refusal. Successful selectors add no diagnostic
+property reads, serialization or writes.
+
+The worker's actual `Wait-CapVisibleElement` is different from a direct selector:
+its zero-match refusals are intermediate polls, not terminal wait failures.
+Polling retains only the last already-enumerated candidate references and cheap
+call context. It does no diagnostic property reads, projection, serialization
+or writes. Only after the wait definitively fails does it attempt one
+`TERMINAL_LAST_POLL_SNAPSHOT` record, outside the wait budget, without another
+tree/window query. The original wait refusal remains primary. This adds no
+timeout allowance or retry. With no trace sink, neither the resolver nor the
+terminal observer prepares a snapshot/context or performs diagnostic work.
+An attempted snapshot cannot emit or report an observer failure twice.
+
+`terminalObservation.lastPollUtc` and `waitDeadlineUtc` bind the retained
+references to the wait; `failureObservedUtc` and `propertyReadStartedUtc` mark
+the later observation. The properties are deliberately read **after failure**,
+not frozen values from the last poll. They may have changed or vanished.
+An unavailable `Current` getter is retained as a typed read error and is
+propagated to the unavailable candidate fields, never treated as an empty
+element or a reason to query again.
+
+`stageCounts` scans the full existing candidate collection, cumulatively in the
+original order: process-owned, exact case-sensitive Name, optional exact ID,
+optional ordinal prefix, visibility rule, positive bounds. Inactive optional
+stages propagate the previous count. With `AllowOffscreen`, `visible` counts
+passage through the visibility **rule**, not actually visible elements.
+`stageReadErrors` and `stageCountsComplete` distinguish unavailable decision
+properties from observed negative matches. A query not reached is
+`candidatesObserved=false`, with null counts, not an invented empty result.
+Held window/process-generation context comes only from existing call data;
+unavailable context/root PID is labelled `NotObserved`.
+
+At most 16 candidates are retained, ranked by deepest passed cumulative stage
+then original source index. Total/sample/omitted counts and the sample policy
+are explicit. Each Name, AutomationId, ProcessId, IsOffscreen, BoundingRectangle
+and ControlType field distinguishes `Value`, `Null`, `Missing` and `ReadError`.
+Successfully read `Rect.Empty` remains `Value` with `rectangleKind=Empty`.
+Finite rectangle coordinates are JSON numbers; special coordinates are typed
+`numberKind` markers (`NaN`, `PositiveInfinity`, `NegativeInfinity`).
+`propertyReadSucceeded` distinguishes those real values from failed reads.
+The bounds stage uses the original raw null/Width-less-than-or-equal-zero/
+Height-less-than-or-equal-zero rejection predicate literally, including its
+special-number semantics; it does not replace it with a positive comparison.
+ControlType is a scalar programmatic-name string, not a serialized UIA object.
+Strings are capped at 512 UTF-16 units (ControlType 128, errors 256, recorded
+refusal message 1024), with original-length/truncation metadata. Truncation
+never splits a surrogate pair; isolated surrogates are replaced and disclosed.
+Only the diagnostic copy of a message is clipped.
+
+`observedProcessIds` is the first 64 **distinct actually read primitive PIDs**
+in source order, not a full lossless observed array. Raw observation count,
+distinct count, sample count, unavailable count, truncation and completeness
+are recorded separately. The expected PID is never substituted as an
+observation. Diagnostics do not query a fresh tree/window, retarget, adopt a
+foreign candidate, retry, or change selector/deadline/ownership decisions.
+
+The focused thirteen-case group uses synthetic candidates with the actual
+resolver and retained trace sink, plus the actual worker wait/deadline
+functions extracted by AST and a synthetic query leaf. It uses the real
+100 ms polling cadence and compiles/launches no target:
+
+```powershell
+pwsh -NoProfile -File Tools\windows\Tests\UiCaptureDriver.Tests.ps1 `
+  -SelectorRefusalContractOnly -ScratchRoot C:\owned\fresh-selector-contracts
+```
+
+The empty-bounds fixture is a **synthetic canonical Rect.Empty numeric shape**,
+not an instantiated WPF rectangle or live UIA evidence. Structural
+classification uses the four already-read primitive coordinates, without
+adding a WindowsBase dependency or changing assembly loading.
+
+All thirteen cases are also registered in the normal suite: exactly 85 ordinary
+or 88 real-seed cases, preserving all 75 real-seed case names from the merged
+journal base. The four timing
+subcases and journal success path are unchanged. This diagnostic evidence is
+not live UIA, graph-delivery, rendering, input, B-scene or parity evidence;
+the live refusal's root cause remains unclassified until separately admitted
+retained runtime evidence is available.
