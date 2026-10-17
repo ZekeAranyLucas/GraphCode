@@ -72,6 +72,39 @@ jobs:
         if: env.HARDENING_REQUIRED == 'true'
         shell: pwsh
         run: ./Tools/windows/Tests/ValidationRunner.Tests.ps1
+      - name: Resolve capture contract failure diagnostics root
+        id: capture_temp
+        if: failure()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = [IO.Path]::GetTempPath().TrimEnd([char[]]'\/')
+          if ($root.Contains("`r") -or $root.Contains("`n") -or
+              -not [IO.Path]::IsPathFullyQualified($root) -or
+              -not (Test-Path -LiteralPath $root -PathType Container)) {
+            throw 'Capture diagnostics require the actual absolute temporary directory.'
+          }
+          if ([string]::IsNullOrWhiteSpace($env:GITHUB_OUTPUT) -or
+              -not [IO.Path]::IsPathFullyQualified($env:GITHUB_OUTPUT) -or
+              -not (Test-Path -LiteralPath $env:GITHUB_OUTPUT -PathType Leaf)) {
+            throw 'Capture diagnostics require the runner output file.'
+          }
+          [IO.File]::AppendAllText($env:GITHUB_OUTPUT, "root=$root`n", [Text.UTF8Encoding]::new($false))
+      - name: Retain capture contract failure diagnostics
+        if: ${{ failure() && steps.capture_temp.conclusion == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ui-capture-hardening-${{ matrix.os }}-${{ matrix.powershell }}-${{ github.run_attempt }}
+          path: |
+            ${{ steps.capture_temp.outputs.root }}\gc-ui-capture-*\suite\**\*.json
+            ${{ steps.capture_temp.outputs.root }}\gc-ui-capture-*\suite\**\*.jsonl
+            ${{ steps.capture_temp.outputs.root }}\gc-ui-capture-*\suite\**\*.log
+            ${{ steps.capture_temp.outputs.root }}\gc-ui-capture-*\prebuilt\fixtures.json
+            ${{ steps.capture_temp.outputs.root }}\gc-ui-capture-*\prebuilt\**\provenance.json
+            ${{ steps.capture_temp.outputs.root }}\gc-ui-capture-*\prebuilt\**\compile*.log
+            !${{ steps.capture_temp.outputs.root }}\gc-ui-capture-*\suite\**\.git\**
+          if-no-files-found: warn
+          retention-days: 7
 
   full-pinned:
     name: "Full pinned Windows validation"

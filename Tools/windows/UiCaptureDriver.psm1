@@ -2647,26 +2647,48 @@ function New-CapJournalState {
 
 function Write-CapJournalObservation {
     param($State, [long]$Sequence, [int]$Attempt, [string]$Decision,
-        [AllowNull()][string]$NativeError, $Transaction)
+        [AllowNull()][string]$NativeError, $Transaction, [switch]$TerminalFailure)
     if (-not $State.ObservationPath) { return }
-    $record = [ordered]@{
-        runId = $State.Binding.runId; readerPid = $PID; sequence = $Sequence; attempt = $Attempt
-        utc = [DateTime]::UtcNow.ToString('o')
-        monotonicTimestamp = [Diagnostics.Stopwatch]::GetTimestamp()
-        monotonicFrequency = [Diagnostics.Stopwatch]::Frequency
-        nativeHresult = $NativeError; decision = $Decision
-        deadlineUtc = $Transaction.DeadlineUtc.ToString('o'); retries = $Transaction.Retries
-        openElapsedMilliseconds = $Transaction.OpenElapsedMilliseconds
-        copyElapsedMilliseconds = $Transaction.CopyElapsedMilliseconds
-        totalElapsedMilliseconds = $Transaction.Clock.Elapsed.TotalMilliseconds
-    }
-    $bytes = [Text.UTF8Encoding]::new($false).GetBytes(
-        (ConvertTo-Json -InputObject $record -Compress -Depth 8) + "`n")
+    $writeClock = [Diagnostics.Stopwatch]::StartNew()
+    $Transaction.ObservationOrdinal++
+    $ordinal = $Transaction.ObservationOrdinal
+    $failureDecision = $Decision -cin @('OpenFailed','CopyFailed','FinalManifestOpenFailed','DeadlineExhausted')
+    $durable = $Decision -cin @('CopyFailed','DeadlineExhausted') -or
+        ($TerminalFailure -and $Decision -cin @('OpenFailed','FinalManifestOpenFailed'))
     try {
+        $record = [ordered]@{
+            runId = $State.Binding.runId; readerPid = $PID; sequence = $Sequence; attempt = $Attempt
+            observationTransactionId = $Transaction.ObservationTransactionId
+            observationOrdinal = $ordinal
+            previousObservationWriteMs = $Transaction.LastCompletedObservationWriteMilliseconds
+            previousObservationOrdinal = $Transaction.LastCompletedObservationOrdinal
+            utc = [DateTime]::UtcNow.ToString('o')
+            monotonicTimestamp = [Diagnostics.Stopwatch]::GetTimestamp()
+            monotonicFrequency = [Diagnostics.Stopwatch]::Frequency
+            nativeHresult = $NativeError; decision = $Decision
+            deadlineUtc = $Transaction.DeadlineUtc.ToString('o'); retries = $Transaction.Retries
+            openElapsedMilliseconds = $Transaction.OpenElapsedMilliseconds
+            copyElapsedMilliseconds = $Transaction.CopyElapsedMilliseconds
+            totalElapsedMilliseconds = $Transaction.Clock.Elapsed.TotalMilliseconds
+        }
+        if ($failureDecision) {
+            $record.preOpenMs = if ($null -eq $Transaction.PreOpenElapsedMilliseconds) {
+                $Transaction.Clock.Elapsed.TotalMilliseconds
+            } else { $Transaction.PreOpenElapsedMilliseconds }
+            $record.firstOpen = if ($null -eq $Transaction.PreOpenElapsedMilliseconds) { 'NOT_ATTEMPTED' } else { 'ATTEMPTED' }
+        }
+        $bytes = [Text.UTF8Encoding]::new($false).GetBytes(
+            (ConvertTo-Json -InputObject $record -Compress -Depth 8) + "`n")
         $stream = [IO.File]::Open($State.ObservationPath, [IO.FileMode]::Append,
             [IO.FileAccess]::Write, [IO.FileShare]::Read)
-        try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) }
+        try {
+            $stream.Write($bytes, 0, $bytes.Length)
+            if ($durable) { $stream.Flush($true) } else { $stream.Flush() }
+        }
         finally { $stream.Dispose() }
+        $writeClock.Stop()
+        $Transaction.LastCompletedObservationWriteMilliseconds = $writeClock.Elapsed.TotalMilliseconds
+        $Transaction.LastCompletedObservationOrdinal = $ordinal
     } catch { throw (New-CapJournalFailure 'JournalObservationFailure' $_.Exception.Message $_.Exception) }
 }
 
@@ -2767,12 +2789,22 @@ function Get-CapJournalNames {
 }
 
 function New-CapJournalTransaction {
-    param($State)
-    $remaining = [Math]::Min(1000.0, ($State.DeadlineUtc - [DateTime]::UtcNow).TotalMilliseconds)
+    param($State, [switch]$ManifestBudget)
+    $createdUtc = [DateTime]::UtcNow
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $remaining = [Math]::Max(0, [Math]::Min(1000.0, ($State.DeadlineUtc - $createdUtc).TotalMilliseconds))
     return [pscustomobject]@{
-        DeadlineUtc = [DateTime]::UtcNow.AddMilliseconds([Math]::Max(0, $remaining))
-        Clock = [Diagnostics.Stopwatch]::StartNew()
-        BudgetMilliseconds = [Math]::Max(0, $remaining)
+        CreatedUtc = $createdUtc
+        DeadlineUtc = if ($ManifestBudget) { $createdUtc.AddMilliseconds($remaining) } else { $State.DeadlineUtc }
+        Clock = $clock
+        IoClock = if ($ManifestBudget) { $clock } else { $null }
+        BudgetMilliseconds = if ($ManifestBudget) { $remaining } else { 1000.0 }
+        PreOpenElapsedMilliseconds = $null
+        ObservationState = $State
+        ObservationTransactionId = [guid]::NewGuid().ToString('N')
+        ObservationOrdinal = 0L
+        LastCompletedObservationWriteMilliseconds = $null
+        LastCompletedObservationOrdinal = $null
         Retries = 0
         Attempts = [Collections.Generic.Dictionary[long,int]]::new()
         OpenElapsedMilliseconds = $null
@@ -2786,15 +2818,29 @@ function Format-CapJournalPhaseTiming {
         else { $Transaction.OpenElapsedMilliseconds.ToString('F3', [Globalization.CultureInfo]::InvariantCulture) }
     $copy = if ($null -eq $Transaction.CopyElapsedMilliseconds) { 'UNOBSERVED' }
         else { $Transaction.CopyElapsedMilliseconds.ToString('F3', [Globalization.CultureInfo]::InvariantCulture) }
-    return "openMs=$open copyMs=$copy totalMs=$($Transaction.Clock.Elapsed.TotalMilliseconds.ToString('F3', [Globalization.CultureInfo]::InvariantCulture))"
+    $preOpen = if ($null -eq $Transaction.PreOpenElapsedMilliseconds) { $Transaction.Clock.Elapsed.TotalMilliseconds }
+        else { $Transaction.PreOpenElapsedMilliseconds }
+    $firstOpen = if ($null -eq $Transaction.PreOpenElapsedMilliseconds) { 'NOT_ATTEMPTED' } else { 'ATTEMPTED' }
+    $observation = if ($null -eq $Transaction.LastCompletedObservationWriteMilliseconds) { 'UNOBSERVED' }
+        else { $Transaction.LastCompletedObservationWriteMilliseconds.ToString('F3', [Globalization.CultureInfo]::InvariantCulture) }
+    return "preOpenMs=$($preOpen.ToString('F3', [Globalization.CultureInfo]::InvariantCulture)) firstOpen=$firstOpen openMs=$open copyMs=$copy totalMs=$($Transaction.Clock.Elapsed.TotalMilliseconds.ToString('F3', [Globalization.CultureInfo]::InvariantCulture)) previousObservationWriteMs=$observation previousObservationOrdinal=$($Transaction.LastCompletedObservationOrdinal) observationTransactionId=$($Transaction.ObservationTransactionId)"
 }
 
 function Assert-CapJournalTime {
     param($Transaction, [long]$Sequence, [AllowNull()][string]$NativeError = $null)
     if ([DateTime]::UtcNow -ge $Transaction.DeadlineUtc -or
-        $Transaction.Clock.Elapsed.TotalMilliseconds -ge $Transaction.BudgetMilliseconds) {
-        throw (New-CapJournalFailure 'JournalUnavailable' (
-            "sequence=$Sequence HRESULT=$NativeError retries=$($Transaction.Retries); deadline/exhaustion, no late success. $(Format-CapJournalPhaseTiming $Transaction)"))
+        ($null -ne $Transaction.IoClock -and
+            $Transaction.IoClock.Elapsed.TotalMilliseconds -ge $Transaction.BudgetMilliseconds)) {
+        $failure = New-CapJournalFailure 'JournalUnavailable' (
+            "sequence=$Sequence HRESULT=$NativeError retries=$($Transaction.Retries); deadline/exhaustion, no late success. $(Format-CapJournalPhaseTiming $Transaction)")
+        try {
+            $attempt = if ($Transaction.Attempts.ContainsKey($Sequence)) { $Transaction.Attempts[$Sequence] } else { 0 }
+            Write-CapJournalObservation $Transaction.ObservationState $Sequence $attempt 'DeadlineExhausted' $NativeError $Transaction
+        } catch {
+            $failure.Data['CapJournalObservationFailure'] = $_.Exception.ToString()
+            [Console]::Error.WriteLine("JournalObservationFailure while reporting JournalUnavailable: $($_.Exception.Message)")
+        }
+        throw $failure
     }
 }
 
@@ -2807,14 +2853,28 @@ function Read-CapJournalObject {
         if ($Transaction.Attempts[$Sequence] -ge 8) {
             throw (New-CapJournalFailure 'JournalUnavailable' "sequence=$Sequence HRESULT=$native; eight Open attempts. $(Format-CapJournalPhaseTiming $Transaction)")
         }
+        $name = $Sequence.ToString('D6', [Globalization.CultureInfo]::InvariantCulture) + '.json'
+        $path = Join-Path $State.Directory $name
+        $retained = $false
+        Assert-CapJournalTime $Transaction $Sequence $native
+        if ($null -eq $Transaction.IoClock) {
+            $now = [DateTime]::UtcNow
+            $Transaction.BudgetMilliseconds = [Math]::Max(0, [Math]::Min(1000.0,
+                ($Transaction.DeadlineUtc - $now).TotalMilliseconds))
+            $ioDeadline = $now.AddMilliseconds($Transaction.BudgetMilliseconds)
+            if ($ioDeadline -lt $Transaction.DeadlineUtc) { $Transaction.DeadlineUtc = $ioDeadline }
+            $Transaction.IoClock = [Diagnostics.Stopwatch]::StartNew()
+        }
+        Assert-CapJournalTime $Transaction $Sequence $native
+        if ($null -eq $Transaction.PreOpenElapsedMilliseconds) {
+            $Transaction.PreOpenElapsedMilliseconds = $Transaction.Clock.Elapsed.TotalMilliseconds
+        }
         $Transaction.Attempts[$Sequence]++
         $attempt = $Transaction.Attempts[$Sequence]
-        $name = $Sequence.ToString('D6', [Globalization.CultureInfo]::InvariantCulture) + '.json'
-        $retained = $false
         try {
             $openClock = [Diagnostics.Stopwatch]::StartNew()
             try {
-                $stream = [IO.File]::Open((Join-Path $State.Directory $name), [IO.FileMode]::Open,
+                $stream = [IO.File]::Open($path, [IO.FileMode]::Open,
                     [IO.FileAccess]::Read, [IO.FileShare]::Read)
             } finally {
                 $elapsed = $openClock.Elapsed.TotalMilliseconds
@@ -2823,7 +2883,10 @@ function Read-CapJournalObject {
             }
         } catch {
             $native = Get-CapJournalNativeError $_.Exception
-            Write-CapJournalObservation $State $Sequence $attempt 'OpenFailed' $native $Transaction
+            $terminalFailure = $native -notin @('80070002','80070003','80070020','80070021') -or
+                $Transaction.Retries -ge 7
+            Write-CapJournalObservation $State $Sequence $attempt 'OpenFailed' $native $Transaction `
+                -TerminalFailure:$terminalFailure
             if ($native -notin @('80070002','80070003','80070020','80070021')) {
                 $class = if ($native -eq '80070005') { 'JournalAccessDenied' } else { 'JournalOpenFailure' }
                 throw (New-CapJournalFailure $class "sequence=$Sequence HRESULT=$native" $_.Exception)
@@ -2834,7 +2897,7 @@ function Read-CapJournalObject {
             $Transaction.Retries++
             Assert-CapJournalTime $Transaction $Sequence $native
             $remaining = [Math]::Min(($Transaction.DeadlineUtc - [DateTime]::UtcNow).TotalMilliseconds,
-                $Transaction.BudgetMilliseconds - $Transaction.Clock.Elapsed.TotalMilliseconds)
+                $Transaction.BudgetMilliseconds - $Transaction.IoClock.Elapsed.TotalMilliseconds)
             if ($remaining -gt 0) { Start-Sleep -Milliseconds ([int][Math]::Min(100, [Math]::Floor($remaining))) }
             Assert-CapJournalTime $Transaction $Sequence $native
             if ($Advance) {
@@ -3014,7 +3077,7 @@ function Read-CapJournalFinalProof {
     if ($State.HighestObserved -gt $Record.terminal.sequence) {
         throw (New-CapJournalFailure 'PostTerminalPublication' 'Observed floor exceeds final binding.')
     }
-    $transaction = New-CapJournalTransaction $State
+    $transaction = New-CapJournalTransaction $State -ManifestBudget
     Assert-CapJournalTime $transaction $Record.terminal.sequence
     $manifestPath = Assert-CapArtifactPath -Root $State.Root -Path (Join-Path $OutputDirectory $Record.manifest.name)
     $stream = $null
@@ -3213,11 +3276,17 @@ function Open-CapJournalManifestStream {
     $native = $null
     for ($attempt = 1; $attempt -le 8; $attempt++) {
         Assert-CapJournalTime $Transaction $Sequence $native
+        if ($null -eq $Transaction.PreOpenElapsedMilliseconds) {
+            $Transaction.PreOpenElapsedMilliseconds = $Transaction.Clock.Elapsed.TotalMilliseconds
+        }
         try {
             return [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
         } catch {
             $native = Get-CapJournalNativeError $_.Exception
-            Write-CapJournalObservation $State $Sequence $attempt 'FinalManifestOpenFailed' $native $Transaction
+            $terminalFailure = $native -notin @('80070002','80070003','80070020','80070021') -or
+                $Transaction.Retries -ge 7 -or $attempt -ge 8
+            Write-CapJournalObservation $State $Sequence $attempt 'FinalManifestOpenFailed' $native $Transaction `
+                -TerminalFailure:$terminalFailure
             if ($native -notin @('80070002','80070003','80070020','80070021')) {
                 throw (New-CapJournalFailure 'JournalOpenFailure' "Final manifest HRESULT=$native" $_.Exception)
             }
@@ -3225,7 +3294,7 @@ function Open-CapJournalManifestStream {
             $Transaction.Retries++
             Assert-CapJournalTime $Transaction $Sequence $native
             $remaining = [Math]::Min(($Transaction.DeadlineUtc - [DateTime]::UtcNow).TotalMilliseconds,
-                $Transaction.BudgetMilliseconds - $Transaction.Clock.Elapsed.TotalMilliseconds)
+                $Transaction.BudgetMilliseconds - $Transaction.IoClock.Elapsed.TotalMilliseconds)
             if ($remaining -gt 0) { Start-Sleep -Milliseconds ([int][Math]::Min(100, [Math]::Floor($remaining))) }
         }
     }

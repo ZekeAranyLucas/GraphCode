@@ -386,13 +386,13 @@ Test definitions retain the original 59 cases (the native export contract is
 updated to 26), adding three contained harmless normal/nonzero/timeout cases,
 one STD source-ordering check, and N1's full numbered-final-proof synthetic
 output-descendant accept/refusal fixture, plus one negative umbrella safety-net
-release assertion, lease-path and receipt-IO groups, prebuilt binding and journal-phase timing contracts: 69 expected cases. N1 is not real
+release assertion, lease-path and receipt-IO groups, prebuilt binding, journal-phase timing, first-Open and buffered-observation contracts: 72 expected cases. N1 is not real
 seed evidence. `-RequireRealSeed` additionally defines three actual-command
 cases: two real zmx phases before a normal, nonzero, or timed-out harmless
-target, for 72 expected cases. It requires explicit `-RealSeedZmxPath` and
+target, for 75 expected cases. It requires explicit `-RealSeedZmxPath` and
 `-RealSeedZmxSha256` inputs admitted against the pinned provider; there is no
 PATH or stale-candidate fallback. Without those cases, the repaired report
-gate refuses live admission even if the 69 offline cases pass.
+gate refuses live admission even if the 72 offline cases pass.
 
 None of these new native cases ran during M1. Parse/compile-only evidence
 does not establish job nesting, gate timing, output transport, native STD
@@ -474,8 +474,8 @@ test override. Retry trace observations assert actual sharing/parse retries.
 `-ReceiptExclusiveOnly` with that focused mode selects just the exclusive
 release case for discriminating RED/GREEN evidence.
 
-These five contracts are registered as one full-suite case, giving the
-69/72 prospective counts above. Focused reports are named
+These five contracts are registered as one full-suite case within the current
+72/75 prospective counts above. Focused reports are named
 `UiCaptureReceiptContracts` and cannot stand in for a complete capture
 preflight. A file-IO GREEN is not native lifecycle or job-zero GREEN.
 The strict outer job-zero gate remains unchanged; there is no vctip exemption.
@@ -526,21 +526,112 @@ compiles is the authorized scope, not a retroactive parent attribution.
 Journal diagnostics add cumulative measured Open/Copy milliseconds and total
 transaction elapsed time to observations and JournalUnavailable messages.
 Unattempted phases remain null/`UNOBSERVED`, not invented zero. Open and Copy
-throw paths retain measurements; N1 records copy-complete phase observations.
-The **1000ms transaction budget, seven global retries, eight Open attempts,
-deadline/no-late-success and schema/identity rules are unchanged**. The
-two-minute fixture context does not replace the one-second read transaction.
+throw paths retain measurements; there is no flushed observation between
+successful CopyTo and its first deadline check.
+
+The numbered-object reader's **1000ms I/O budget starts once at its first
+Open attempt inside `Read-CapJournalObject`**, after caller preparation and
+path construction, not at transaction creation or sequence discovery. This is
+the explicit #851 revision to the #829 creation-started clock contract.
+The absolute UTC lease/transaction deadline remains hard even before Open;
+the first I/O budget is clipped to its remaining time. Subsequent reads,
+sequence advancement and retries never restart that clock or reset the
+**seven global retries / eight Open attempts per sequence**. Final manifest
+reads explicitly retain their creation-started 1000ms transaction budget.
+No late success, schema or identity checks are relaxed. The two-minute fixture
+context does not replace either one-second I/O/manifest budget.
+
+Only failure messages and failure observations add `preOpenMs` and `firstOpen`.
+After an attempted Open, `preOpenMs` is the frozen measured interval from
+transaction creation to the first attempt. If the absolute deadline expires
+first, it is actual elapsed creation-to-refusal time, with
+`firstOpen=NOT_ATTEMPTED`; no Open or phase duration is invented. Successful
+observation counts and ordering are unchanged. A failed deadline
+observation in `Assert-CapJournalTime` retains the primary `JournalUnavailable`,
+with an explicit secondary diagnostic. This does not change or establish
+primary-error preservation in the existing OpenFailed, CopyFailed or
+FinalManifestOpenFailed observation paths. The focused first-Open groups exercise an actual >=1500ms caller
+delay followed by a valid held-file read, absolute pre-open refusal, clipping,
+once-only clocks/counters, legacy manifest timing and observer failure.
+Both new caller-delay tests sleep until the assertion's own clock measures
+at least 1500ms, with a 5000ms harness cap checked even after the final sleep.
+Their report details retain the measured delay, including assertion failures.
 Host-load/foreign-build causation of the old N1 timeout remains unproved.
 
-Run the focused synthetic prebuilt binding and actual file-IO timing contracts
-without a compiler or target:
+Non-failure observations, including `ReadVerified` and
+`AcceptedLiveSequenceOnly`, use OS-buffered `Flush()`, not disk-durable
+`Flush(true)`. **Durability is terminal-only**, not inferred from a failure
+label: `DeadlineExhausted` and `CopyFailed` end the read and flush durably.
+The numbered and manifest Open callsites explicitly request terminal durability
+only for non-retryable HRESULTs or exhausted retry/attempt limits.
+`OpenFailed` and `FinalManifestOpenFailed` with retryable HRESULTs
+`80070002`, `80070003`, `80070020` or `80070021` remain buffered while a retry
+is available. All successes and unknown decisions stay buffered even if a
+terminal switch is mistakenly supplied. The 1000ms budget, retries,
+first-Open boundary and absolute deadlines are unchanged.
+
+Each record carries an `observationTransactionId` GUID and an attempted
+`observationOrdinal`, bound to its existing run ID. **`previousObservationWriteMs`
+is explicitly lagged**: it measures the previous completed observation's
+serialization, Open, Write, selected Flush and Dispose, not the current record.
+`previousObservationOrdinal` identifies that completed write in the same
+transaction/run. Both fields are null on the first record. A failed write
+reserves an ordinal but does not update the last-completed pair; gaps are
+intentional, not a fictional N-1 reference. The current completed duration
+remains in transaction memory for the following record and failure diagnostics.
+There are no extra success records or rewrites to serialize self-duration.
+The new contract uses a transparent FileStream subclass, substituting only the
+actual writer's unique Open constructor and restoring that writer in `finally`.
+Its slow durable-flush seam must not delay a successful read; additional real
+Flush/Dispose delays and a failed write check completed-duration/ordinal binding.
+This compiles a C# seam in-process, not a native fixture or target.
+The same group extends that seam with two **injected** typed sharing HRESULTs
+followed by a real nonempty file Open. This is controlled retry evidence, not
+proof of kernel sharing violations. A separate probe verifies that configured
+sequence and resets counters before the timed actual reader. On the old policy,
+the first slow durable retry observation exhausts the budget before the second
+attempt. The revised path must complete two retries, three Opens and all four
+buffered observations (including caller-equivalent acceptance and its actual
+deadline check) within 1000ms, without durable flushing. Existing two-success
+observation assertions remain unchanged.
+
+On actor cleanup failure only, the harness appends the known owned
+`Reader-failed.json` and `Writer-failed.json` contents to the existing cleanup
+assertion. Each read is bounded to 16KiB plus one truncation-detection byte;
+missing, unreadable and truncated primaries are explicit. Successful cleanup
+does not read these files. Exit, generation, kernel/EOF assertions and recovery
+remain unchanged. This fixes harness diagnostic masking, not the separate
+production observer-primary masking risks described above.
+
+Hardening's deterministic matrix and Windows port validation's `spikes-swift`
+job are configured to retain capture-contract diagnostics only on failure, for
+seven days. A failure-only step resolves the same `[IO.Path]::GetTempPath()`
+used by the capture producer, not the potentially different `RUNNER_TEMP`;
+missing/invalid output paths fail explicitly. Uploads select JSON/JSONL/log files under the existing
+`gc-ui-capture-*\suite` root and fixture manifest/provenance/compiler logs under
+its `prebuilt` sibling, excluding Git metadata. They do not include whole TEMP,
+environment dumps, credentials, binaries or screenshots. No matching files
+warns without replacing the original failure. The upload failure branch remains
+runtime-unverified until an actual CI failure exercises it; a green job is not
+upload evidence. #846, #849 and #851 are related capture-core failures, not a
+claim of a common cause or harmlessness.
+
+Run the focused synthetic prebuilt binding and actual file-IO timing/observation
+contracts without a native fixture compiler or target (the observation seam
+compiles C# in-process):
 
 ```powershell
 pwsh -NoProfile -File Tools\windows\Tests\UiCaptureDriver.Tests.ps1 `
-  -FixtureContractOnly -JournalTimingContractOnly -ScratchRoot C:\owned\fresh-setup-contracts
+  -FixtureContractOnly -JournalTimingContractOnly -JournalFirstOpenContractOnly `
+  -JournalObservationContractOnly `
+  -ScratchRoot C:\owned\fresh-setup-contracts
 ```
 
-These add two full-suite cases (69 offline / 72 real-seed mode). A focused
+The two prior #845 setup groups gave the historical 69 offline / 72 real-seed
+inventory. The two #851 first-Open groups brought that inventory to 71 offline / 74
+real-seed cases. The #852 buffered-observation group brings current full-suite
+expectations to 72 offline / 75 real-seed cases. Historical run counts are not
+relabelled by these additions. A focused
 setup-contract pass is not a complete capture, native job-zero or parity pass.
 
 `ValidationRunner.Tests.ps1` uses this same two-step PrepareFixturesOnly →

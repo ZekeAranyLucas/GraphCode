@@ -7,6 +7,8 @@ param(
     [switch]$PrepareFixturesOnly,
     [switch]$FixtureContractOnly,
     [switch]$JournalTimingContractOnly,
+    [switch]$JournalFirstOpenContractOnly,
+    [switch]$JournalObservationContractOnly,
     [switch]$PreflightReportContractOnly,
     [string]$PrebuiltFixtureManifest = '',
     [string]$PrebuiltFixtureManifestSha256 = '',
@@ -45,6 +47,35 @@ function Read-JournalContractJson {
         try { return ConvertFrom-Json $reader.ReadToEnd() -Depth 40 -DateKind String }
         finally { $reader.Dispose() }
     } finally { $file.Dispose() }
+}
+
+function Format-JournalActorCleanupFailure {
+    param([string]$Root, [string[]]$CleanupErrors)
+    $primaries = foreach ($name in @('Reader-failed.json','Writer-failed.json')) {
+        $path = Join-Path $Root $name
+        $file = $null
+        try {
+            $file = [IO.File]::Open($path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
+            $bytes = [byte[]]::new(16385)
+            $count = 0
+            while ($count -lt $bytes.Length) {
+                $read = $file.Read($bytes,$count,$bytes.Length-$count)
+                if ($read -eq 0) { break }
+                $count += $read
+            }
+            $text = [Text.Encoding]::UTF8.GetString($bytes,0,[Math]::Min($count,16384))
+            if ($count -gt 16384) { $text += ' [TRUNCATED at 16384 bytes]' }
+            "${name}: $text"
+        } catch {
+            $cause = $_.Exception
+            while ($cause.InnerException) { $cause = $cause.InnerException }
+            $status = if ($cause -is [IO.FileNotFoundException] -or $cause -is [IO.DirectoryNotFoundException]) {
+                'MISSING'
+            } else { 'READ_ERROR' }
+            "${name}: $status $($cause.Message)"
+        } finally { if ($null -ne $file) { $file.Dispose() } }
+    }
+    return "Empty/incomplete actual actor cleanup: $($CleanupErrors -join '; '); actor primaries: $($primaries -join '; ')"
 }
 
 function Wait-JournalContractFile {
@@ -147,8 +178,12 @@ Import-Module $modulePath -Force -WarningAction SilentlyContinue
 Set-CapTracePath -Path (Join-Path $scratch 'test-calls.jsonl')
 
 function Assert-CapTest {
-    param([bool]$Condition, [string]$Message)
-    if (-not $Condition) { throw $Message }
+    param([bool]$Condition, [string]$Message, $Detail = $null)
+    if (-not $Condition) {
+        $failure = [InvalidOperationException]::new($Message)
+        if ($null -ne $Detail) { $failure.Data['CapTestDetail'] = $Detail }
+        throw $failure
+    }
 }
 
 function Invoke-CapTest {
@@ -158,7 +193,9 @@ function Invoke-CapTest {
         $results.Add([ordered]@{ name = $Name; passed = $true; detail = $detail })
         Write-Host "PASS $Name"
     } catch {
-        $results.Add([ordered]@{ name = $Name; passed = $false; error = $_.Exception.ToString(); stack = $_.ScriptStackTrace })
+        $row = [ordered]@{ name = $Name; passed = $false; error = $_.Exception.ToString(); stack = $_.ScriptStackTrace }
+        if ($_.Exception.Data.Contains('CapTestDetail')) { $row.detail = $_.Exception.Data['CapTestDetail'] }
+        $results.Add($row)
         Write-Host "FAIL $Name`: $($_.Exception.Message)"
     }
 }
@@ -320,8 +357,10 @@ function Assert-CapRejects {
             Write-JournalContractJson (Join-Path $contractRoot 'actor-cleanup.json') @{
                 receipts = @($cleanup.ToArray()); expected = 2; failures = @($cleanupErrors.ToArray())
             }
-            Assert-CapTest ($cleanup.Count -eq 2 -and $cleanupErrors.Count -eq 0) `
-                "Empty/incomplete actual actor cleanup: $($cleanupErrors -join '; ')"
+            if ($cleanup.Count -ne 2 -or $cleanupErrors.Count -ne 0) {
+                Assert-CapTest ($cleanup.Count -eq 2 -and $cleanupErrors.Count -eq 0) `
+                    (Format-JournalActorCleanupFailure $contractRoot @($cleanupErrors.ToArray()))
+            }
         }
     }
 
@@ -1627,6 +1666,495 @@ function Invoke-CapJournalTimingContract {
         mode = 'Actual file Open/Copy observations plus elapsed-clock refusal; no native target.' }
 }
 
+function New-CapFirstOpenContext {
+    param([string]$Name)
+    $directory = Join-Path $scratch $Name
+    $null = New-Item -ItemType Directory -Path (Join-Path $directory 'snapshots')
+    $binding = [pscustomobject]@{
+        runId = [guid]::NewGuid().ToString(); leaseId = [guid]::NewGuid().ToString()
+        jobSha256 = ('A' * 64); moduleSha256 = $sourceHashesBefore[$modulePath]
+        workerSha256 = $sourceHashesBefore[$workerPath]; supervisorSha256 = $sourceHashesBefore[$supervisorPath]
+        workerPid = 1L; workerCreationFileTimeUtc = 1L; workerImagePath = 'C:\synthetic-worker.exe'
+        workerExecutableSha256 = ('B' * 64); workerParentPid = 2L; workerSessionId = 1L
+        workerRole = 'SYNTHETIC_FIRST_OPEN_FILE_IO'
+    }
+    $state = New-CapJournalState -Root $scratch -Directory (Join-Path $directory 'snapshots') `
+        -Binding $binding -DeadlineUtc ([DateTime]::UtcNow.AddMinutes(2)) `
+        -ObservationPath (Join-Path $directory 'observations.jsonl')
+    $null = Publish-CapJournalSnapshot $state Bootstrap ([pscustomobject]@{ entries = @(); counter = 1L })
+    return $state
+}
+
+function Wait-CapMeasuredDelay {
+    param([Diagnostics.Stopwatch]$Clock, [double]$Milliseconds = 1500)
+    $cap = [Diagnostics.Stopwatch]::StartNew()
+    while ($Clock.Elapsed.TotalMilliseconds -lt $Milliseconds) {
+        if ($cap.Elapsed.TotalMilliseconds -ge 5000) {
+            $failure = [IO.IOException]::new('HARNESSFAIL: elapsed delay did not reach its unchanged threshold within 5000ms.')
+            $failure.Data['CapTestHarnessFailure'] = 'ElapsedDelay'
+            $failure.Data['CapTestDetail'] = @{ delayMilliseconds = $Clock.Elapsed.TotalMilliseconds
+                capMilliseconds = $cap.Elapsed.TotalMilliseconds; requiredMilliseconds = $Milliseconds }
+            throw $failure
+        }
+        Start-Sleep -Milliseconds ([int][Math]::Max(1, [Math]::Ceiling(
+            [Math]::Min(100, $Milliseconds - $Clock.Elapsed.TotalMilliseconds))))
+    }
+    if ($cap.Elapsed.TotalMilliseconds -ge 5000) {
+        $failure = [IO.IOException]::new('HARNESSFAIL: elapsed delay exceeded its 5000ms cap.')
+        $failure.Data['CapTestHarnessFailure'] = 'ElapsedDelay'
+        $failure.Data['CapTestDetail'] = @{ delayMilliseconds = $Clock.Elapsed.TotalMilliseconds
+            capMilliseconds = $cap.Elapsed.TotalMilliseconds; requiredMilliseconds = $Milliseconds }
+        throw $failure
+    }
+}
+
+function Invoke-CapJournalObservationContract {
+    if (-not ('CapObservationFlushStream' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Diagnostics;
+using System.Threading;
+public sealed class CapObservationFlushStream : FileStream {
+    public static int DurableCalls;
+    public static int BufferedCalls;
+    public static double DelayMilliseconds;
+    public static bool DelayDurable = true;
+    public static bool FailFlush;
+    public static int FlushDelayMilliseconds;
+    public static int DisposeDelayMilliseconds;
+    public static int ReaderOpenCalls;
+    public static int InjectedSharingErrors;
+    public static int ReaderErrorHresult = unchecked((int)0x80070020);
+    public static FileStream OpenJournal(string path, FileMode mode, FileAccess access, FileShare share) {
+        ReaderOpenCalls++;
+        if (ReaderOpenCalls <= 2) {
+            InjectedSharingErrors++;
+            throw new IOException("Injected journal Open HRESULT.", ReaderErrorHresult);
+        }
+        return File.Open(path, mode, access, share);
+    }
+    public CapObservationFlushStream(string path, FileMode mode, FileAccess access, FileShare share)
+        : base(path, mode, access, share) { }
+    public override void Flush(bool flushToDisk) {
+        if (flushToDisk) {
+            DurableCalls++;
+            if (DelayDurable) {
+                var clock = Stopwatch.StartNew();
+                while (clock.Elapsed.TotalMilliseconds < 1500) {
+                    if (clock.Elapsed.TotalMilliseconds >= 5000)
+                        throw new IOException("HARNESSFAIL: slow durability seam exceeded 5000ms.");
+                    Thread.Sleep(Math.Max(1, (int)Math.Ceiling(Math.Min(100, 1500-clock.Elapsed.TotalMilliseconds))));
+                }
+                DelayMilliseconds = clock.Elapsed.TotalMilliseconds;
+                if (DelayMilliseconds >= 5000)
+                    throw new IOException("HARNESSFAIL: slow durability seam exceeded 5000ms.");
+            }
+        }
+        base.Flush(flushToDisk);
+    }
+    public override void Flush() {
+        BufferedCalls++;
+        if (FailFlush) throw new IOException("Injected observation flush failure.");
+        WaitMeasuredDelay(FlushDelayMilliseconds);
+        base.Flush();
+    }
+    protected override void Dispose(bool disposing) {
+        try { if (disposing) WaitMeasuredDelay(DisposeDelayMilliseconds); }
+        finally { base.Dispose(disposing); }
+    }
+    private static void WaitMeasuredDelay(int milliseconds) {
+        var clock = Stopwatch.StartNew();
+        while (clock.Elapsed.TotalMilliseconds < milliseconds && clock.Elapsed.TotalMilliseconds < 5000)
+            Thread.Sleep(Math.Max(1, (int)Math.Ceiling(Math.Min(10, milliseconds-clock.Elapsed.TotalMilliseconds))));
+        if (clock.Elapsed.TotalMilliseconds >= 5000) {
+            var failure = new IOException("HARNESSFAIL: observation measurement delay exceeded 5000ms.");
+            failure.Data["CapTestHarnessFailure"] = "ElapsedDelay";
+            throw failure;
+        }
+    }
+}
+'@
+    }
+    [CapObservationFlushStream]::DurableCalls = 0
+    [CapObservationFlushStream]::BufferedCalls = 0
+    [CapObservationFlushStream]::DelayMilliseconds = 0
+    [CapObservationFlushStream]::DelayDurable = $true
+    $state = New-CapFirstOpenContext 'observation-buffered-success'
+    $module = Get-Module UiCaptureDriver
+    $original = & $module { (Get-Item Function:Write-CapJournalObservation).ScriptBlock }
+    $originalReader = & $module { (Get-Item Function:Read-CapJournalObject).ScriptBlock }
+    $needle = '[IO.File]::Open($State.ObservationPath,'
+    Assert-CapTest ([regex]::Matches($original.ToString(), [regex]::Escape($needle)).Count -eq 1) `
+        'Observation seam requires exactly one actual file-open constructor.'
+    $injected = [scriptblock]::Create($original.ToString().Replace($needle,
+        '[CapObservationFlushStream]::new($State.ObservationPath,'))
+    $readerNeedle = '[IO.File]::Open($path,'
+    Assert-CapTest ([regex]::Matches($originalReader.ToString(), [regex]::Escape($readerNeedle)).Count -eq 1) `
+        'Retry seam requires exactly one actual reader file-open constructor.'
+    $injectedReader = [scriptblock]::Create($originalReader.ToString().Replace($readerNeedle,
+        '[CapObservationFlushStream]::OpenJournal($path,'))
+    try {
+        & $module { param($Body) Set-Item Function:Write-CapJournalObservation -Value $Body } $injected
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        $reading = $null
+        $readFailure = $null
+        try { $reading = Read-CapJournalSnapshot $state }
+        catch { $readFailure = $_.Exception.ToString() }
+        $clock.Stop()
+        $detail = @{ elapsedMilliseconds = $clock.Elapsed.TotalMilliseconds
+            injectedDurableDelayMilliseconds = [CapObservationFlushStream]::DelayMilliseconds
+            durableCalls = [CapObservationFlushStream]::DurableCalls
+            bufferedCalls = [CapObservationFlushStream]::BufferedCalls
+            readFailure = $readFailure; seam = 'Actual writer with only File.Open constructor replaced; actual reader and file IO.' }
+        Assert-CapTest ($null -eq $readFailure -and $null -ne $reading -and
+            $reading.Snapshot.Reference.length -gt 0 -and $clock.Elapsed.TotalMilliseconds -lt 1000) `
+            'Success observations consumed the I/O budget through the injected 1500ms disk-flush seam.' $detail
+        $events = @(Get-Content -LiteralPath $state.ObservationPath | ForEach-Object { ConvertFrom-Json $_ })
+        Assert-CapTest ($events.Count -eq 2 -and $events[0].decision -ceq 'ReadVerified' -and
+            $events[1].decision -ceq 'AcceptedLiveSequenceOnly' -and
+            [CapObservationFlushStream]::DurableCalls -eq 0 -and
+            [CapObservationFlushStream]::BufferedCalls -eq 2) `
+            'Buffered observations changed the existing count or invoked durable success flushing.' $detail
+        Assert-CapTest ($null -eq $events[0].previousObservationWriteMs -and
+            $null -eq $events[0].previousObservationOrdinal -and $events[0].observationOrdinal -eq 1 -and
+            $events[1].observationOrdinal -eq 2 -and $events[1].previousObservationOrdinal -eq 1 -and
+            $events[1].previousObservationWriteMs -gt 0 -and
+            $events[0].observationTransactionId -cmatch '\A[0-9a-f]{32}\z' -and
+            $events[1].observationTransactionId -ceq $events[0].observationTransactionId -and
+            $events[1].runId -ceq $events[0].runId) `
+            'Lagged observation timing lost its first-record nulls or causal transaction/ordinal binding.'
+        $retryState = New-CapFirstOpenContext 'observation-buffered-retry'
+        $retryPath = Join-Path $retryState.Directory '000001.json'
+        [CapObservationFlushStream]::ReaderOpenCalls = 0
+        [CapObservationFlushStream]::InjectedSharingErrors = 0
+        $probeErrors = [Collections.Generic.List[string]]::new()
+        foreach ($probe in 1..2) {
+            try {
+                $unexpected = [CapObservationFlushStream]::OpenJournal($retryPath,
+                    [IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+                $unexpected.Dispose()
+                throw 'Configured sharing-error probe unexpectedly opened.'
+            } catch {
+                $native = & $module { param($Failure) Get-CapJournalNativeError $Failure } $_.Exception
+                Assert-CapTest ($native -ceq '80070020') 'Sharing-error probe lost its injected typed HRESULT.'
+                $probeErrors.Add($native)
+            }
+        }
+        $probeStream = [CapObservationFlushStream]::OpenJournal($retryPath,
+            [IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+        try { Assert-CapTest ($probeStream.Length -gt 0) 'Third configured Open did not read a nonempty real file.' }
+        finally { $probeStream.Dispose() }
+        [CapObservationFlushStream]::ReaderOpenCalls = 0
+        [CapObservationFlushStream]::InjectedSharingErrors = 0
+        [CapObservationFlushStream]::DurableCalls = 0
+        [CapObservationFlushStream]::BufferedCalls = 0
+        [CapObservationFlushStream]::DelayMilliseconds = 0
+        & $module { param($Body) Set-Item Function:Read-CapJournalObject -Value $Body } $injectedReader
+        $retryTransaction = & $module { param($State) New-CapJournalTransaction $State } $retryState
+        $retryClock = [Diagnostics.Stopwatch]::StartNew()
+        $retryRead = $null
+        $retryFailure = $null
+        try {
+            $retryRead = & $module {
+                param($State,$Transaction)
+                Read-CapJournalObject $State 1 $Transaction
+            } $retryState $retryTransaction
+            & $module {
+                param($State,$Transaction)
+                Write-CapJournalObservation $State 1 3 'AcceptedLiveSequenceOnly' $null $Transaction
+                Assert-CapJournalTime $Transaction 1
+            } $retryState $retryTransaction
+        } catch { $retryFailure = $_.Exception.ToString() }
+        $retryClock.Stop()
+        $retryDetail = @{ elapsedMilliseconds = $retryClock.Elapsed.TotalMilliseconds
+            injectedSharingErrors = [CapObservationFlushStream]::InjectedSharingErrors
+            actualReaderOpenCalls = [CapObservationFlushStream]::ReaderOpenCalls
+            retries = $retryTransaction.Retries; attempts = $retryTransaction.Attempts[1L]
+            durableCalls = [CapObservationFlushStream]::DurableCalls
+            bufferedCalls = [CapObservationFlushStream]::BufferedCalls
+            injectedDurableDelayMilliseconds = [CapObservationFlushStream]::DelayMilliseconds
+            probeErrors = @($probeErrors.ToArray()); probeThirdRealFile = $true; failure = $retryFailure
+            seam = 'Injected typed sharing HRESULTs, not kernel sharing evidence; unique reader Open constructor substitution.' }
+        Assert-CapTest ($null -eq $retryFailure -and $null -ne $retryRead -and
+            $retryRead.Reference.length -gt 0 -and $retryClock.Elapsed.TotalMilliseconds -lt 1000 -and
+            [CapObservationFlushStream]::InjectedSharingErrors -eq 2 -and
+            [CapObservationFlushStream]::ReaderOpenCalls -eq 3 -and
+            $retryTransaction.Retries -eq 2 -and $retryTransaction.Attempts[1L] -eq 3) `
+            'Transient retry observations consumed the unchanged read budget through slow durable flush.' $retryDetail
+        Assert-CapTest ([CapObservationFlushStream]::BufferedCalls -eq 4 -and
+            [CapObservationFlushStream]::DurableCalls -eq 0) `
+            'Two transient failures and two successes must use exactly four buffered writes.' $retryDetail
+        $detail.retry = $retryDetail
+        & $module { param($Body) Set-Item Function:Read-CapJournalObject -Value $Body } $originalReader
+        [CapObservationFlushStream]::DelayDurable = $false
+        $transaction = & $module { param($State) New-CapJournalTransaction $State } $state
+        & $module {
+            param($State,$Transaction)
+            Write-CapJournalObservation $State 1 1 'OtherNonFailureDecision' $null $Transaction
+            Write-CapJournalObservation $State 1 1 'OpenFailed' '80070020' $Transaction
+            Write-CapJournalObservation $State 1 1 'OpenFailed' '80070005' $Transaction -TerminalFailure
+            Write-CapJournalObservation $State 1 1 'ReadVerified' $null $Transaction -TerminalFailure
+            Write-CapJournalObservation $State 1 1 'OtherNonFailureDecision' $null $Transaction -TerminalFailure
+        } $state $transaction
+        Assert-CapTest ([CapObservationFlushStream]::BufferedCalls -eq 8 -and
+            [CapObservationFlushStream]::DurableCalls -eq 1) `
+            'Transient failures and successes must be buffered; only terminal failures may request durability.' $detail
+        $durableBefore = [CapObservationFlushStream]::DurableCalls
+        $bufferedBefore = [CapObservationFlushStream]::BufferedCalls
+        $terminalState = New-CapFirstOpenContext 'observation-terminal-policy'
+        $terminalState.ObservationPath = Join-Path (Split-Path -Parent $terminalState.Directory) 'terminal-observations.jsonl'
+        $capTransaction = & $module { param($State) New-CapJournalTransaction $State } $terminalState
+        $capTransaction.Retries = 7
+        $null = Assert-CapRejects {
+            & $module { param($State,$Transaction) Read-CapJournalObject $State 2 $Transaction } $terminalState $capTransaction
+        } 'JournalUnavailable'
+        Assert-CapTest ($capTransaction.Retries -eq 7 -and $capTransaction.Attempts[2L] -eq 1) `
+            'Terminal global-cap fixture changed the existing retry/attempt state.'
+        $manifestTransaction = & $module { param($State) New-CapJournalTransaction $State -ManifestBudget } $terminalState
+        $manifestTransaction.Retries = 7
+        $null = Assert-CapRejects {
+            & $module {
+                param($State,$Transaction)
+                Open-CapJournalManifestStream $State (Join-Path $State.Directory 'missing-manifest.json') $Transaction 1
+            } $terminalState $manifestTransaction
+        } 'JournalUnavailable'
+        [CapObservationFlushStream]::ReaderOpenCalls = 0
+        [CapObservationFlushStream]::ReaderErrorHresult = [int]-2147024891
+        & $module { param($Body) Set-Item Function:Read-CapJournalObject -Value $Body } $injectedReader
+        $deniedTransaction = & $module { param($State) New-CapJournalTransaction $State } $terminalState
+        try {
+            $null = Assert-CapRejects {
+                & $module { param($State,$Transaction) Read-CapJournalObject $State 1 $Transaction } $terminalState $deniedTransaction
+            } 'JournalAccessDenied'
+        } finally {
+            [CapObservationFlushStream]::ReaderErrorHresult = [int]-2147024864
+            & $module { param($Body) Set-Item Function:Read-CapJournalObject -Value $Body } $originalReader
+        }
+        $null = & $module {
+            param($State,$Transaction)
+            Write-CapJournalObservation $State 1 1 'CopyFailed' '80070020' $Transaction
+            Write-CapJournalObservation $State 1 1 'DeadlineExhausted' '80070020' $Transaction
+            Write-CapJournalObservation $State 1 1 'FinalManifestOpenFailed' '80070020' $Transaction
+        } $terminalState $deniedTransaction
+        Assert-CapTest ([CapObservationFlushStream]::DurableCalls -eq $durableBefore + 5 -and
+            [CapObservationFlushStream]::BufferedCalls -eq $bufferedBefore + 1 -and
+            $deniedTransaction.Retries -eq 0 -and $deniedTransaction.Attempts[1L] -eq 1) `
+            'Terminal reader/cap/manifest/copy/deadline policy or transient manifest buffering differs.'
+        $actorRoot = Join-Path $scratch 'actor-primary-message'
+        $null = New-Item -ItemType Directory -Path $actorRoot
+        Write-JournalContractJson (Join-Path $actorRoot 'Reader-failed.json') @{
+            error = 'JournalUnavailable: retained known reader primary'
+        }
+        Write-JournalContractJson (Join-Path $actorRoot 'Writer-failed.json') @{
+            error = 'Writer retained known primary'
+        }
+        $message = Format-JournalActorCleanupFailure $actorRoot @('Actor normal exit/kernel/bothEOF not proven.')
+        $rendered = Assert-CapRejects { Assert-CapTest $false $message } 'Empty/incomplete actual actor cleanup'
+        Assert-CapTest ($rendered.Contains('Actor normal exit/kernel/bothEOF not proven.') -and
+            $rendered.Contains('JournalUnavailable: retained known reader primary') -and
+            $rendered.Contains('Writer retained known primary')) `
+            'Actual cleanup assertion message masked actor primary or weakened cleanup failure detail.'
+        $missingRoot = Join-Path $scratch 'actor-primary-missing'
+        $missingMessage = Format-JournalActorCleanupFailure $missingRoot @('EOF not proven')
+        Assert-CapTest ($missingMessage.Contains('Reader-failed.json: MISSING') -and
+            $missingMessage.Contains('Writer-failed.json: MISSING')) 'Missing actor primary must be explicit.'
+        $boundedRoot = Join-Path $scratch 'actor-primary-bounded'
+        $null = New-Item -ItemType Directory -Path (Join-Path $boundedRoot 'Reader-failed.json')
+        [IO.File]::WriteAllText((Join-Path $boundedRoot 'Writer-failed.json'),('x' * 17000))
+        $boundedMessage = Format-JournalActorCleanupFailure $boundedRoot @('EOF not proven')
+        Assert-CapTest ($boundedMessage.Contains('Reader-failed.json: READ_ERROR') -and
+            $boundedMessage.Contains('[TRUNCATED at 16384 bytes]') -and $boundedMessage.Length -lt 17000) `
+            'Unreadable or oversized actor primary must be explicit and bounded.'
+        $detail.actorFailureMessage = $rendered
+        $measured = & $module { param($State) New-CapJournalTransaction $State } $state
+        [CapObservationFlushStream]::FlushDelayMilliseconds = 60
+        [CapObservationFlushStream]::DisposeDelayMilliseconds = 60
+        & $module {
+            param($State,$Transaction)
+            Write-CapJournalObservation $State 1 1 'MeasuredCompletion' $null $Transaction
+        } $state $measured
+        $completed = $measured.LastCompletedObservationWriteMilliseconds
+        Assert-CapTest ($completed -ge 120 -and $measured.LastCompletedObservationOrdinal -eq 1) `
+            'Completed observation measurement excluded its actual Flush or Dispose delay.'
+        [CapObservationFlushStream]::FailFlush = $true
+        try {
+            $null = Assert-CapRejects {
+                & $module {
+                    param($State,$Transaction)
+                    Write-CapJournalObservation $State 1 1 'InjectedFailedWrite' $null $Transaction
+                } $state $measured
+            } 'JournalObservationFailure'
+        } finally { [CapObservationFlushStream]::FailFlush = $false }
+        Assert-CapTest ($measured.ObservationOrdinal -eq 2 -and
+            $measured.LastCompletedObservationOrdinal -eq 1 -and
+            $measured.LastCompletedObservationWriteMilliseconds -eq $completed) `
+            'Failed observation advanced the last-completed timing pair.'
+        & $module {
+            param($State,$Transaction)
+            Write-CapJournalObservation $State 1 1 'AfterFailedWrite' $null $Transaction
+        } $state $measured
+        $last = Get-Content -LiteralPath $state.ObservationPath | Select-Object -Last 1 | ConvertFrom-Json
+        Assert-CapTest ($last.observationOrdinal -eq 3 -and $last.previousObservationOrdinal -eq 1 -and
+            $last.previousObservationWriteMs -eq $completed -and
+            $last.observationTransactionId -ceq $measured.ObservationTransactionId -and
+            $last.observationTransactionId -cne $events[0].observationTransactionId -and
+            $measured.LastCompletedObservationOrdinal -eq 3) `
+            'The following record fabricated N-1 or crossed transaction timing identities.'
+        $detail.completedObservationWriteMilliseconds = $completed
+        $detail.failedOrdinalSkipped = 2
+        return $detail
+    } finally {
+        try { & $module { param($Body) Set-Item Function:Read-CapJournalObject -Value $Body } $originalReader }
+        finally { & $module { param($Body) Set-Item Function:Write-CapJournalObservation -Value $Body } $original }
+        $restoredReader = & $module { (Get-Item Function:Read-CapJournalObject).ScriptBlock.ToString() }
+        Assert-CapTest ($restoredReader -ceq $originalReader.ToString()) 'Actual journal reader was not restored after retry seam.'
+        [CapObservationFlushStream]::FailFlush = $false
+        [CapObservationFlushStream]::ReaderErrorHresult = [int]-2147024864
+        [CapObservationFlushStream]::FlushDelayMilliseconds = 0
+        [CapObservationFlushStream]::DisposeDelayMilliseconds = 0
+        $restored = & $module { (Get-Item Function:Write-CapJournalObservation).ScriptBlock.ToString() }
+        Assert-CapTest ($restored -ceq $original.ToString()) 'Actual observation writer was not restored after its test seam.'
+    }
+}
+
+function Invoke-CapFirstOpenGroups {
+    Invoke-CapTest 'journal first Open excludes actual 1500ms caller preparation and starts only once' {
+        $state = New-CapFirstOpenContext 'first-open-delay'
+        $held = [IO.File]::Open((Join-Path $state.Directory '000001.json'), [IO.FileMode]::Open,
+            [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        try {
+            $proof = & (Get-Module UiCaptureDriver) {
+                param($State,$WaitDelay)
+                $transaction = New-CapJournalTransaction $State
+                $delay = [Diagnostics.Stopwatch]::StartNew()
+                & $WaitDelay $delay
+                $delay.Stop()
+                Assert-CapJournalTime $transaction 1
+                $names = Get-CapJournalNames $State
+                $read = Read-CapJournalObject $State 1 $transaction
+                [pscustomobject]@{ Transaction = $transaction; Read = $read
+                    DelayMilliseconds = $delay.Elapsed.TotalMilliseconds; Names = $names.Count }
+            } $state ${function:Wait-CapMeasuredDelay}
+            Assert-CapTest ($proof.DelayMilliseconds -ge 1500 -and $proof.Names -eq 1 -and
+                $proof.Read.Reference.length -gt 0 -and $proof.Read.Payload.data.counter -eq 1) `
+                'Actual delayed caller preparation did not return the nonempty valid held-file publication.' `
+                @{ delayMilliseconds = $proof.DelayMilliseconds; names = $proof.Names
+                    length = $proof.Read.Reference.length; counter = $proof.Read.Payload.data.counter }
+            $clock = $proof.Transaction.IoClock
+            $deadline = $proof.Transaction.DeadlineUtc
+            $null = & (Get-Module UiCaptureDriver) {
+                param($State,$Transaction) Read-CapJournalObject $State 1 $Transaction
+            } $state $proof.Transaction
+            Assert-CapTest ([object]::ReferenceEquals($clock, $proof.Transaction.IoClock) -and
+                $deadline -eq $proof.Transaction.DeadlineUtc -and $proof.Transaction.Attempts[1L] -eq 2 -and
+                $proof.Transaction.Retries -eq 0 -and $proof.Transaction.PreOpenElapsedMilliseconds -ge 1500) `
+                'A later object read restarted the transaction I/O budget or reset its counters.'
+            $events = @(Get-Content -LiteralPath $state.ObservationPath | ForEach-Object { ConvertFrom-Json $_ })
+            Assert-CapTest ($events.Count -eq 2 -and
+                @($events | Where-Object { $_.PSObject.Properties.Name -contains 'preOpenMs' -or
+                    $_.PSObject.Properties.Name -contains 'firstOpen' }).Count -eq 0) `
+                'First-Open diagnostics added success-path observation fields or writes.'
+            $retryState = New-CapFirstOpenContext 'first-open-shared-retries'
+            $retryState.ObservationPath = $null
+            $retryTransaction = & (Get-Module UiCaptureDriver) { param($State) New-CapJournalTransaction $State } $retryState
+            $retryClock = $null
+            $retryDeadline = $null
+            foreach ($sequence in @(2L,3L)) {
+                $null = Assert-CapRejects {
+                    & (Get-Module UiCaptureDriver) {
+                        param($State,$Transaction,$Sequence)
+                        try { Read-CapJournalObject $State $Sequence $Transaction }
+                        catch {
+                            if ($_.Exception.Data['CapJournalFailure'] -cne 'JournalUnavailable') {
+                                throw 'Retry refusal lost its typed journal classification.'
+                            }
+                            throw
+                        }
+                    } $retryState $retryTransaction $sequence
+                } 'JournalUnavailable'
+                if ($sequence -eq 2L) {
+                    $retryClock = $retryTransaction.IoClock
+                    $retryDeadline = $retryTransaction.DeadlineUtc
+                }
+            }
+            Assert-CapTest ($null -ne $retryClock -and [object]::ReferenceEquals($retryClock, $retryTransaction.IoClock) -and
+                $retryDeadline -eq $retryTransaction.DeadlineUtc -and $retryTransaction.Retries -eq 7 -and
+                $retryTransaction.Attempts[2L] -eq 8 -and $retryTransaction.Attempts[3L] -eq 1) `
+                'A new sequence reset the shared I/O budget, eight-attempt cap, or seven global retries.'
+            return @{ delayMilliseconds = $proof.DelayMilliseconds; length = $proof.Read.Reference.length
+                attempts = $proof.Transaction.Attempts[1L]; budgetMilliseconds = $proof.Transaction.BudgetMilliseconds }
+        } finally { $held.Dispose() }
+    }
+    Invoke-CapTest 'journal absolute deadline refuses pre-Open without an attempt and clips the once-started budget' {
+        $state = New-CapFirstOpenContext 'first-open-absolute'
+        $state.DeadlineUtc = [DateTime]::UtcNow.AddMilliseconds(250)
+        $transaction = & (Get-Module UiCaptureDriver) { param($State) New-CapJournalTransaction $State } $state
+        $delay = [Diagnostics.Stopwatch]::StartNew()
+        Wait-CapMeasuredDelay $delay
+        $delay.Stop()
+        $failure = Assert-CapRejects {
+            & (Get-Module UiCaptureDriver) { param($State,$Transaction) Read-CapJournalObject $State 1 $Transaction } $state $transaction
+        } 'JournalUnavailable'
+        Assert-CapTest ($delay.Elapsed.TotalMilliseconds -ge 1500 -and
+            $failure -match 'preOpenMs=([0-9]+\.[0-9]+)' -and
+            [double]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture) -ge 1500 -and
+            $failure.Contains('firstOpen=NOT_ATTEMPTED') -and $transaction.Attempts.Count -eq 0 -and
+            $null -eq $transaction.OpenElapsedMilliseconds -and $null -eq $transaction.CopyElapsedMilliseconds) `
+            'Absolute refusal lost elapsed pre-open time, fabricated an Open, or allowed late success.' `
+            @{ delayMilliseconds = $delay.Elapsed.TotalMilliseconds; refusal = $failure }
+        $observations = @(Get-Content -LiteralPath $state.ObservationPath | ForEach-Object { ConvertFrom-Json $_ })
+        Assert-CapTest ($observations.Count -eq 1 -and $observations[0].decision -ceq 'DeadlineExhausted' -and
+            $observations[0].preOpenMs -ge 1500 -and $observations[0].firstOpen -ceq 'NOT_ATTEMPTED') `
+            'Absolute pre-open refusal lacks its failure-only observation.'
+        $state = New-CapFirstOpenContext 'first-open-clipped'
+        $state.DeadlineUtc = [DateTime]::UtcNow.AddMilliseconds(750)
+        $proof = & (Get-Module UiCaptureDriver) {
+            param($State)
+            $transaction = New-CapJournalTransaction $State
+            Start-Sleep -Milliseconds 250
+            $read = Read-CapJournalObject $State 1 $transaction
+            [pscustomobject]@{ Transaction = $transaction; Read = $read }
+        } $state
+        Assert-CapTest ($proof.Read.Reference.length -gt 0 -and $proof.Transaction.BudgetMilliseconds -gt 0 -and
+            $proof.Transaction.BudgetMilliseconds -lt 750 -and $proof.Transaction.DeadlineUtc -le $state.DeadlineUtc) `
+            'First Open did not clip its I/O budget to the absolute deadline.'
+        Start-Sleep -Milliseconds 800
+        $null = Assert-CapRejects {
+            & (Get-Module UiCaptureDriver) { param($State,$Transaction) Read-CapJournalObject $State 1 $Transaction } $state $proof.Transaction
+        } 'JournalUnavailable'
+        Assert-CapTest ($proof.Transaction.Attempts[1L] -eq 1) 'Absolute expiry allowed another Open or reset the attempt count.'
+        $manifestState = New-CapFirstOpenContext 'manifest-creation-budget'
+        $manifestTransaction = & (Get-Module UiCaptureDriver) {
+            param($State) New-CapJournalTransaction $State -ManifestBudget
+        } $manifestState
+        Start-Sleep -Milliseconds 1500
+        $manifestFailure = Assert-CapRejects {
+            & (Get-Module UiCaptureDriver) {
+                param($State,$Transaction)
+                Open-CapJournalManifestStream $State (Join-Path $State.Directory '000001.json') $Transaction 1
+            } $manifestState $manifestTransaction
+        } 'JournalUnavailable'
+        Assert-CapTest ($manifestTransaction.BudgetMilliseconds -eq 1000 -and
+            [object]::ReferenceEquals($manifestTransaction.Clock, $manifestTransaction.IoClock) -and
+            $null -eq $manifestTransaction.PreOpenElapsedMilliseconds -and
+            $manifestFailure.Contains('firstOpen=NOT_ATTEMPTED')) `
+            'Final manifest lost its creation-started 1000ms budget or attempted a late Open.'
+        $manifestState.ObservationPath = $manifestState.Directory
+        try {
+            & (Get-Module UiCaptureDriver) { param($Transaction) Assert-CapJournalTime $Transaction 1 } $manifestTransaction
+            throw 'Expired manifest unexpectedly passed with an unavailable observation sink.'
+        } catch {
+            Assert-CapTest ($_.Exception.Data['CapJournalFailure'] -ceq 'JournalUnavailable' -and
+                $_.Exception.Data.Contains('CapJournalObservationFailure')) `
+                'Failure observation masked the primary JournalUnavailable instead of retaining a secondary diagnostic.'
+        }
+        return @{ subcases = 4; delayMilliseconds = $delay.Elapsed.TotalMilliseconds
+            preOpenRefusal = $failure; manifestRefusal = $manifestFailure
+            clippedBudgetMilliseconds = $proof.Transaction.BudgetMilliseconds }
+    }
+}
+
 function Invoke-CapPreflightReportContract {
     $ast = [Management.Automation.Language.Parser]::ParseFile($supervisorPath,[ref]$null,[ref]$null)
     $definitions = @($ast.FindAll({ param($node)
@@ -1701,25 +2229,34 @@ if ($PreflightReportContractOnly) {
     exit 0
 }
 
-if ($FixtureContractOnly -or $JournalTimingContractOnly) {
+if ($FixtureContractOnly -or $JournalTimingContractOnly -or $JournalFirstOpenContractOnly -or $JournalObservationContractOnly) {
     if ($FixtureContractOnly) {
         Invoke-CapTest 'prebuilt fixture binder accepts exact artifacts and refuses missing or tampered bytes' { Invoke-CapPrebuiltFixtureContract }
     }
     if ($JournalTimingContractOnly) {
         Invoke-CapTest 'journal phase timing records open copy total without changing budget or retry limits' { Invoke-CapJournalTimingContract }
     }
+    if ($JournalFirstOpenContractOnly) { Invoke-CapFirstOpenGroups }
+    if ($JournalObservationContractOnly) {
+        Invoke-CapTest 'journal success observations bypass slow durable flush without changing the read budget or observation count' {
+            Invoke-CapJournalObservationContract
+        }
+    }
     $passed = @($results | Where-Object passed -EQ $true).Count
     $failed = @($results | Where-Object passed -EQ $false).Count
     $report = [pscustomobject]@{ suite = 'UiCaptureSetupContracts'; executed = $results.Count; passed = $passed; failed = $failed
-        cases = @($results); mode = 'BINDER_AND_TIMING_FILE_IO_NO_COMPILER_OR_TARGET' }
+        cases = @($results); mode = if ($JournalObservationContractOnly) {
+            'FILE_IO_IN_PROCESS_CSHARP_SEAM_NO_NATIVE_FIXTURE_COMPILER_OR_TARGET'
+        } else { 'BINDER_AND_TIMING_FILE_IO_NO_COMPILER_OR_TARGET' } }
     $report | ConvertTo-Json -Depth 25 | Set-Content -LiteralPath (Join-Path $scratch 'report.json') -Encoding utf8NoBOM
     $report | Select-Object suite,executed,passed,failed | ConvertTo-Json -Compress
-    if ($results.Count -ne ([int]$FixtureContractOnly.IsPresent + [int]$JournalTimingContractOnly.IsPresent) -or $failed -ne 0) { exit 1 }
+    if ($results.Count -ne ([int]$FixtureContractOnly.IsPresent + [int]$JournalTimingContractOnly.IsPresent +
+        2 * [int]$JournalFirstOpenContractOnly.IsPresent + [int]$JournalObservationContractOnly.IsPresent) -or $failed -ne 0) { exit 1 }
     exit 0
 }
 
 if ($PrepareFixturesOnly) {
-    if ($ReceiptContractOnly -or $FixtureContractOnly -or $JournalTimingContractOnly -or $PrebuiltFixtureManifest) {
+    if ($ReceiptContractOnly -or $FixtureContractOnly -or $JournalTimingContractOnly -or $JournalFirstOpenContractOnly -or $JournalObservationContractOnly -or $PrebuiltFixtureManifest) {
         throw 'Fixture preparation cannot also consume or run contract suites.'
     }
     $null = New-CapHarmlessTarget
@@ -1749,6 +2286,10 @@ try {
     if (-not $LaunchContractOnly) {
         Invoke-CapTest 'prebuilt fixture binder accepts exact artifacts and refuses missing or tampered bytes' { Invoke-CapPrebuiltFixtureContract }
         Invoke-CapTest 'journal phase timing records open copy total without changing budget or retry limits' { Invoke-CapJournalTimingContract }
+        Invoke-CapFirstOpenGroups
+        Invoke-CapTest 'journal success observations bypass slow durable flush without changing the read budget or observation count' {
+            Invoke-CapJournalObservationContract
+        }
         Invoke-CapTest 'actual exit receipt reader retries sharing and partial JSON with typed deadline and identity refusal' {
             $details = @(
                 foreach ($receiptCaseName in @('exclusive-release','exclusive-deadline','partial-json','foreign-job','foreign-generation')) {
@@ -2746,6 +3287,6 @@ try {
 }
 [ordered]@{ suite = $suiteName; executed = $results.Count; passed = $passed; failed = $failed; artifacts = $scratch } |
     ConvertTo-Json -Compress
-$expectedCount = if ($JournalContractOnly) { 10 } elseif ($LaunchContractOnly) { 2 } elseif ($RequireRealSeed) { 72 } else { 69 }
+$expectedCount = if ($JournalContractOnly) { 10 } elseif ($LaunchContractOnly) { 2 } elseif ($RequireRealSeed) { 75 } else { 72 }
 if ($results.Count -ne $expectedCount -or $failed -ne 0 -or $passed -ne $results.Count) { exit 1 }
 exit 0
