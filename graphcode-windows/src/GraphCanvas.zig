@@ -704,6 +704,10 @@ pub fn paint(
                 if (resolveCardRoles(allocator, graph.nodes.items, graph.edges.items, declared_entries)) |roles| {
                     defer allocator.free(roles);
                     for (graph.nodes.items, 0..) |node, index| {
+                        drawLoopCardShadow(hdc, allocator, node, nodeBounds(index, state), state, roles[index],
+                            needsAttention(node, graph.nodes.items, graph.edges.items), model.selectedIndex() == index);
+                    }
+                    for (graph.nodes.items, 0..) |node, index| {
                         drawNode(
                             hdc,
                             allocator,
@@ -869,6 +873,10 @@ fn drawOverview(
             } else {
                 drawTextRect(hdc, allocator, "Worktree notice unavailable", notice_bounds, scaledValue(9, state.zoom), 0x00B8B8BE, c.DT_LEFT | c.DT_SINGLELINE | c.DT_VCENTER);
             }
+        }
+        for (graph.nodes.items, 0..) |node, node_index| {
+            drawLoopCardShadow(hdc, allocator, node, overviewCardBounds(model, graph_index, node_index, bounds, state),
+                state, roles[node_index], needsAttention(node, graph.nodes.items, graph.edges.items), false);
         }
         var index: usize = 0;
         while (index < graph.nodes.items.len) : (index += 1) {
@@ -1726,6 +1734,47 @@ fn drawNode(
     }
 }
 
+fn loopCardChrome(
+    node: GraphModel.Node,
+    state: *const CanvasState,
+    role: NodeRole,
+    attention: bool,
+    selected: bool,
+) GdiplusAA.LoopCardChrome {
+    const stripe = loopTypeColor(node.loop_type);
+    return .{
+        .top = if (attention) Tokens.loop_card_attention_top else Tokens.loop_card_top,
+        .bottom = if (attention) Tokens.loop_card_attention_bottom else Tokens.loop_card_bottom,
+        .radius = scaled(Tokens.loop_card_radius, state),
+        .stripe_width = scaled(Tokens.loop_card_stripe, state),
+        .stripe = stripe,
+        .stripe_alpha = if (role == .unwired) 89 else 255,
+        .border = if (selected) Tokens.canvas_selection else if (attention) 0x000A9FFF else 0x00FFFFFF,
+        .border_alpha = if (selected) 255 else if (attention) 140 else 23,
+        .border_width = (if (selected) @as(f32, 2) else 1) * state.zoom,
+        .dashed = role == .unwired and !selected,
+        .halo = if (attention) 0x000A9FFF else stripe,
+        .halo_opacity = if (attention) 0.45 else 0.16,
+        .halo_sigma = (if (attention) @as(f32, 18) else 12) * state.zoom,
+        .zoom = state.zoom,
+    };
+}
+
+fn drawLoopCardShadow(
+    hdc: c.HDC,
+    allocator: std.mem.Allocator,
+    node: GraphModel.Node,
+    bounds: c.RECT,
+    state: *const CanvasState,
+    role: NodeRole,
+    attention: bool,
+    selected: bool,
+) void {
+    GdiplusAA.drawLoopCardShadows(hdc, allocator, bounds, loopCardChrome(node, state, role, attention, selected)) catch |err| {
+        std.log.warn("Card {s} shadow unavailable: {s}", .{ node.id, @errorName(err) });
+    };
+}
+
 fn drawLoopCard(
     hdc: c.HDC,
     allocator: std.mem.Allocator,
@@ -1739,18 +1788,15 @@ fn drawLoopCard(
     reclaim: bool,
     show_reclaim: bool,
 ) void {
-    // Theme.loopCard's bottom stop (#232326), used for both states: selection is
-    // carried by the border/ring (Tokens.canvas_selection via roundedCard's
-    // `selected` flag), matching mac -- there is no "selected node fill" color in
-    // Theme.swift. Previously an ad-hoc 0x00345D8C blue with no Theme.swift source.
-    roundedCard(hdc, bounds, Tokens.loop_card_bottom, selected);
-    const stripe = loopTypeColor(node.loop_type);
-    const stripe_color = if (role == .unwired) blendCardColor(stripe, Tokens.loop_card_bottom, 35) else stripe;
-    fill(
-        hdc,
-        rect(bounds.left, bounds.top, bounds.left + scaled(Tokens.loop_card_stripe, state), bounds.bottom),
-        stripe_color,
-    );
+    GdiplusAA.drawLoopCardChrome(hdc, bounds, loopCardChrome(node, state, role, attention, selected)) catch |err| {
+        std.log.warn("Card {s} chrome degraded to flat GDI fallback: {s}", .{ node.id, @errorName(err) });
+        roundedCard(hdc, bounds, Tokens.loop_card_bottom, selected);
+        fill(
+            hdc,
+            rect(bounds.left, bounds.top, bounds.left + scaled(Tokens.loop_card_stripe, state), bounds.bottom),
+            if (role == .unwired) blendCardColor(loopTypeColor(node.loop_type), Tokens.loop_card_bottom, 35) else loopTypeColor(node.loop_type),
+        );
+    };
     drawCardBody(hdc, allocator, node, bounds, state.zoom, role, attention, action, reclaim) catch |err| {
         std.log.warn("Card {s} presentation failed: {s}", .{ node.id, @errorName(err) });
     };
@@ -4425,6 +4471,52 @@ fn paint764NodeIndex(nodes: []const GraphModel.Node, id: []const u8) ?usize {
     return null;
 }
 
+fn paint764RgbL1(a: u32, b: u32) u32 {
+    var distance: u32 = 0;
+    inline for ([_]u5{ 0, 8, 16 }) |shift| {
+        const left: i32 = @intCast((a >> shift) & 255);
+        const right: i32 = @intCast((b >> shift) & 255);
+        distance += @abs(left - right);
+    }
+    return distance;
+}
+
+fn verifyPaint764StrokeVisibility(dib: ParityDib, sample: c.RECT, expected: u32, edge_id: []const u8) !void {
+    try std.testing.expectEqual(@as(i32, 7), sample.right - sample.left);
+    try std.testing.expectEqual(@as(i32, 7), sample.bottom - sample.top);
+    const stroke_y = sample.top + 3;
+    // Sealed A6C523 has 42 pairs with minimum contrast/edge-distance advantage 80.
+    // Freeze half that minimum (40 RGB L1) for BOTH predicates, before any runs.
+    const margin: u32 = 40;
+    var comparisons: usize = 0;
+    var failures: usize = 0;
+    var x = sample.left;
+    while (x < sample.right) : (x += 1) {
+        const stroke = c.GetPixel(dib.dc, x, stroke_y);
+        for ([_]i32{ -1, 1 }) |offset| {
+            const neighbor = c.GetPixel(dib.dc, x, stroke_y + offset);
+            if (stroke == c.CLR_INVALID or neighbor == c.CLR_INVALID) {
+                std.debug.print("paint764 edge visibility unreadable edge={s} x={d} stroke-y={d} offset={d}\n",
+                    .{ edge_id, x, stroke_y, offset });
+                return error.Paint764EdgeStrokeSampleUnreadable;
+            }
+            const contrast = paint764RgbL1(stroke, neighbor);
+            const stroke_distance = paint764RgbL1(stroke, expected);
+            const neighbor_distance = paint764RgbL1(neighbor, expected);
+            const advantage = @as(i32, @intCast(neighbor_distance)) - @as(i32, @intCast(stroke_distance));
+            const visible = contrast >= margin and advantage >= @as(i32, @intCast(margin));
+            comparisons += 1;
+            if (!visible) failures += 1;
+            std.debug.print("paint764 edge visibility edge={s} x={d} stroke-y={d} neighbor-y={d} contrast={d} edge-advantage={d} margin={d} pass={}\n",
+                .{ edge_id, x, stroke_y, stroke_y + offset, contrast, advantage, margin, visible });
+        }
+    }
+    std.debug.print("paint764 edge visibility summary edge={s} region=({d},{d},{d},{d}) comparisons={d} failures={d} margin={d}\n",
+        .{ edge_id, sample.left, sample.top, sample.right, sample.bottom, comparisons, failures, margin });
+    try std.testing.expectEqual(@as(usize, 14), comparisons);
+    if (failures != 0) return error.Paint764EdgeStrokeNotVisible;
+}
+
 fn verifyPaint764Contract(
     dib: ParityDib,
     fixture: *const Paint764Fixture,
@@ -4476,7 +4568,9 @@ fn verifyPaint764Contract(
             const center_x = @divTrunc(from.x + to.x, 2);
             const center_y = @divTrunc(from.y + to.y, 2);
             const stroke_sample = rect(center_x - 3, center_y - 3, center_x + 4, center_y + 4);
-            try std.testing.expect(dib.count(stroke_sample, edgeKindColor(edge.kind)) > 0);
+            // All three 7x7 fixture windows lie 2..8 points from adjacent cards,
+            // inside their finite 36/54-point halo support; none is an exact-color control.
+            try verifyPaint764StrokeVisibility(dib, stroke_sample, edgeKindColor(edge.kind), edge.id);
             const label = try edgeLabel(allocator, edge);
             defer allocator.free(label);
             try std.testing.expectEqualStrings("handoff", label);
@@ -4497,6 +4591,8 @@ fn verifyPaint764Contract(
         }
     } else {
         for (fixture.model.graphs.items, 0..) |graph, graph_index| {
+            const roles = try resolveCardRoles(allocator, graph.nodes.items, graph.edges.items, &.{});
+            defer allocator.free(roles);
             const lane = overviewLaneBounds(&fixture.model, graph_index, graph_bounds, &state);
             try std.testing.expect(lane.left >= viewport.left and lane.right <= viewport.right);
             try std.testing.expect(lane.top >= viewport.top and lane.bottom <= viewport.bottom);
@@ -4506,7 +4602,8 @@ fn verifyPaint764Contract(
                 const bounds = overviewCardBounds(&fixture.model, graph_index, node_index, graph_bounds, &state);
                 try std.testing.expect(bounds.left >= lane.left and bounds.top > lane.top);
                 try std.testing.expect(bounds.right <= lane.right and bounds.bottom < lane.bottom);
-                try verifyPaint764CardPixels(dib, allocator, node, bounds, .interior, false, age_observed_at);
+                try verifyPaint764CardPixels(dib, allocator, node, bounds, roles[node_index],
+                    needsAttention(node, graph.nodes.items, graph.edges.items), age_observed_at);
             }
         }
     }
@@ -5042,12 +5139,21 @@ var paint764TestRendererReady = false;
 fn initPaint764TestRenderer() !void {
     if (paint764TestRendererReady) return;
     if (paint764TestRendererInitAttempted) return error.Paint764TestGdiplusNotReady;
-    const export_root = std.process.getEnvVarOwned(std.testing.allocator, "GRAPHCODE_PAINT_EXPORT_DIR") catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => return,
+    const export_root: ?[]u8 = std.process.getEnvVarOwned(std.testing.allocator, "GRAPHCODE_PAINT_EXPORT_DIR") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
         else => return err,
     };
-    defer std.testing.allocator.free(export_root);
-    if (export_root.len == 0) return error.PaintExportDirectoryEmpty;
+    if (export_root) |root| {
+        defer std.testing.allocator.free(root);
+        if (root.len == 0) return error.PaintExportDirectoryEmpty;
+    } else {
+        const native = std.process.getEnvVarOwned(std.testing.allocator, "GRAPHCODE_NATIVE_PAINT_TESTS") catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => return,
+            else => return err,
+        };
+        defer std.testing.allocator.free(native);
+        if (!std.mem.eql(u8, native, "1")) return error.Paint764NativeTestFlagInvalid;
+    }
     paint764TestRendererInitAttempted = true;
     GdiplusAA.init();
     const deadline = std.time.nanoTimestamp() + 2_000_000_000;
@@ -5075,6 +5181,473 @@ fn paint764ExpectedAccent(loop_type: []const u8) ?u32 {
     if (std.mem.eql(u8, loop_type, "turnBased")) return 0x008151D5;
     if (std.mem.eql(u8, loop_type, "composite")) return 0x00E98590;
     return null;
+}
+
+const Chrome764Checks = struct {
+    observations: usize = 0,
+    failures: usize = 0,
+
+    fn expect(self: *Chrome764Checks, condition: bool, name: []const u8, scene: Paint764Scene, node: []const u8) void {
+        self.observations += 1;
+        if (!condition) {
+            self.failures += 1;
+            std.debug.print("chrome764 missing={s} surface={s} node={s}\n", .{ name, @tagName(scene), node });
+        }
+    }
+
+    fn pixel(self: *Chrome764Checks, actual: u32, expected: u32, name: []const u8, scene: Paint764Scene, node: []const u8) void {
+        const matches = chrome764ColorNear(actual, expected, 1);
+        self.expect(matches, name, scene, node);
+        if (!matches) std.debug.print("  expected=0x{x:0>6} actual=0x{x:0>6} channel-tolerance=1\n", .{ expected, actual });
+    }
+
+    fn finish(self: Chrome764Checks, failure: anyerror) !void {
+        std.debug.print("chrome764 observations={d} passed={d} failed={d} native-ready={}\n", .{
+            self.observations, self.observations - self.failures, self.failures, GdiplusAA.isReady(),
+        });
+        if (self.observations == 0) return error.Chrome764NoObservations;
+        if (self.failures != 0) return failure;
+    }
+};
+
+fn chrome764ColorNear(actual: u32, expected: u32, tolerance: u32) bool {
+    if (actual == c.CLR_INVALID) return false;
+    for ([_]u5{ 0, 8, 16 }) |shift| {
+        const a: i32 = @intCast((actual >> shift) & 255);
+        const b: i32 = @intCast((expected >> shift) & 255);
+        if (@abs(a - b) > tolerance) return false;
+    }
+    return true;
+}
+
+fn chrome764Face(attention: bool, y: i32, height: i32) u32 {
+    const top: u32 = if (attention) 0x00222A30 else 0x00302C2C;
+    const bottom: u32 = if (attention) 0x00202226 else 0x00262323;
+    var result: u32 = 0;
+    for ([_]u5{ 0, 8, 16 }) |shift| {
+        const a: f64 = @floatFromInt((top >> shift) & 255);
+        const b: f64 = @floatFromInt((bottom >> shift) & 255);
+        const t = (@as(f64, @floatFromInt(y)) + 0.5) / @as(f64, @floatFromInt(height));
+        const channel: u32 = @intFromFloat(@round(a + (b - a) * t));
+        result |= channel << shift;
+    }
+    return result;
+}
+
+fn chrome764Blend(foreground: u32, background: u32, percent: u32) u32 {
+    var result: u32 = 0;
+    for ([_]u5{ 0, 8, 16 }) |shift| {
+        const a = (foreground >> shift) & 255;
+        const b = (background >> shift) & 255;
+        result |= ((a * percent + b * (100 - percent) + 50) / 100) << shift;
+    }
+    return result;
+}
+
+fn chrome764Native() !void {
+    try initPaint764TestRenderer();
+    if (!paint764TestRendererReady) return error.SkipZigTest;
+    try std.testing.expect(GdiplusAA.isReady());
+}
+
+fn chrome764GraphBounds() c.RECT {
+    const bounds = renderBounds(1280, 720, .{
+        .graph_visible = true,
+        .rail_visible = true,
+        .panel_visible = false,
+        .activity_enabled = false,
+    });
+    return rect(bounds.left, bounds.top, bounds.right, bounds.bottom);
+}
+
+fn chrome764Card(fixture: *const Paint764Fixture, scene: Paint764Scene, index: usize, state: *const CanvasState) c.RECT {
+    return if (scene == .project)
+        nodeBounds(index, state)
+    else
+        overviewCardBounds(&fixture.model, 0, index, chrome764GraphBounds(), state);
+}
+
+fn chrome764Map(dib: ParityDib, dpi: i32) !void {
+    if (c.SetMapMode(dib.dc, c.MM_ANISOTROPIC) == 0 or
+        c.SetWindowExtEx(dib.dc, 96, 96, null) == 0 or
+        c.SetViewportExtEx(dib.dc, dpi, dpi, null) == 0)
+        return error.Chrome764MappingFailed;
+}
+
+fn chrome764DibPixel(dib: ParityDib, x: i32, y: i32, dpi: i32) !u32 {
+    if (c.GdiFlush() == 0) return error.Chrome764FlushFailed;
+    const px = std.math.cast(usize, @divTrunc(x * dpi, 96)) orelse return error.Chrome764SampleOutsideDib;
+    const py = std.math.cast(usize, @divTrunc(y * dpi, 96)) orelse return error.Chrome764SampleOutsideDib;
+    if (px >= dib.width or py >= dib.height) return error.Chrome764SampleOutsideDib;
+    const offset = py * dib.row_bytes + px * 4;
+    return @as(u32, dib.pixels[offset + 2]) |
+        (@as(u32, dib.pixels[offset + 1]) << 8) |
+        (@as(u32, dib.pixels[offset]) << 16);
+}
+
+fn chrome764Paint(
+    dib: ParityDib,
+    fixture: *const Paint764Fixture,
+    scene: Paint764Scene,
+    state: *const CanvasState,
+    inspection: ?*const WorktreeStatus.Inspection,
+    entries: []const []const u8,
+) !void {
+    var sidebar = Sidebar.State.init(std.testing.allocator);
+    defer sidebar.deinit();
+    paint(
+        dib.dc, 1280, 720, &fixture.model, inspection, "", 0, "", "", "", false, "",
+        entries, &.{}, std.testing.allocator, state, &sidebar, -1,
+        .{ .graph_visible = true, .rail_visible = true, .panel_visible = false, .activity_enabled = false },
+        if (scene == .project) .project else .overview,
+    );
+    if (c.GdiFlush() == 0) return error.Chrome764FlushFailed;
+}
+
+fn chrome764Replace(destination: *[]u8, value: []const u8) !void {
+    const owned = try std.testing.allocator.dupe(u8, value);
+    std.testing.allocator.free(destination.*);
+    destination.* = owned;
+}
+
+fn chrome764State(fixture: *Paint764Fixture, index: usize, state: []const u8, presence: []const u8) !void {
+    const project = &(fixture.model.graph orelse return error.Chrome764ProjectMissing).nodes.items[index];
+    const overview = &fixture.model.graphs.items[0].nodes.items[index];
+    try chrome764Replace(&project.state, state);
+    try chrome764Replace(&project.presence, presence);
+    try chrome764Replace(&overview.state, state);
+    try chrome764Replace(&overview.presence, presence);
+}
+
+fn chrome764IsolatedFixture() !Paint764Fixture {
+    var fixture = try paint764FixtureModel(std.testing.allocator, .project);
+    errdefer fixture.model.deinit();
+    _ = try fixture.model.updateFromFrame(
+        \\{"version":2,"kind":"event","sequence":2,"event":{"graphChanged":{"id":"paint-764-project","project":{"path":"C:\\GraphCodeFixture\\CardStates","name":"Card States"},"nodes":[{"id":"chrome-isolated","title":"Isolated chrome","loopType":"goalBased","state":"idle","backend":"copilotCLI","firstInstruction":"In-memory native chrome check."}],"edges":[]}}}
+    );
+    return fixture;
+}
+
+test "loop card parity chrome 764 normal gradient and shared surfaces" {
+    try chrome764Native();
+    var fixture = try paint764FixtureModel(std.testing.allocator, .overview);
+    defer fixture.model.deinit();
+    var project = try ParityDib.init(1280, 720);
+    defer project.deinit();
+    var overview = try ParityDib.init(1280, 720);
+    defer overview.deinit();
+    try paint764TestSurface(project, &fixture, std.testing.allocator, .project);
+    try paint764TestSurface(overview, &fixture, std.testing.allocator, .overview);
+    var checks = Chrome764Checks{};
+    const state = CanvasState{};
+    for ([_]usize{ 0, 1, 3, 4 }) |index| {
+        const node = fixture.model.graphs.items[0].nodes.items[index];
+        const pb = chrome764Card(&fixture, .project, index, &state);
+        const ob = chrome764Card(&fixture, .overview, index, &state);
+        for ([_]i32{ 16, 48, 80 }) |y| {
+            const expected = chrome764Face(false, y, 96);
+            const pp = c.GetPixel(project.dc, pb.right - 7, pb.top + y);
+            const op = c.GetPixel(overview.dc, ob.right - 7, ob.top + y);
+            checks.pixel(pp, expected, "normal-local-gradient", .project, node.id);
+            checks.pixel(op, expected, "normal-local-gradient", .overview, node.id);
+            checks.pixel(pp, op, "shared-local-face", .overview, node.id);
+            checks.pixel(
+                c.GetPixel(project.dc, pb.left + 2, pb.top + 48),
+                c.GetPixel(overview.dc, ob.left + 2, ob.top + 48),
+                "shared-local-stripe", .overview, node.id,
+            );
+        }
+        for ([_]Paint764Scene{ .project, .overview }) |scene| {
+            const dib = if (scene == .project) project else overview;
+            const bounds = chrome764Card(&fixture, scene, index, &state);
+            const top = c.GetPixel(dib.dc, bounds.right - 7, bounds.top + 16);
+            const bottom = c.GetPixel(dib.dc, bounds.right - 7, bounds.top + 80);
+            checks.expect((top & 255) >= (bottom & 255) + 3, "normal-top-to-bottom-variation", scene, node.id);
+        }
+    }
+    try checks.finish(error.Chrome764NormalGradientMissing);
+}
+
+test "loop card parity chrome 764 warmth remains independent of primary actions" {
+    try chrome764Native();
+    var fixture = try paint764FixtureModel(std.testing.allocator, .overview);
+    defer fixture.model.deinit();
+    var dib = try ParityDib.init(1280, 720);
+    defer dib.deinit();
+    var checks = Chrome764Checks{};
+    const state = CanvasState{};
+    for (0..2) |variant| {
+        if (variant == 1) {
+            try chrome764State(&fixture, 0, "failed", "idle");
+            try chrome764State(&fixture, 1, "running", "busy");
+            try chrome764State(&fixture, 3, "stalled", "idle");
+        }
+        const expected_warm = if (variant == 0)
+            [_]bool{ false, false, true, false, false, true }
+        else
+            [_]bool{ true, false, false, true, false, true };
+        const graph = fixture.model.graphs.items[0];
+        for ([_]Paint764Scene{ .project, .overview }) |scene| {
+            try paint764TestSurface(dib, &fixture, std.testing.allocator, scene);
+            for (graph.nodes.items, 0..) |node, index| {
+                const warm = needsAttention(node, graph.nodes.items, graph.edges.items);
+                checks.expect(warm == expected_warm[index], "preserved-attention-classification", scene, node.id);
+                const bounds = chrome764Card(&fixture, scene, index, &state);
+                checks.pixel(c.GetPixel(dib.dc, bounds.right - 7, bounds.top + 48),
+                    chrome764Face(expected_warm[index], 48, 96), "reason-selected-face", scene, node.id);
+                const action = primaryCardAction(node);
+                const expected_action: ?AttentionAction = if (index == 2) .inspect else if (index == 5) .reply else null;
+                checks.expect(action == expected_action, "preserved-independent-primary-action", scene, node.id);
+                const action_pixels = dib.count(attentionActionBounds(bounds, &state), 0x000A9FFF);
+                checks.expect(if (expected_action != null) action_pixels > 20 else action_pixels == 0,
+                    "primary-action-pixels-independent-of-warmth", scene, node.id);
+            }
+        }
+    }
+    try checks.finish(error.Chrome764AttentionFaceMissing);
+}
+
+test "loop card parity chrome 764 tinted falloff and offset black lift on both grounds" {
+    try chrome764Native();
+    var fixture = try chrome764IsolatedFixture();
+    defer fixture.model.deinit();
+    var normal = try ParityDib.init(1280, 720);
+    defer normal.deinit();
+    var warm = try ParityDib.init(1280, 720);
+    defer warm.deinit();
+    var checks = Chrome764Checks{};
+    const state = CanvasState{};
+    for ([_]Paint764Scene{ .project, .overview }) |scene| {
+        try chrome764State(&fixture, 0, "idle", "idle");
+        try chrome764Paint(normal, &fixture, scene, &state, null, &.{"chrome-isolated"});
+        try chrome764State(&fixture, 0, "failed", "idle");
+        try chrome764Paint(warm, &fixture, scene, &state, null, &.{"chrome-isolated"});
+        const bounds = chrome764Card(&fixture, scene, 0, &state);
+        const ground: u32 = if (scene == .project) Tokens.canvas_tone else Tokens.workspace_rail;
+        const x = bounds.left + 125;
+        var last_green: u32 = 255;
+        var last_orange: u32 = 255;
+        for ([_]i32{ 6, 12, 20 }) |distance| {
+            const np = c.GetPixel(normal.dc, x, bounds.top - distance);
+            const wp = c.GetPixel(warm.dc, x, bounds.top - distance);
+            const green = (np >> 8) & 255;
+            const orange = wp & 255;
+            checks.expect(green > ((ground >> 8) & 255), "positive-type-tinted-halo", scene, "chrome-isolated");
+            checks.expect(orange > (ground & 255), "positive-attention-orange-halo", scene, "chrome-isolated");
+            checks.expect(green <= last_green and orange <= last_orange, "bounded-alpha-falloff-not-flat-rings", scene, "chrome-isolated");
+            if (distance == 20) checks.expect(orange -| (ground & 255) > green -| ((ground >> 8) & 255),
+                "emphasized-halo-wider-and-stronger", scene, "chrome-isolated");
+            last_green = green;
+            last_orange = orange;
+            std.debug.print("chrome764 halo surface={s} distance={d} normal=0x{x} warm=0x{x} ground=0x{x}\n",
+                .{ @tagName(scene), distance, np, wp, ground });
+        }
+        for ([_]i32{ 2, 7 }) |distance| {
+            const above = c.GetPixel(normal.dc, x, bounds.top - distance);
+            const below = c.GetPixel(normal.dc, x, bounds.bottom + distance);
+            checks.expect((below & 255) < (above & 255), "downward-contact-and-ambient-black-lift", scene, "chrome-isolated");
+        }
+        checks.pixel(c.GetPixel(normal.dc, bounds.right + 80, bounds.top + 48),
+            c.GetPixel(warm.dc, bounds.right + 80, bounds.top + 48),
+            "finite-shadow-support-leaves-far-ground-unchanged", scene, "chrome-isolated");
+    }
+    try checks.finish(error.Chrome764HaloAndContactShadowMissing);
+}
+
+test "loop card parity chrome 764 rounded stripe alpha hairline and unwired dash" {
+    try chrome764Native();
+    var fixture = try paint764FixtureModel(std.testing.allocator, .overview);
+    defer fixture.model.deinit();
+    var dib = try ParityDib.init(1280, 720);
+    defer dib.deinit();
+    var checks = Chrome764Checks{};
+    const state = CanvasState{};
+    const accent: u32 = 0x008151D5;
+    for ([_]bool{ false, true }) |attention| {
+        try chrome764State(&fixture, 5, if (attention) "running" else "idle", if (attention) "awaitingInput" else "idle");
+        for ([_]Paint764Scene{ .project, .overview }) |scene| {
+            try paint764TestSurface(dib, &fixture, std.testing.allocator, scene);
+            const bounds = chrome764Card(&fixture, scene, 5, &state);
+            const face = chrome764Face(attention, 48, 96);
+            checks.pixel(c.GetPixel(dib.dc, bounds.left + 2, bounds.top + 48),
+                chrome764Blend(accent, face, 35), "unwired-alpha-over-local-gradient", scene, "fixture-turn-needs-you");
+            const corner = c.GetPixel(dib.dc, bounds.left + 1, bounds.top + 1);
+            const middle = c.GetPixel(dib.dc, bounds.left + 1, bounds.top + 48);
+            checks.expect(!chrome764ColorNear(corner, middle, 8), "radius11-corner-excludes-rectangular-stripe", scene, "fixture-turn-needs-you");
+            var transitions: usize = 0;
+            var previous = c.GetPixel(dib.dc, bounds.left + 30, bounds.bottom);
+            var x = bounds.left + 31;
+            while (x < bounds.left + 120) : (x += 1) {
+                const pixel = c.GetPixel(dib.dc, x, bounds.bottom);
+                if (!chrome764ColorNear(pixel, previous, 2)) transitions += 1;
+                previous = pixel;
+            }
+            checks.expect(transitions >= 12, "unwired-four-three-dashed-hairline", scene, "fixture-turn-needs-you");
+            const upper = c.GetPixel(dib.dc, bounds.right - 1, bounds.top + 16);
+            const lower = c.GetPixel(dib.dc, bounds.right - 1, bounds.top + 80);
+            checks.expect(!chrome764ColorNear(upper, lower, 1), "alpha-hairline-preserves-local-face-variation", scene, "fixture-turn-needs-you");
+        }
+        if (!fixture.model.setSelectedIndex(5)) return error.Chrome764SelectionFailed;
+        try paint764TestSurface(dib, &fixture, std.testing.allocator, .project);
+        const bounds = nodeBounds(5, &state);
+        checks.expect(dib.count(rect(bounds.left + 20, bounds.top, bounds.left + 220, bounds.top + 1),
+            Tokens.canvas_selection) >= 190, "selected-unwired-solid-blue-precedence", .project, "fixture-turn-needs-you");
+        if (!fixture.model.setSelectedIndex(0)) return error.Chrome764SelectionFailed;
+    }
+    try checks.finish(error.Chrome764RoundedStripeAndDashedAlphaBorderMissing);
+}
+
+test "loop card parity chrome 764 zoom mapping and graph viewport clip" {
+    try chrome764Native();
+    var fixture = try chrome764IsolatedFixture();
+    defer fixture.model.deinit();
+    try chrome764State(&fixture, 0, "failed", "idle");
+    var dib = try ParityDib.init(2600, 1500);
+    defer dib.deinit();
+    var checks = Chrome764Checks{};
+    const graph_bounds = chrome764GraphBounds();
+    for ([_]i32{ 96, 120, 144, 192 }) |dpi| {
+        for ([_]f32{ 0.55, 0.75, 1, 1.25, 1.8 }) |zoom| {
+            for ([_]Paint764Scene{ .project, .overview }) |scene| {
+                const saved = c.SaveDC(dib.dc);
+                if (saved == 0) return error.Chrome764SaveDcFailed;
+                defer _ = c.RestoreDC(dib.dc, saved);
+                try chrome764Map(dib, dpi);
+                const sentinel: u32 = 0x00EF12AB;
+                fill(dib.dc, rect(0, 0, 1280, 720), sentinel);
+                if (c.IntersectClipRect(dib.dc, graph_bounds.left, graph_bounds.top, graph_bounds.right, graph_bounds.bottom) == c.ERROR)
+                    return error.Chrome764ClipFailed;
+                var state = CanvasState{ .zoom = zoom };
+                const unshifted = chrome764Card(&fixture, scene, 0, &state);
+                state.pan_x = @floatFromInt(300 - unshifted.left);
+                state.pan_y = @floatFromInt(200 - unshifted.top);
+                try chrome764Paint(dib, &fixture, scene, &state, null, &.{"chrome-isolated"});
+                const bounds = chrome764Card(&fixture, scene, 0, &state);
+                const stripe_x = bounds.left + @divTrunc(scaledValue(4, zoom), 2);
+                checks.pixel(c.GetPixel(dib.dc, stripe_x, bounds.top + scaledValue(12, zoom)),
+                    0x00709E19, "stripe-radius-and-HDC-mapping-scale-once", scene, "chrome-isolated");
+                checks.expect(!chrome764ColorNear(c.GetPixel(dib.dc, bounds.left + scaledValue(1, zoom),
+                    bounds.top + scaledValue(1, zoom)), 0x00709E19, 1),
+                    "scaled-rounded-corner-clips-stripe", scene, "chrome-isolated");
+                const sample_y = bounds.top - scaledValue(12, zoom);
+                const sample_x = bounds.left + scaledValue(125, zoom);
+                const ground: u32 = if (scene == .project) Tokens.canvas_tone else Tokens.workspace_rail;
+                const halo = c.GetPixel(dib.dc, sample_x, sample_y);
+                checks.expect((halo & 255) > (ground & 255), "scaled-halo-overflows-card-within-viewport", scene, "chrome-isolated");
+                checks.pixel(try chrome764DibPixel(dib, graph_bounds.left - 2, 200, dpi), sentinel,
+                    "left-viewport-sentinel-unchanged", scene, "chrome-isolated");
+                checks.pixel(try chrome764DibPixel(dib, 400, graph_bounds.top - 2, dpi), sentinel,
+                    "top-viewport-sentinel-unchanged", scene, "chrome-isolated");
+                var clip: c.RECT = undefined;
+                if (c.GetClipBox(dib.dc, &clip) == c.ERROR) return error.Chrome764ClipQueryFailed;
+                checks.expect(clip.left == graph_bounds.left and clip.top == graph_bounds.top and
+                    clip.right == graph_bounds.right and clip.bottom == graph_bounds.bottom,
+                    "caller-clip-restored-after-card-chrome", scene, "chrome-isolated");
+                std.debug.print("chrome764 mapped surface={s} dpi={d} zoom={d} card=({d},{d},{d},{d}) halo=0x{x}\n",
+                    .{ @tagName(scene), dpi, zoom, bounds.left, bounds.top, bounds.right, bounds.bottom, halo });
+            }
+        }
+    }
+    try checks.finish(error.Chrome764ScaledChromeOrViewportContractMissing);
+}
+
+test "loop card parity chrome 764 preserves geometry content roles and affordances" {
+    try chrome764Native();
+    var fixture = try paint764FixtureModel(std.testing.allocator, .overview);
+    defer fixture.model.deinit();
+    var dib = try ParityDib.init(1280, 720);
+    defer dib.deinit();
+    var checks = Chrome764Checks{};
+    const state = CanvasState{};
+    const graph_bounds = chrome764GraphBounds();
+    try verifyPaint764Inventory(&fixture, .overview);
+    const project_size = contentSize(&fixture.model, .project);
+    const overview_size = contentSize(&fixture.model, .overview);
+    checks.expect(project_size.width == 844 and project_size.height == 380,
+        "project-fit-excludes-noninteractive-halo", .project, "fixture-main-idle");
+    checks.expect(overview_size.width == 854 and overview_size.height == 558,
+        "overview-fit-excludes-noninteractive-halo", .overview, "fixture-main-idle");
+    for ([_]usize{ 0, 5 }) |selected| {
+        if (!fixture.model.setSelectedIndex(selected)) return error.Chrome764SelectionFailed;
+        for ([_]Paint764Scene{ .project, .overview }) |scene| {
+            try paint764TestSurface(dib, &fixture, std.testing.allocator, scene);
+            const graph = fixture.model.graphs.items[0];
+            const roles = try resolveCardRoles(std.testing.allocator, graph.nodes.items, graph.edges.items, &.{});
+            defer std.testing.allocator.free(roles);
+            checks.expect(roles[0] == .entry and roles[5] == .unwired, "entry-and-unwired-roles-preserved", scene, "fixture-main-idle");
+            for (graph.nodes.items, 0..) |node, index| {
+                const bounds = chrome764Card(&fixture, scene, index, &state);
+                try verifyPaint764CardPixels(dib, std.testing.allocator, node, bounds, roles[index],
+                    needsAttention(node, graph.nodes.items, graph.edges.items), @intCast(std.time.timestamp()));
+                checks.expect(bounds.right - bounds.left == 250 and bounds.bottom - bounds.top == 96,
+                    "250-by-96-hit-geometry-preserved", scene, node.id);
+                const live = try cardLiveLine(std.testing.allocator, node);
+                defer std.testing.allocator.free(live);
+                if (live.len != 0) {
+                    const rows = cardTextLayout(bounds, 1, 80);
+                    checks.expect(dib.count(rows.live, 0x009F9C9C) > 0,
+                        "description-or-activity-ink-preserved", scene, node.id);
+                }
+                const x = bounds.left + 125;
+                const y = bounds.top + 48;
+                if (scene == .project) {
+                    checks.expect(hitTest(graph.nodes.items, x, y, &state, graph_bounds) == index,
+                        "project-hit-and-activation-identity", scene, node.id);
+                    checks.expect(hitTest(graph.nodes.items, x, bounds.top - 4, &state, graph_bounds) == null,
+                        "halo-overflow-not-interactive", scene, node.id);
+                } else {
+                    const hit = hitTestOverview(&fixture.model, x, y, &state, graph_bounds);
+                    checks.expect(hit != null and hit.?.graph_index == 0 and hit.?.node_index == index,
+                        "overview-hit-and-activation-identity", scene, node.id);
+                    checks.expect(hitTestOverview(&fixture.model, x, bounds.top - 4, &state, graph_bounds) == null,
+                        "halo-overflow-not-interactive", scene, node.id);
+                }
+                if (primaryCardAction(node) != null and scene == .project) {
+                    const action = attentionActionBounds(bounds, &state);
+                    checks.expect(hitTestAttentionAction(graph.nodes.items, graph.edges.items,
+                        action.left + 1, action.top + 1, &state) == index,
+                        "reply-inspect-action-hit-preserved", scene, node.id);
+                }
+            }
+        }
+    }
+    for ([_]*GraphModel.Edge{
+        &(fixture.model.graph orelse return error.Chrome764ProjectMissing).edges.items[1],
+        &fixture.model.graphs.items[0].edges.items[1],
+    }) |edge| try chrome764Replace(&edge.to, "fixture-main-idle");
+    for ([_]Paint764Scene{ .project, .overview }) |scene| {
+        try paint764TestSurface(dib, &fixture, std.testing.allocator, scene);
+        const graph = fixture.model.graphs.items[0];
+        const roles = try resolveCardRoles(std.testing.allocator, graph.nodes.items, graph.edges.items, &.{});
+        defer std.testing.allocator.free(roles);
+        checks.expect(roles[0] == .cycle_only and roles[1] == .cycle_only,
+            "closed-handoff-cycle-role-preserved", scene, "fixture-main-idle");
+        const bounds = chrome764Card(&fixture, scene, 0, &state);
+        const chip = cardRoleChip(.cycle_only) orelse return error.Chrome764CycleChipMissing;
+        checks.expect(dib.count(bounds, chip.fill) > 0, "cycle-role-chip-still-painted", scene, "fixture-main-idle");
+    }
+    var inspection = WorktreeStatus.Inspection{
+        .entries = std.array_list.Managed(WorktreeStatus.Entry).init(std.testing.allocator),
+        .default_branch = @constCast("main"),
+        .project_path = @constCast("C:\\GraphCodeFixture\\CardStates"),
+    };
+    defer inspection.entries.deinit();
+    try inspection.entries.append(.{
+        .path = @constCast("C:\\GraphCodeFixture\\CardStates\\worktrees\\review"),
+        .branch = @constCast("review"), .pushed = true, .landed = true,
+    });
+    try chrome764Paint(dib, &fixture, .project, &state, &inspection, &.{});
+    const graph = (fixture.model.graph orelse return error.Chrome764ProjectMissing);
+    const offer = reclaimOfferBounds(nodeBounds(1, &state));
+    checks.expect(dib.count(offer.reclaim, 0x003A3A44) > 20, "reclaim-fill-preserved", .project, "fixture-goal-done");
+    checks.expect(dib.count(offer.keep, 0x008A8A8A) > 0, "keep-label-preserved", .project, "fixture-goal-done");
+    const reclaim = hitTestReclaimOffer(graph.nodes.items, &inspection, &.{}, offer.reclaim.left + 1, offer.reclaim.top + 1, &state);
+    const keep = hitTestReclaimOffer(graph.nodes.items, &inspection, &.{}, offer.keep.left + 1, offer.keep.top + 1, &state);
+    checks.expect(reclaim != null and reclaim.?.node_index == 1 and reclaim.?.action == .reclaim,
+        "reclaim-hit-preserved", .project, "fixture-goal-done");
+    checks.expect(keep != null and keep.?.node_index == 1 and keep.?.action == .keep,
+        "keep-hit-preserved", .project, "fixture-goal-done");
+    try checks.finish(error.Chrome764ExistingSemanticsRegressed);
 }
 
 test "loop card parity paint 764 accents match Mac COLORREFs on both surfaces" {
@@ -5109,7 +5682,7 @@ test "loop card parity paint 764 accents match Mac COLORREFs on both surfaces" {
         const expected = paint764ExpectedAccent(node.loop_type) orelse
             return error.Paint764UnexpectedLoopType;
         const expected_stripe = if (roles[index] == .unwired)
-            blendCardColor(expected, Tokens.loop_card_bottom, 35)
+            blendCardColor(expected, if (paint764TestRendererReady) chrome764Face(needsAttention(node, graph.nodes.items, graph.edges.items), 8, 96) else Tokens.loop_card_bottom, 35)
         else
             expected;
         const bounds = nodeBounds(index, &state);

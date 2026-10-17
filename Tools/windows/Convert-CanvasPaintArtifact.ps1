@@ -436,7 +436,8 @@ Assert-NativeArtifactBinding $runReceipt.nativeArtifacts "nativeLog" $nativeLogP
   $nativeLogDocument.Sha256 "NativeLogHashMismatch"
 Assert-NativeArtifactBinding $runReceipt.nativeArtifacts "paintReceipt" $receiptFull `
   $receiptDocument.Sha256 "NativePaintReceiptHashMismatch"
-$nativeLogLines = @($nativeLogDocument.Text -split "\r?\n" | Where-Object { $_.Length -gt 0 })
+$nativeLogAllLines = @($nativeLogDocument.Text -split "\r?\n")
+$nativeLogLines = @($nativeLogAllLines | Where-Object { $_.Length -gt 0 })
 $nativeResultLines = @($nativeLogLines | Where-Object { $_ -match '^\d+/\d+ ' })
 $expectedNativeTest = "GraphCanvas.test.paint export: $Scene"
 $nativeTestPattern = '^1/1 ' + [regex]::Escape($expectedNativeTest) + '\.\.\.'
@@ -448,10 +449,27 @@ if ($nativeResultLines.Count -ne 1 -or $nativeTestLines.Count -ne 1 -or $nativeS
     $nativeFailureMarkers.Count -ne 0) {
   Stop-Artifact "NativeRunSummaryInvalid" "Native log must contain exactly one named 1/1 paint test, one positive pass summary, and no failure or skip marker."
 }
-$nativeTestLineIndex = [Array]::IndexOf($nativeLogLines, $nativeTestLines[0])
-if ($nativeTestLineIndex -lt 0 -or $nativeTestLineIndex + 1 -ge $nativeLogLines.Count -or
-    $nativeLogLines[$nativeTestLineIndex + 1] -cne "OK") {
-  Stop-Artifact "NativeRunSummaryInvalid" "The named paint test does not have an unambiguous OK result."
+$nativeOkLines = @($nativeLogAllLines | Where-Object { $_ -ceq "OK" })
+$nativeTestLineIndex = [Array]::IndexOf($nativeLogAllLines, $nativeTestLines[0])
+$nativeOkLineIndex = [Array]::IndexOf($nativeLogAllLines, "OK")
+if ($nativeOkLines.Count -ne 1 -or $nativeTestLineIndex -lt 0 -or
+    $nativeOkLineIndex -le $nativeTestLineIndex -or $nativeOkLineIndex + 1 -ge $nativeLogAllLines.Count -or
+    $nativeLogAllLines[$nativeOkLineIndex + 1] -cne "All 1 tests passed." -or
+    $nativeLogLines[-1] -cne "All 1 tests passed.") {
+  Stop-Artifact "NativeRunSummaryInvalid" "The single named paint test must end with exactly one OK immediately followed by the final positive summary."
+}
+$nativeDiagnostics = [Collections.Generic.List[string]]::new()
+$headerMatch = [regex]::Match($nativeTestLines[0], $nativeTestPattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+$headerSuffix = $nativeTestLines[0].Substring($headerMatch.Length)
+if ($headerSuffix.Length -gt 0) { $nativeDiagnostics.Add($headerSuffix) }
+for ($lineIndex = $nativeTestLineIndex + 1; $lineIndex -lt $nativeOkLineIndex; $lineIndex++) {
+  $nativeDiagnostics.Add($nativeLogAllLines[$lineIndex])
+}
+foreach ($diagnostic in $nativeDiagnostics) {
+  if ($diagnostic -match '^(?:\d+/\d+ |OK$|All \d+ tests)' -or
+      $diagnostic -match '(?i)(?:pass=false|failures=[1-9]|=fail)') {
+    Stop-Artifact "NativeRunSummaryInvalid" "Native diagnostics may not introduce another runner result, summary, or failing status."
+  }
 }
 
 $expectedSourceKeys = @($sourceFiles | Sort-Object -CaseSensitive)

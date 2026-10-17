@@ -844,6 +844,56 @@ Keep claims aligned with the
 [Windows UI parity ledger](../investigation/ui-parity-matrix.md) and the
 [preview-readiness plan](../investigation/windows-preview-release-plan.md).
 
+### Native loop-card paint tests without exports
+
+`GRAPHCODE_NATIVE_PAINT_TESTS=1` opts the existing card-test initializer into
+GDI+ without enabling either #764 profile export or the legacy export. Leave
+`GRAPHCODE_PAINT_EXPORT_DIR` **absent**, not present with an empty value:
+
+```powershell
+# From graphcode-windows, after loading the pinned environment.ps1.
+if (Test-Path -LiteralPath Env:\GRAPHCODE_PAINT_EXPORT_DIR) {
+    Remove-Item -LiteralPath Env:\GRAPHCODE_PAINT_EXPORT_DIR -ErrorAction Stop
+}
+if ([Environment]::GetEnvironmentVariables("Process").Contains("GRAPHCODE_PAINT_EXPORT_DIR")) {
+    throw "Paint exports must remain disabled."
+}
+$env:GRAPHCODE_NATIVE_PAINT_TESTS = "1"
+$runRoot = Join-Path $PWD ".zig-cache\native-card-check"
+New-Item -ItemType Directory -Force $runRoot | Out-Null
+& $env:GRAPHCODE_ZIG0152 test src\GraphCanvas.zig `
+    -target x86_64-windows-msvc -lc -luser32 -lgdi32 -lgdiplus `
+    "-I$env:GRAPHCODE_WINGHOSTTY_ROOT\include" `
+    --test-filter "loop card parity chrome 764" `
+    --cache-dir (Join-Path $runRoot "local") `
+    --global-cache-dir (Join-Path $runRoot "global")
+```
+
+Require six executed cases and zero skips for that focused selector. This is
+in-memory native component painting, not an image export, desktop capture,
+physical-DPI test, or paired macOS visual acceptance.
+
+For complete regression coverage, use **full default-path suite plus isolated
+native-AA groups**, not one unfiltered native-AA process. GDI+ `initWith` has a
+process-global startup latch: the existing gated-readiness test must run in a
+fresh process that has not initialized card painting. Use stock compile-time
+`--test-filter` partitions, serial fresh processes, and a bound name inventory
+whose union executes each test exactly once, with only the three export cases
+skipped. Record actual named positive native-AA cases separately from suite
+totals; a zero-match filter or initialization alone is not native-paint evidence.
+
+The retained slice-1 full run was 299 total / 296 passed / 3 export skips on
+the **non-AA default path**; only its focused 33-case run exercised native AA.
+The checked-in Windows shell CI workflow/runner does not set either native-paint
+opt-in: this is a pre-existing native-AA coverage gap, not coverage established
+by green CI. Adding that coverage is a separate follow-up.
+
+Loop-card shadows use bounded, normalized Gaussian masks (declared logical
+radius mapped to sigma, truncated at three sigma). Attention halo orange uses
+the explicit attention-border RGB as a Windows mapping, not a verified
+resolution of SwiftUI `.orange`. Blur/compositing equivalence and the static
+attention endpoints still require separate visual/temporal evidence.
+
 ### Offscreen canvas paint artifact
 
 The opt-in `paint export: <scene-id>` Zig test calls the production
