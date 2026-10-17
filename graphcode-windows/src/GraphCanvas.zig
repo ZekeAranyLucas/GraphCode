@@ -701,6 +701,7 @@ pub fn paint(
                 emptyGraph(hdc, allocator, graph, graph_bounds);
             } else {
                 drawEdges(hdc, graph, state);
+                drawEdgeLabels(hdc, allocator, graph, state);
                 if (resolveCardRoles(allocator, graph.nodes.items, graph.edges.items, declared_entries)) |roles| {
                     defer allocator.free(roles);
                     for (graph.nodes.items, 0..) |node, index| {
@@ -725,8 +726,6 @@ pub fn paint(
                 } else |err| {
                     std.log.warn("Project card role resolution failed: {s}", .{@errorName(err)});
                 }
-
-                drawEdgeLabels(hdc, allocator, graph, state);
             }
         } else {
             welcome(hdc, allocator, graph_bounds);
@@ -1560,7 +1559,6 @@ fn drawEdgeLabels(hdc: c.HDC, allocator: std.mem.Allocator, graph: GraphModel.Gr
             placed[placed_count] = bounds;
             placed_count += 1;
         }
-        fill(hdc, bounds, Tokens.canvas_tone);
         drawTextRect(hdc, allocator, label, bounds, 10, color, c.DT_CENTER | c.DT_SINGLELINE | c.DT_END_ELLIPSIS);
     }
 }
@@ -5648,6 +5646,352 @@ test "loop card parity chrome 764 preserves geometry content roles and affordanc
     checks.expect(keep != null and keep.?.node_index == 1 and keep.?.action == .keep,
         "keep-hit-preserved", .project, "fixture-goal-done");
     try checks.finish(error.Chrome764ExistingSemanticsRegressed);
+}
+
+fn label858Fixture() !Paint764Fixture {
+    var fixture = try paint764FixtureModel(std.testing.allocator, .project);
+    errdefer fixture.model.deinit();
+    _ = try fixture.model.updateFromFrame(
+        \\{"version":2,"kind":"event","sequence":2,"event":{"graphChanged":{"id":"paint-764-project","project":{"path":"C:\\GraphCodeFixture\\CardStates","name":"Card States"},"nodes":[{"id":"label-0","title":"Layer zero","loopType":"goalBased","state":"idle"},{"id":"label-1","title":"Layer one","loopType":"goalBased","state":"idle"},{"id":"label-2","title":"Layer two","loopType":"goalBased","state":"idle"},{"id":"label-3","title":"Layer three","loopType":"goalBased","state":"idle"}],"edges":[{"id":"label-edge","from":"label-0","to":"label-3","kind":"handoff","condition":"always"}]}}}
+    );
+    if (!fixture.model.setSelectedIndex(1)) return error.Label858SelectionFailed;
+    return fixture;
+}
+
+fn label858RgbDistance(a: u32, b: u32) !u32 {
+    if (a == c.CLR_INVALID or b == c.CLR_INVALID) return error.Label858InvalidPixel;
+    var distance: u32 = 0;
+    for ([_]u5{ 0, 8, 16 }) |shift| {
+        const first: i32 = @intCast((a >> shift) & 255);
+        const second: i32 = @intCast((b >> shift) & 255);
+        distance += @abs(first - second);
+    }
+    return distance;
+}
+
+const label858Glyphs = [_]c.POINT{
+    .{ .x = 390, .y = 195 }, .{ .x = 393, .y = 195 }, .{ .x = 362, .y = 197 },
+    .{ .x = 367, .y = 197 }, .{ .x = 373, .y = 197 }, .{ .x = 378, .y = 197 },
+    .{ .x = 384, .y = 197 }, .{ .x = 385, .y = 197 }, .{ .x = 389, .y = 197 },
+    .{ .x = 390, .y = 197 }, .{ .x = 391, .y = 197 }, .{ .x = 392, .y = 197 },
+    .{ .x = 393, .y = 197 }, .{ .x = 360, .y = 198 }, .{ .x = 371, .y = 198 },
+    .{ .x = 367, .y = 199 }, .{ .x = 368, .y = 199 }, .{ .x = 366, .y = 201 },
+    .{ .x = 367, .y = 201 }, .{ .x = 368, .y = 201 }, .{ .x = 378, .y = 201 },
+    .{ .x = 379, .y = 201 }, .{ .x = 380, .y = 201 }, .{ .x = 384, .y = 201 },
+    .{ .x = 385, .y = 201 },
+};
+
+const Label858Checks = struct {
+    observations: usize = 0,
+    failures: usize = 0,
+
+    fn expect(self: *Label858Checks, condition: bool) void {
+        self.observations += 1;
+        if (!condition) self.failures += 1;
+    }
+
+    fn finish(self: Label858Checks, name: []const u8, failure: anyerror) !void {
+        std.debug.print("label858 case={s} observations={d} failures={d} native-ready={}\n",
+            .{ name, self.observations, self.failures, GdiplusAA.isReady() });
+        if (self.observations == 0) return error.Label858NoObservations;
+        if (self.failures != 0) return failure;
+    }
+};
+
+fn label858Text(hdc: c.HDC, color: u32, bounds: c.RECT) void {
+    drawTextRect(hdc, std.testing.allocator, "handoff", bounds, 10, color,
+        c.DT_CENTER | c.DT_SINGLELINE | c.DT_END_ELLIPSIS);
+}
+
+fn label858Composition(dib: ParityDib, fixture: *const Paint764Fixture, state: *const CanvasState,
+    order: enum { below, above, omitted }) !void
+{
+    const graph = fixture.model.graph orelse return error.Label858GraphMissing;
+    fill(dib.dc, rect(0, 0, 1280, 720), Tokens.canvas_tone);
+    drawGrid(dib.dc, chrome764GraphBounds(), state);
+    drawEdges(dib.dc, graph, state);
+    const color: u32 = if (state.selected_edge == 0) Tokens.canvas_selection else
+        if (graph.edges.items[0].fired) 0x006BD58D else edgeKindColor("handoff");
+    if (order == .below) label858Text(dib.dc, color, rect(303, 192, 451, 212));
+    const roles = try resolveCardRoles(std.testing.allocator, graph.nodes.items, graph.edges.items, &.{});
+    defer std.testing.allocator.free(roles);
+    for (graph.nodes.items, 0..) |node, index| {
+        drawLoopCardShadow(dib.dc, std.testing.allocator, node, nodeBounds(index, state), state, roles[index],
+            needsAttention(node, graph.nodes.items, graph.edges.items), fixture.model.selectedIndex() == index);
+    }
+    for (graph.nodes.items, 0..) |node, index| {
+        drawNode(dib.dc, std.testing.allocator, node, index, fixture.model.selectedIndex(),
+            graph.nodes.items, graph.edges.items, roles[index], null, &.{}, state);
+    }
+    if (order == .above) label858Text(dib.dc, color, rect(303, 192, 451, 212));
+    if (c.GdiFlush() == 0) return error.Label858FlushFailed;
+}
+
+fn label858Differences(a: ParityDib, b: ParityDib, bounds: c.RECT) !usize {
+    var differences: usize = 0;
+    var y = bounds.top;
+    while (y < bounds.bottom) : (y += 1) {
+        var x = bounds.left;
+        while (x < bounds.right) : (x += 1) {
+            if (try label858RgbDistance(c.GetPixel(a.dc, x, y), c.GetPixel(b.dc, x, y)) != 0)
+                differences += 1;
+        }
+    }
+    return differences;
+}
+
+test "loop card parity edge-label chrome 858 backing preserves lower-layer pixels" {
+    try chrome764Native();
+    var fixture = try label858Fixture();
+    defer fixture.model.deinit();
+    var actual = try ParityDib.init(1280, 720);
+    defer actual.deinit();
+    var lower = try ParityDib.init(1280, 720);
+    defer lower.deinit();
+    var checks = Label858Checks{};
+    const graph = &(fixture.model.graph orelse return error.Label858GraphMissing);
+    for (0..3) |variant| {
+        const state = CanvasState{ .selected_edge = if (variant == 1) 0 else null };
+        graph.edges.items[0].fired = variant == 2;
+        fill(lower.dc, rect(0, 0, 1280, 720), Tokens.canvas_tone);
+        var x: i32 = 303;
+        while (x < 451) : (x += 1)
+            fill(lower.dc, rect(x, 192, x + 1, 212), if (@mod(x, 2) == 0) 0x001B2418 else 0x00251820);
+        if (c.BitBlt(actual.dc, 0, 0, 1280, 720, lower.dc, 0, 0, c.SRCCOPY) == 0)
+            return error.Label858CopyFailed;
+        drawEdgeLabels(actual.dc, std.testing.allocator, graph.*, &state);
+        var y: i32 = 192;
+        while (y < 212) : (y += 1) {
+            for ([_]c.RECT{ rect(303, y, 323, y + 1), rect(431, y, 451, y + 1) }) |strip| {
+                x = strip.left;
+                while (x < strip.right) : (x += 1) {
+                    checks.expect(try label858RgbDistance(c.GetPixel(actual.dc, x, y), c.GetPixel(lower.dc, x, y)) == 0);
+                }
+            }
+        }
+        var ink: usize = 0;
+        for (label858Glyphs) |point| {
+            if (try label858RgbDistance(c.GetPixel(actual.dc, point.x, point.y), c.GetPixel(lower.dc, point.x, point.y)) > 20)
+                ink += 1;
+        }
+        checks.expect(ink == 25);
+        std.debug.print("label858 backing variant={d} protected=800 positive-glyphs={d}\n", .{ variant, ink });
+    }
+    var empty = graph.*;
+    empty.edges.items = &.{};
+    const before = try actual.rgbSha256(std.testing.allocator);
+    drawEdgeLabels(actual.dc, std.testing.allocator, empty, &CanvasState{});
+    checks.expect(std.mem.eql(u8, &before, &(try actual.rgbSha256(std.testing.allocator))));
+    try checks.finish("backing", error.Label858OpaqueBacking);
+}
+
+test "loop card parity edge-label chrome 858 text is below normal and attention shadows" {
+    try chrome764Native();
+    var fixture = try label858Fixture();
+    defer fixture.model.deinit();
+    var actual = try ParityDib.init(1280, 720);
+    defer actual.deinit();
+    var below = try ParityDib.init(1280, 720);
+    defer below.deinit();
+    var above = try ParityDib.init(1280, 720);
+    defer above.deinit();
+    var checks = Label858Checks{};
+    const state = CanvasState{};
+    for (0..2) |warm| {
+        const graph = &(fixture.model.graph orelse return error.Label858GraphMissing);
+        for ([_]usize{ 0, 3 }) |index|
+            try chrome764Replace(&graph.nodes.items[index].state, if (warm == 0) "idle" else "failed");
+        try chrome764Paint(actual, &fixture, .project, &state, null, &.{});
+        try label858Composition(below, &fixture, &state, .below);
+        try label858Composition(above, &fixture, &state, .above);
+        const region = rect(303, 192, 451, 212);
+        const discriminating = try label858Differences(below, above, region);
+        if (discriminating == 0) return error.Label858NondiscriminatingOrder;
+        const mismatches = try label858Differences(actual, below, region);
+        checks.expect(mismatches == 0);
+        checks.expect(try label858Differences(actual, above, region) > 0);
+        std.debug.print("label858 order warm={d} pixels=2960 discriminating={d} correct-order-mismatches={d}\n",
+            .{ warm, discriminating, mismatches });
+    }
+    try checks.finish("shadow-order", error.Label858TextAboveShadows);
+}
+
+test "loop card parity edge-label chrome 858 card face occludes overlapping label" {
+    try chrome764Native();
+    var fixture = try label858Fixture();
+    defer fixture.model.deinit();
+    var actual = try ParityDib.init(1280, 720);
+    defer actual.deinit();
+    var omitted = try ParityDib.init(1280, 720);
+    defer omitted.deinit();
+    var above = try ParityDib.init(1280, 720);
+    defer above.deinit();
+    var checks = Label858Checks{};
+    var state = CanvasState{};
+    state.node_offsets[1] = .{ .x = -182, .y = 106 };
+    for ([_]usize{ 2, 1 }) |selected| {
+        if (!fixture.model.setSelectedIndex(selected)) return error.Label858SelectionFailed;
+        try chrome764Paint(actual, &fixture, .project, &state, null, &.{});
+        try label858Composition(omitted, &fixture, &state, .omitted);
+        try label858Composition(above, &fixture, &state, .above);
+        const region = rect(350, 194, 410, 208);
+        const discriminating = try label858Differences(omitted, above, region);
+        if (discriminating == 0) return error.Label858NondiscriminatingOcclusion;
+        const mismatches = try label858Differences(actual, omitted, region);
+        checks.expect(mismatches == 0);
+        std.debug.print("label858 face selected={d} pixels=840 discriminating={d} mismatches={d}\n",
+            .{ selected, discriminating, mismatches });
+    }
+    try checks.finish("face-occlusion", error.Label858TextAboveFace);
+}
+
+test "loop card parity edge-label chrome 858 placement and viewport boundaries remain unchanged" {
+    try chrome764Native();
+    var fixture = try label858Fixture();
+    defer fixture.model.deinit();
+    const graph = fixture.model.graph orelse return error.Label858GraphMissing;
+    var checks = Label858Checks{};
+    for ([_]i32{ 96, 120, 144, 192 }) |dpi| {
+        for ([_]f32{ 0.55, 1, 1.8 }) |zoom| {
+            var actual = try ParityDib.init(@divTrunc(1280 * dpi, 96), @divTrunc(720 * dpi, 96));
+            defer actual.deinit();
+            var expected = try ParityDib.init(@divTrunc(1280 * dpi, 96), @divTrunc(720 * dpi, 96));
+            defer expected.deinit();
+            try chrome764Map(actual, dpi);
+            try chrome764Map(expected, dpi);
+            const state = CanvasState{ .zoom = zoom, .pan_x = 17, .pan_y = 9 };
+            const left: i32 = @intFromFloat(252 * zoom + 17);
+            const width: i32 = @intFromFloat(250 * zoom);
+            const top0: i32 = @intFromFloat(84 * zoom + 9);
+            const top3: i32 = @intFromFloat(224 * zoom + 9);
+            const height: i32 = @intFromFloat(96 * zoom);
+            const cy = @divTrunc(top0 + top3 + height, 2);
+            const cx = left + @divTrunc(width, 2);
+            for ([_]ParityDib{ actual, expected }) |dib| {
+                fill(dib.dc, rect(0, 0, 1280, 720), Tokens.canvas_tone);
+                if (c.IntersectClipRect(dib.dc, 223, 35, 1000, 620) == c.ERROR) return error.Label858ClipFailed;
+            }
+            drawEdgeLabels(actual.dc, std.testing.allocator, graph, &state);
+            label858Text(expected.dc, edgeKindColor("handoff"), rect(cx - 74, cy - 10, cx + 74, cy + 10));
+            const hash = try actual.rgbSha256(std.testing.allocator);
+            checks.expect(std.mem.eql(u8, &hash, &(try expected.rgbSha256(std.testing.allocator))));
+            std.debug.print("label858 placement dpi={d} zoom={d} pan=17,9 expected=({d},{d},148,20) full-rgb-clip-check=true\n",
+                .{ dpi, zoom, cx - 74, cy - 10 });
+        }
+    }
+    var actual = try ParityDib.init(1280, 720);
+    defer actual.deinit();
+    var expected = try ParityDib.init(1280, 720);
+    defer expected.deinit();
+    for ([_]i32{ 39, 40 }) |delta| {
+        var state = CanvasState{};
+        state.node_offsets[3].y = @floatFromInt(delta - 140);
+        fill(actual.dc, rect(0, 0, 1280, 720), Tokens.canvas_tone);
+        fill(expected.dc, rect(0, 0, 1280, 720), Tokens.canvas_tone);
+        drawEdgeLabels(actual.dc, std.testing.allocator, graph, &state);
+        const y: i32 = if (delta == 39) 56 else 142;
+        label858Text(expected.dc, edgeKindColor("handoff"), rect(303, y, 451, y + 20));
+        const hash = try actual.rgbSha256(std.testing.allocator);
+        checks.expect(std.mem.eql(u8, &hash, &(try expected.rgbSha256(std.testing.allocator))));
+    }
+    var edges: [130]GraphModel.Edge = undefined;
+    @memset(&edges, graph.edges.items[0]);
+    for ([_]usize{ 2, 128, 129, 130 }) |count| {
+        var crowded = graph;
+        crowded.edges.items = edges[0..count];
+        fill(actual.dc, rect(0, 0, 1280, 720), Tokens.canvas_tone);
+        fill(expected.dc, rect(0, 0, 1280, 720), Tokens.canvas_tone);
+        drawEdgeLabels(actual.dc, std.testing.allocator, crowded, &CanvasState{});
+        for (0..count) |index| {
+            const y: i32 = 192 + @as(i32, @intCast(@min(index, 12))) * 24;
+            label858Text(expected.dc, edgeKindColor("handoff"), rect(303, y, 451, y + 20));
+        }
+        if (c.GdiFlush() == 0) return error.Label858FlushFailed;
+        var support_mismatches: usize = 0;
+        for (0..actual.height) |y| {
+            for (0..actual.width) |x| {
+                const offset = y * actual.row_bytes + x * 4;
+                const a = actual.pixels[offset .. offset + 3];
+                const b = expected.pixels[offset .. offset + 3];
+                const ground = [_]u8{ 11, 12, 10 };
+                if (std.mem.eql(u8, a, &ground) != std.mem.eql(u8, b, &ground))
+                    support_mismatches += 1;
+            }
+        }
+        checks.expect(support_mismatches == 0);
+        std.debug.print("label858 collision edges={d} attempts=12 record-limit=128 exact-ink-support-mismatches={d}\n",
+            .{ count, support_mismatches });
+    }
+    const placed = [_]c.RECT{rect(303, 192, 451, 212)};
+    checks.expect(!overlapsPlaced(rect(451, 192, 599, 212), &placed));
+    checks.expect(overlapsPlaced(rect(450, 192, 598, 212), &placed));
+    try checks.finish("placement-clip", error.Label858PlacementChanged);
+}
+
+test "loop card parity edge-label chrome 858 project-only change preserves the card contract" {
+    try chrome764Native();
+    var fixture = try label858Fixture();
+    defer fixture.model.deinit();
+    var actual = try ParityDib.init(1280, 720);
+    defer actual.deinit();
+    var omitted = try ParityDib.init(1280, 720);
+    defer omitted.deinit();
+    var checks = Label858Checks{};
+    for (0..2) |warm| {
+        const graph = &(fixture.model.graph orelse return error.Label858GraphMissing);
+        for ([_]usize{ 0, 3 }) |index|
+            try chrome764Replace(&graph.nodes.items[index].state, if (warm == 0) "idle" else "failed");
+        for (0..3) |variant| {
+            const state = CanvasState{ .selected_edge = if (variant == 1) 0 else null };
+            graph.edges.items[0].fired = variant == 2;
+            try chrome764Paint(actual, &fixture, .project, &state, null, &.{});
+            try label858Composition(omitted, &fixture, &state, .omitted);
+            var pairs: usize = 0;
+            var ink: usize = 0;
+            var minimum: u32 = std.math.maxInt(u32);
+            for (label858Glyphs) |point| {
+                const glyph = c.GetPixel(actual.dc, point.x, point.y);
+                const no_label = c.GetPixel(omitted.dc, point.x, point.y);
+                if (try label858RgbDistance(glyph, no_label) >= 100) ink += 1;
+                for ([_]i32{ 302, 451 }) |hx| {
+                    const distance = try label858RgbDistance(glyph, c.GetPixel(actual.dc, hx, point.y));
+                    minimum = @min(minimum, distance);
+                    checks.expect(distance >= 100);
+                    pairs += 1;
+                }
+            }
+            checks.expect(ink > 0);
+            checks.expect(pairs == 50);
+            std.debug.print("label858 fixed-legibility warm={d} variant={d} frozen-glyphs=25 positive-ink={d} pairs={d} minimum-l1={d} fixed-margin=100\n",
+                .{ warm, variant, ink, pairs, minimum });
+        }
+    }
+    const state = CanvasState{};
+    const graph = fixture.model.graph orelse return error.Label858GraphMissing;
+    checks.expect(hitTest(graph.nodes.items, 377, 132, &state, chrome764GraphBounds()) == 0);
+    checks.expect(contentSize(&fixture.model, .project).width > 0);
+    const label = try edgeLabel(std.testing.allocator, graph.edges.items[0]);
+    defer std.testing.allocator.free(label);
+    checks.expect(std.mem.eql(u8, label, "handoff"));
+    var outside = std.crypto.hash.sha2.Sha256.init(.{});
+    if (c.GdiFlush() == 0) return error.Label858FlushFailed;
+    for (0..actual.height) |y| {
+        for (0..actual.width) |x| {
+            if (x >= 303 and x < 451 and y >= 192 and y < 212) continue;
+            const offset = y * actual.row_bytes + x * 4;
+            outside.update(actual.pixels[offset .. offset + 3]);
+        }
+    }
+    const outside_digest = outside.finalResult();
+    std.debug.print("label858 project-outside-label rgb-sha256={s} pixels=918640\n",
+        .{std.fmt.bytesToHex(outside_digest, .lower)});
+    var overview_fixture = try paint764FixtureModel(std.testing.allocator, .overview);
+    defer overview_fixture.model.deinit();
+    try paint764TestSurface(actual, &overview_fixture, std.testing.allocator, .overview);
+    const overview_digest = try actual.rgbSha256(std.testing.allocator);
+    std.debug.print("label858 overview-preservation rgb-sha256={s} byte-count={d} unix-seconds={d}\n",
+        .{ std.fmt.bytesToHex(overview_digest, .lower), actual.width * actual.height * 3, std.time.timestamp() });
+    try checks.finish("preservation-legibility", error.Label858LegibilityOrCardContractChanged);
 }
 
 test "loop card parity paint 764 accents match Mac COLORREFs on both surfaces" {
