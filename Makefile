@@ -2,7 +2,7 @@
         daemon-install daemon-uninstall daemon-status test check format clean \
         dev-generate dev-build-app dev-build-daemon dev-install-daemon \
         dev-install-zmx dev-run-app dev-status \
-        third-party build-zmx install-zmx build-ghostty vendor-sdk \
+        third-party build-zmx install-zmx build-ghostty vendor-sdk zig-sdk \
         build-cli install-cli release-dmg notarize signing-doctor tap-bump build-nod
 
 SCHEME_APP := graphcode
@@ -86,7 +86,7 @@ build-nod:
 	rm -rf "$(NOD_BUILD_DIR)"
 	cd NodRuntime && sh scripts/package.sh "$(NOD_BUILD_DIR)" bun-darwin-arm64
 
-build-zmx:
+build-zmx: zig-sdk
 	@test -d ThirdParty/zmx || { echo "ThirdParty/zmx missing — run: git submodule update --init --recursive"; exit 1; }
 	@# -Doptimize is load-bearing: zig defaults to Debug, whose ghostty-vt runs
 	@# page-integrity verification on every scrolled line. Measured via
@@ -122,7 +122,7 @@ install-zmx: build-zmx
 		|| { echo "zmx installed but won't run — check its code signature"; exit 1; }
 	@echo "zmx installed: $(SUPPORT_DIR)/bin/zmx"
 
-build-ghostty:
+build-ghostty: zig-sdk
 	@test -d ThirdParty/ghostty || { echo "ThirdParty/ghostty missing — run: git submodule update --init --recursive"; exit 1; }
 	@if xcrun metal --version 2>&1 | grep -q "missing Metal Toolchain"; then \
 		echo "[missing] Metal toolchain — GhosttyKit compiles Metal shaders."; \
@@ -144,6 +144,11 @@ build-ghostty:
 	@mkdir -p "$(BUILD_DIR)/ghostty"
 	@ditto ThirdParty/ghostty/macos/GhosttyKit.xcframework "$(BUILD_DIR)/ghostty/GhosttyKit.xcframework"
 	@echo "GhosttyKit built: $(BUILD_DIR)/ghostty/GhosttyKit.xcframework"
+
+# When no macOS 15 SDK exists (GitHub's macos-26 runners), a patched view of the
+# newest SDK stands in. A no-op wherever the shim already finds one.
+zig-sdk:
+	@sh Tools/zig-sdk-shim/make-zig-sdk
 
 # Copy a macOS 15 SDK into the repo so a Command Line Tools update that drops it
 # can't break the zig builds. The shim prefers this copy when it exists.

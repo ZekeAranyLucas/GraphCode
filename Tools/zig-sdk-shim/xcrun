@@ -4,15 +4,12 @@
 # ── Why this exists ────────────────────────────────────────────────────────────
 # usr/lib/libSystem.B.tbd is a multi-document YAML file: one `!tapi-tbd` document
 # for libSystem itself, then one per reexported sub-library. In macOS SDK 26.x the
-# *primary* libSystem document dropped the plain `arm64-macos` target, leaving only
-# `arm64e-macos`:
+# libSystem document and most of its sub-library documents dropped the plain
+# `arm64-macos` target, leaving only `arm64e-macos` (34 of 40 documents in 26.5):
 #
 #   SDK 26.5: targets: [ x86_64-macos, x86_64-maccatalyst, arm64e-macos, arm64e-maccatalyst ]
 #   SDK 15.4: targets: [ x86_64-macos, x86_64-maccatalyst, arm64-macos, arm64-maccatalyst,
 #                        arm64e-macos, arm64e-maccatalyst ]
-#
-# (`grep arm64-macos` on the 26.5 file still hits ~22 times — those are the *other*
-# libraries' documents further down, not libSystem's own.)
 #
 # Zig targets `arm64`, finds no matching target in libSystem's document, and so
 # concludes libSystem exports nothing — every libc symbol (_malloc, _getcwd,
@@ -59,6 +56,11 @@ resolve_sdk() {
   newest=$(ls -d /Library/Developer/CommandLineTools/SDKs/MacOSX15*.sdk 2>/dev/null \
     | sort -V | tail -1)
   [ -n "$newest" ] && { printf '%s\n' "$newest"; return 0; }
+  # 4. A newer SDK with its libSystem stub patched, for machines that have no macOS 15
+  #    SDK at all (`make zig-sdk`, which runs ./make-zig-sdk).
+  for candidate in "$repo_root"/.build/sdk/MacOSX*-zig.sdk; do
+    [ -d "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
+  done
   return 1
 }
 
@@ -78,7 +80,7 @@ if [ "$want_sdk_path" = "1" ] && [ "$sdk" = "macosx" ]; then
     exit 0
   fi
   echo "zig-sdk-shim: no macOS 15 SDK found. Install the Command Line Tools" >&2
-  echo "  (xcode-select --install) or set GRAPHCODE_ZIG_SDK to a macOS 15 SDK." >&2
+  echo "  (xcode-select --install), run \`make zig-sdk\`, or set GRAPHCODE_ZIG_SDK." >&2
   exit 1
 fi
 
