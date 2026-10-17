@@ -3027,6 +3027,163 @@ function Invoke-CapSelectorRefusalContracts {
         return @{ polls = $run.meter.polls; originalMessage = $run.meter.failure.Exception.Message
             observerAttempts = 1; explicitFailure = $run.traceFailures[-1] }
     }
+    Invoke-CapTest 'real Find forwards optional refusal references through owned hidden UIA roots' {
+        if (-not ('CapOptionalRefWindowFixture' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+public static class CapOptionalRefWindowFixture {
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "CreateWindowExW")]
+    private static extern IntPtr CreateWindow(uint exStyle, string className, string title, uint style,
+        int x, int y, int width, int height, IntPtr parent, IntPtr menu, IntPtr instance, IntPtr parameter);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool DestroyWindow(IntPtr window);
+    [DllImport("user32.dll")]
+    public static extern bool IsWindow(IntPtr window);
+    [DllImport("user32.dll")]
+    public static extern bool IsWindowVisible(IntPtr window);
+    public static IntPtr Create() {
+        var window = CreateWindow(0, "STATIC", "GraphCode optional reference fixture", 0x80000000u,
+            0, 0, 120, 30, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+        if (window == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+        return window;
+    }
+    public static void Destroy(IntPtr window) {
+        if (!DestroyWindow(window)) throw new Win32Exception(Marshal.GetLastWin32Error());
+    }
+}
+'@
+        }
+        $module = Get-Module UiCaptureDriver
+        $self = [Diagnostics.Process]::GetCurrentProcess()
+        $window = [IntPtr]::Zero
+        $branches = [Collections.Generic.List[object]]::new()
+        $failuresBefore = @(Get-CapTraceFailures).Count
+        $lifecycle = [ordered]@{
+            mode = 'REAL_FIND_REAL_RESOLVER_HIDDEN_OWN_PROCESS_UIA_NO_INPUT_OR_CAPTURE'
+            pid = $PID; startTimeUtc = $self.StartTime.ToUniversalTime().ToString('o')
+            image = $self.MainModule.FileName; arguments = @([Environment]::GetCommandLineArgs())
+            sourceHashes = $sourceHashesBefore; createdUtc = $null; readyUtc = $null
+            hwnd = $null; creationFileTimeUtc = $null; rootProcessId = $null; candidateCount = $null
+            destroyed = $false; destroyObservedUtc = $null; selfStillLiveBeforeDispose = $null
+            selfWrapperDisposed = $false; spawnedFixtureProcesses = 0
+            childExitAndRedirectedEof = 'Not applicable: HWND belongs to the current test process.'
+            branches = $branches; errors = @()
+        }
+        try {
+            $identity = Get-CapProcessIdentity -Process $self -ExpectedImagePath $self.MainModule.FileName `
+                -Role 'optional-ref-hidden-uia-self'
+            $lifecycle.creationFileTimeUtc = $identity.CreationFileTimeUtc
+            $window = [CapOptionalRefWindowFixture]::Create()
+            $lifecycle.hwnd = $window.ToInt64()
+            $lifecycle.createdUtc = [DateTimeOffset]::UtcNow.ToString('o')
+            Assert-CapTest (-not [CapOptionalRefWindowFixture]::IsWindowVisible($window)) 'Regression HWND must remain hidden.'
+            $parent = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+            $lifecycle.rootProcessId = $parent.Current.ProcessId
+            $candidates = $parent.FindAll([System.Windows.Automation.TreeScope]::Element,
+                [System.Windows.Automation.Condition]::TrueCondition)
+            $lifecycle.candidateCount = $candidates.Count
+            Assert-CapTest ($parent.Current.ProcessId -eq $PID -and $candidates.Count -eq 1 -and
+                $candidates[0].Current.ProcessId -eq $PID) 'Hidden UIA fixture must expose exactly its actual owned root.'
+            $lifecycle.readyUtc = [DateTimeOffset]::UtcNow.ToString('o')
+            foreach ($sink in @($true, $false)) {
+                foreach ($parameterSet in @('Window', 'Element')) {
+                    foreach ($bound in @($false, $true)) {
+                        $path = Join-Path $scratch ("selector-real-find-$parameterSet-$sink-$bound.jsonl")
+                        if ($sink) { Set-CapTracePath $path }
+                        else { & $module { $script:CapTracePath = $null } }
+                        $snapshot = $null
+                        $parameters = @{
+                            ProcessIdentity = $identity; Name = 'Intentionally absent selector'
+                            Scope = [System.Windows.Automation.TreeScope]::Element
+                        }
+                        if ($parameterSet -ceq 'Window') { $parameters.RootHandle = $window }
+                        else { $parameters.Parent = $parent }
+                        if ($bound) { $parameters.RefusalSnapshot = [ref]$snapshot }
+                        $caught = $null
+                        try { $null = Find-CapAutomationElement @parameters }
+                        catch { $caught = $_ }
+                        $exceptionType = if ($caught) { $caught.Exception.GetType().FullName } else { $null }
+                        $bindingFailure = $exceptionType -ceq 'System.Management.Automation.ParameterBindingArgumentTransformationException'
+                        $rows = if (Test-Path -LiteralPath $path) {
+                            @(Get-Content -LiteralPath $path | ForEach-Object { ConvertFrom-Json $_ -DateKind String })
+                        } else { @() }
+                        $entryCount = @($rows | Where-Object command -CEQ 'Resolve-CapAutomationCandidate').Count
+                        $diagnosticCount = @($rows | Where-Object command -CEQ 'CapSelectorRefusal').Count
+                        $branch = [ordered]@{
+                            parameterSet = $parameterSet; referenceBound = $bound; traceSink = $sink
+                            resolverEntries = $entryCount; diagnosticWrites = $diagnosticCount
+                            snapshotObserved = ($null -ne $snapshot)
+                            exceptionType = $exceptionType; bindingFailure = $bindingFailure
+                            exception = if ($caught) { $caught.Exception.ToString() } else { $null }
+                            fullyQualifiedErrorId = if ($caught) { $caught.FullyQualifiedErrorId } else { $null }
+                            scriptStackTrace = if ($caught) { $caught.ScriptStackTrace } else { $null }
+                        }
+                        $branches.Add($branch)
+                        Write-JournalContractJson (Join-Path $scratch ("selector-real-find-$parameterSet-$sink-$bound.json")) $branch
+                        $expected = "Expected exactly one visible UIA element Name='Intentionally absent selector' id='' prefix=''; found=0."
+                        Assert-CapTest ($null -ne $caught -and $caught.Exception.Message -ceq $expected -and
+                            -not $bindingFailure -and
+                            $caught.FullyQualifiedErrorId -ceq $expected -and
+                            $caught.ScriptStackTrace.StartsWith('at Resolve-CapAutomationCandidate,', [StringComparison]::Ordinal)) `
+                            'Real Find must reach the real resolver normal refusal, not optional-reference binding failure.' $branch
+                        Assert-CapTest ($entryCount -eq [int]$sink -and
+                            $diagnosticCount -eq [int]($sink -and -not $bound)) 'Real resolver entry or refusal emission count changed.' $branch
+                        if ($sink -and $bound) {
+                            Assert-CapTest ($null -ne $snapshot -and $snapshot.CandidatesObserved -and
+                                $snapshot.Candidates.Count -eq 1 -and $snapshot.Candidates[0].Current.ProcessId -eq $PID -and
+                                $snapshot.ExpectedProcessId -eq $PID -and $snapshot.Name -ceq $parameters.Name -and
+                                -not $snapshot.EmissionAttempted -and
+                                $snapshot.Context.RootProcessId -eq $PID -and
+                                $snapshot.Context.ProcessIdentity.CreationFileTimeUtc -eq $identity.CreationFileTimeUtc -and
+                                $snapshot.Context.ParameterSet -ceq $parameterSet -and
+                                $snapshot.Context.Scope -eq [System.Windows.Automation.TreeScope]::Element) `
+                                'Bound reference lost actual candidates, held generation, selector, or generated context.'
+                            Assert-CapTest (($parameterSet -ceq 'Window' -and $snapshot.Context.RootHandle -eq $window) -or
+                                ($parameterSet -ceq 'Element' -and $null -eq $snapshot.Context.RootHandle)) `
+                                'Bound reference changed the generated root handle context.'
+                        } elseif ($sink) {
+                            $data = Read-SelectorEvidence $path
+                            Assert-CapTest ($data.schema -ceq 'CapSelectorRefusal/1' -and
+                                $data.refusal.message -ceq $expected -and $data.stageCounts.total -eq 1 -and
+                                $data.stageCounts.processOwned -eq 1 -and $data.stageCounts.nameMatch -eq 0 -and
+                                $data.candidates[0].ProcessId.value -is [long] -and
+                                $data.candidates[0].ProcessId.value -eq $PID -and
+                                $data.heldContext.rootProcessId -eq $PID -and
+                                $data.heldContext.parameterSet -ceq $parameterSet -and
+                                $data.heldContext.identity.CreationFileTimeUtc.value -eq $identity.CreationFileTimeUtc) `
+                                'Unbound reference lost direct typed candidate/stage/held-context evidence.'
+                        } else {
+                            Assert-CapTest ($null -eq $snapshot -and -not (Test-Path -LiteralPath $path)) `
+                                'No-sink real Find retained a snapshot or wrote trace output.'
+                        }
+                        Assert-CapTest (@(Get-CapTraceFailures).Count -eq $failuresBefore) 'Real Find added a trace observer failure.'
+                    }
+                }
+            }
+            Assert-CapTest ($branches.Count -eq 8) 'Real Find optional-reference matrix did not execute all eight branches.'
+        } catch {
+            $lifecycle.errors = @($_.Exception.ToString())
+            throw
+        } finally {
+            try {
+                if ($window -ne [IntPtr]::Zero) {
+                    [CapOptionalRefWindowFixture]::Destroy($window)
+                    $lifecycle.destroyed = -not [CapOptionalRefWindowFixture]::IsWindow($window)
+                    $lifecycle.destroyObservedUtc = [DateTimeOffset]::UtcNow.ToString('o')
+                    Assert-CapTest $lifecycle.destroyed 'Hidden regression HWND survived cleanup.'
+                }
+                $lifecycle.selfStillLiveBeforeDispose = -not [CapNative]::IsExited($self.Handle, $PID)
+            } finally {
+                $self.Dispose()
+                $lifecycle.selfWrapperDisposed = $true
+                Set-CapTracePath -Path (Join-Path $scratch 'test-calls.jsonl')
+                Write-JournalContractJson (Join-Path $scratch 'selector-real-find-lifecycle.json') $lifecycle
+            }
+        }
+        return $lifecycle
+    }
     Set-CapTracePath -Path (Join-Path $scratch 'test-calls.jsonl')
 }
 
@@ -3234,10 +3391,10 @@ if ($SelectorRefusalContractOnly) {
     $failed = @($results | Where-Object passed -EQ $false).Count
     $report = [pscustomobject]@{ suite = 'UiCaptureSelectorRefusalContracts'; executed = $results.Count
         passed = $passed; failed = $failed; cases = @($results); sourceHashesBeforeImport = $sourceHashesBefore
-        mode = 'SYNTHETIC_CANDIDATES_ACTUAL_RESOLVER_AND_TRACE_NO_DESKTOP' }
+        mode = 'SYNTHETIC_CANDIDATES_AND_REAL_FIND_HIDDEN_OWN_PROCESS_UIA_NO_DESKTOP_INPUT' }
     $report | ConvertTo-Json -Depth 25 | Set-Content -LiteralPath (Join-Path $scratch 'report.json') -Encoding utf8NoBOM
     $report | Select-Object suite,executed,passed,failed | ConvertTo-Json -Compress
-    if ($results.Count -ne 13 -or $passed -ne 13 -or $failed -ne 0) { exit 1 }
+    if ($results.Count -ne 14 -or $passed -ne 14 -or $failed -ne 0) { exit 1 }
     exit 0
 }
 
@@ -4324,6 +4481,6 @@ try {
 }
 [ordered]@{ suite = $suiteName; executed = $results.Count; passed = $passed; failed = $failed; artifacts = $scratch } |
     ConvertTo-Json -Compress
-$expectedCount = if ($JournalContractOnly) { 10 } elseif ($LaunchContractOnly) { 2 } elseif ($RequireRealSeed) { 132 } else { 129 }
+$expectedCount = if ($JournalContractOnly) { 10 } elseif ($LaunchContractOnly) { 2 } elseif ($RequireRealSeed) { 133 } else { 130 }
 if ($results.Count -ne $expectedCount -or $failed -ne 0 -or $passed -ne $results.Count) { exit 1 }
 exit 0

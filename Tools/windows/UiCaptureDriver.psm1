@@ -1318,10 +1318,14 @@ function Find-CapAutomationElement {
     }
     $null = Assert-CapUiaProcessIds -ExpectedProcessId $ExpectedProcessId -ObservedProcessIds @($rootProcessId)
     $elements = $rootElement.FindAll($Scope, [System.Windows.Automation.Condition]::TrueCondition)
+    $optionalParameters = @{}
+    if ($PSBoundParameters.ContainsKey('RefusalSnapshot')) {
+        $optionalParameters.RefusalSnapshot = $RefusalSnapshot
+    }
     $resolving = $true
     return Resolve-CapAutomationCandidate -Candidates @($elements) -ExpectedProcessId $ExpectedProcessId `
         -Name $Name -AutomationId $AutomationId -AutomationIdPrefix $AutomationIdPrefix -AllowOffscreen:$AllowOffscreen `
-        -RefusalSnapshot $RefusalSnapshot -RefusalContext $(if ($script:CapTracePath) {
+        @optionalParameters -RefusalContext $(if ($script:CapTracePath) {
             @{ RootHandle = if ($PSCmdlet.ParameterSetName -eq 'Window') { $RootHandle } else { $null }
                 ProcessIdentity = $ProcessIdentity; RootProcessId = $rootProcessId; Scope = $Scope; ParameterSet = $PSCmdlet.ParameterSetName }
         } else { $null })
