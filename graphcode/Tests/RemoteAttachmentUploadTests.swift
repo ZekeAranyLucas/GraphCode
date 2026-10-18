@@ -268,6 +268,13 @@ struct RemoteAttachmentUploadTests {
 }
 
 extension RemoteAttachmentUploadTests {
+  @Test
+  func aPastedImageIsReferencedByItsPathAlone() {
+    #expect(
+      RemoteAttachmentUpload.composerReference(toImageAt: "/home/dev/a.png")
+        == "Image available at /home/dev/a.png ")
+  }
+
   @Test(arguments: [
     (CLISessionBackendKind.copilotCLI, GraphcodeSettings(copilotPermissions: .allowTools)),
     (CLISessionBackendKind.codex, GraphcodeSettings(codexApprovals: .workspace)),

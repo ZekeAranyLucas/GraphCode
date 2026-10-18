@@ -191,10 +191,11 @@ public enum RemoteAttachmentUpload {
     }
   }
 
-  /// What the agent is told, typed into its composer after an upload. Plain words on both
-  /// sides of the path, for the reason `PromptAttachments.resolving` gives.
+  /// What the agent is told, typed into its composer after an upload. Nothing touches the
+  /// path, for the reason `PromptAttachments.resolving` gives; the trailing space keeps
+  /// what the human types next off it.
   public static func composerReference(toImageAt path: String) -> String {
-    "Image available at \(path) - inspect it. "
+    "Image available at \(path) "
   }
 }
 
