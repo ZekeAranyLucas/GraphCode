@@ -934,14 +934,15 @@ function Assert-CapFixtureMapping {
     if ($isD) {
         if ($mapping.quickChats -ne 2 -or $mapping.layouts -ne 3) { throw 'D fixture mapping requires two chats and three layouts.' }
         Assert-CapDFixture -Fixture $fixture -ProjectRoot $projectsRoot
-        $peerPath = Assert-CapArtifactPath -Root $Root -Path (Join-Path $Root 'inputs\offline-peer-source.ps1')
-        $peerBytes = [IO.File]::ReadAllBytes($peerPath)
-        $canonicalPeer = [Text.UTF8Encoding]::new($false).GetBytes((Get-CapDPeerSource))
-        if ($ExpectedPeerSha256 -notmatch '^[A-Fa-f0-9]{64}$' -or
-            [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($peerBytes)) -ne $ExpectedPeerSha256 -or
-            -not [Linq.Enumerable]::SequenceEqual[byte]($peerBytes,$canonicalPeer)) {
-            throw 'D peer bytes differ from the hash-bound same-module fixture peer.'
-        }
+    }
+    $peerPath = Assert-CapArtifactPath -Root $Root -Path (Join-Path $Root 'inputs\offline-peer-source.ps1')
+    $peerBytes = [IO.File]::ReadAllBytes($peerPath)
+    $canonicalPeer = [Text.UTF8Encoding]::new($false).GetBytes($(if ($isD) {Get-CapDPeerSource} else {Get-CapBPeerSource}))
+    if ($ExpectedPeerSha256 -notmatch '^[A-Fa-f0-9]{64}$' -or
+        [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($peerBytes)) -ne $ExpectedPeerSha256 -or
+        -not [Linq.Enumerable]::SequenceEqual[byte]($peerBytes,$canonicalPeer)) {
+        $lane = if ($isD) {'D'} else {'B'}
+        throw "$lane peer bytes differ from the hash-bound same-module fixture peer."
     }
     return [pscustomobject]@{ FixtureSha256 = $fixtureHash; SourceSha256 = $sourceHash; MappingSha256 = $mappingHash }
 }
@@ -2916,7 +2917,7 @@ function Get-CapDPeerFrames {
     $verb=@($Frame.command.PSObject.Properties)[0].Name
     $payload=$Frame.command.$verb
     if ($payload -isnot [pscustomobject]) { throw 'D peer refuses malformed payload.' }
-    $keys=@($payload.PSObject.Properties.Name)
+    $keys=@($payload.PSObject.Properties | ForEach-Object Name)
     $response=[ordered]@{version=2;kind='response';requestID=$Frame.requestID;success=$true}
     switch -CaseSensitive ($verb) {
         'listRecentProjects' {
@@ -2943,13 +2944,96 @@ function Get-CapDPeerFrames {
                 $payload.command -isnot [pscustomobject] -or @($payload.command.PSObject.Properties).Count -ne 1 -or
                 @($payload.command.PSObject.Properties)[0].Name -cne 'resumeSession' -or
                 $payload.command.resumeSession -isnot [pscustomobject] -or
-                (@($payload.command.resumeSession.PSObject.Properties.Name) -join ',') -cne '_0' -or
+                (@($payload.command.resumeSession.PSObject.Properties | ForEach-Object Name) -join ',') -cne '_0' -or
                 $payload.command.resumeSession._0 -cne 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA') { throw 'D peer refuses all but exact metadata-only resumeSession.' }
         }
         {$_ -cin @('restoreOpenProjects','openGlobalGraph')} {if ($keys.Count -ne 0) { throw 'D peer refuses extra payload.' }}
         default { throw "D peer refuses unapproved command '$verb'." }
     }
     return $response
+}
+
+function Get-CapBPeerSource {
+    return @'
+param([Parameter(Mandatory)][string] $PipeName, [Parameter(Mandatory)][string] $FixturePath)
+$ErrorActionPreference = "Stop"
+$fixture = Get-Content -LiteralPath $FixturePath -Raw | ConvertFrom-Json -AsHashtable
+function Read-Bytes($stream, [int] $length) {
+    $bytes = [byte[]]::new($length)
+    $offset = 0
+    while ($offset -lt $length) {
+        $count = $stream.Read($bytes, $offset, $length - $offset)
+        if ($count -eq 0) {
+            if ($offset -ne 0) { throw [IO.InvalidDataException]::new("Truncated fixture peer frame.") }
+            return $null
+        }
+        $offset += $count
+    }
+    return ,$bytes
+}
+function Send-Frame($stream, $frame) {
+    $data = [Text.Encoding]::UTF8.GetBytes(($frame | ConvertTo-Json -Depth 32 -Compress))
+    $length = [uint32]$data.Length
+    $header = [byte[]]@((($length -shr 24) -band 255), (($length -shr 16) -band 255), (($length -shr 8) -band 255), ($length -band 255))
+    $stream.Write($header, 0, 4)
+    $stream.Write($data, 0, $data.Length)
+    $stream.Flush()
+}
+$null = @{ version = 2; kind = "hello"; supportedVersions = @(1,2); selectedVersion = 2 } |
+    ConvertTo-Json -Depth 32 -Compress | ConvertFrom-Json -AsHashtable
+[Console]::Out.WriteLine("CAP_PEER_READY:$([DateTime]::UtcNow.ToString('o')):$([Diagnostics.Stopwatch]::GetTimestamp())")
+$sequence = 0
+while ($true) {
+    $server = [IO.Pipes.NamedPipeServerStream]::new($PipeName, [IO.Pipes.PipeDirection]::InOut, 1)
+    try {
+        $server.WaitForConnection()
+        $published = $false
+        while ($server.IsConnected) {
+            $header = Read-Bytes $server 4
+            if ($null -eq $header) { break }
+            $length = ([int]$header[0] -shl 24) -bor ([int]$header[1] -shl 16) -bor ([int]$header[2] -shl 8) -bor $header[3]
+            if ($length -le 0 -or $length -gt 2097152) { throw [IO.InvalidDataException]::new("Invalid frame length $length") }
+            $bytes = Read-Bytes $server $length
+            if ($null -eq $bytes) { throw [IO.InvalidDataException]::new("Missing fixture peer frame body.") }
+            try {
+                $frame = [Text.UTF8Encoding]::new($false,$true).GetString($bytes) | ConvertFrom-Json -AsHashtable
+            } catch [ArgumentException] { throw [IO.InvalidDataException]::new("Invalid fixture peer JSON.",$_.Exception) }
+            if ($frame -isnot [Collections.IDictionary]) { throw [IO.InvalidDataException]::new("Invalid fixture peer envelope.") }
+            if ($frame.kind -eq "hello") {
+                Send-Frame $server @{ version = 2; kind = "hello"; supportedVersions = @(1,2); selectedVersion = 2 }
+                continue
+            }
+            if ($frame.kind -ne "request") { throw [IO.InvalidDataException]::new("Unexpected frame kind") }
+            if ($frame.command -isnot [Collections.IDictionary] -or $frame.command.Count -eq 0) {
+                throw [IO.InvalidDataException]::new("Invalid fixture peer command.")
+            }
+            $command = @($frame.command.Keys)[0]
+            $response = @{ version = 2; kind = "response"; requestID = $frame.requestID; success = $true }
+            if ($command -eq "listRecentProjects") {
+                $response.Remove("success")
+                $response.event = @{ recentProjectsListed = @($fixture.graphs | ForEach-Object { $_.project }) }
+            } elseif ($command -eq "listQuickChats") {
+                $response.Remove("success")
+                $response.event = @{ quickChatsListed = @() }
+            }
+            Send-Frame $server $response
+            if (-not $published -and $command -eq "listRecentProjects") {
+                foreach ($graph in $fixture.graphs) {
+                    $sequence++
+                    Send-Frame $server @{ version = 2; kind = "event"; sequence = $sequence; event = @{ graphChanged = $graph } }
+                }
+                $published = $true
+            }
+        }
+    } catch [IO.InvalidDataException] {
+        [Console]::Error.WriteLine("CAP_PEER_PROTOCOL_REFUSAL: $($_.Exception.Message)")
+    } catch [IO.IOException], [ObjectDisposedException] {
+    } catch {
+        [Console]::Error.WriteLine("CAP_PEER_FATAL: $($_.Exception)")
+        throw
+    } finally { $server.Dispose() }
+}
+'@
 }
 
 function Get-CapDPeerSource {
@@ -2968,28 +3052,45 @@ function Read-Exact([IO.Stream]$Stream,[int]$Length) {
     while ($offset -lt $Length) {
         $read = $Stream.Read($bytes,$offset,$Length-$offset)
         if ($read -eq 0) {
-            if ($offset -ne 0) { throw 'Truncated fixture peer frame.' }
+            if ($offset -ne 0) { throw [IO.InvalidDataException]::new('Truncated fixture peer frame.') }
             return $null
         }
         $offset += $read
     }
     return ,$bytes
 }
+$null = @{version=2;kind='hello';supportedVersions=@(1,2);selectedVersion=2} |
+    ConvertTo-Json -Depth 40 -Compress | ConvertFrom-Json -DateKind String
+[Console]::Out.WriteLine("CAP_PEER_READY:$([DateTime]::UtcNow.ToString('o')):$([Diagnostics.Stopwatch]::GetTimestamp())")
 $sequence = 0
 while ($true) {
     $pipe = [IO.Pipes.NamedPipeServerStream]::new($PipeName,[IO.Pipes.PipeDirection]::InOut,1)
+    $clientIo = $true
     try {
         $pipe.WaitForConnection()
         while ($pipe.IsConnected) {
             $header = Read-Exact $pipe 4
             if ($null -eq $header) { break }
             $length = ([int]$header[0] -shl 24) -bor ([int]$header[1] -shl 16) -bor ([int]$header[2] -shl 8) -bor $header[3]
-            if ($length -le 0 -or $length -gt 2097152) { throw 'Invalid fixture peer frame length.' }
+            if ($length -le 0 -or $length -gt 2097152) { throw [IO.InvalidDataException]::new('Invalid fixture peer frame length.') }
             $bytes = Read-Exact $pipe $length
-            if ($null -eq $bytes) { throw 'Missing fixture peer frame body.' }
-            $frame = [Text.UTF8Encoding]::new($false,$true).GetString($bytes) | ConvertFrom-Json -DateKind String
-            $responses = @(Get-CapDPeerFrames -Frame $frame -Fixture $fixture -Sequence ([ref]$sequence))
+            if ($null -eq $bytes) { throw [IO.InvalidDataException]::new('Missing fixture peer frame body.') }
+            try {
+                $frame = [Text.UTF8Encoding]::new($false,$true).GetString($bytes) | ConvertFrom-Json -DateKind String
+            } catch [ArgumentException] { throw [IO.InvalidDataException]::new('Invalid fixture peer JSON.',$_.Exception) }
+            if ($frame -isnot [pscustomobject] -or -not $frame.PSObject.Properties['kind'] -or
+                -not $frame.PSObject.Properties['version']) { throw [IO.InvalidDataException]::new('Invalid fixture peer envelope.') }
+            $clientIo = $false
+            try {
+                $responses = @(Get-CapDPeerFrames -Frame $frame -Fixture $fixture -Sequence ([ref]$sequence))
+            } catch {
+                if ($_.Exception.Message -match '^D peer (requires|refuses|request\b)') {
+                    throw [IO.InvalidDataException]::new($_.Exception.Message,$_.Exception)
+                }
+                throw
+            }
             [IO.File]::AppendAllText($CommandLog,($frame | ConvertTo-Json -Depth 20 -Compress)+"`n",[Text.UTF8Encoding]::new($false))
+            $clientIo = $true
             foreach ($response in $responses) {
                 $payload = [Text.Encoding]::UTF8.GetBytes(($response | ConvertTo-Json -Depth 40 -Compress))
                 $size = $payload.Length
@@ -2999,6 +3100,16 @@ while ($true) {
                 $pipe.Flush()
             }
         }
+    } catch [IO.InvalidDataException] {
+        [Console]::Error.WriteLine("CAP_PEER_PROTOCOL_REFUSAL: $($_.Exception.Message)")
+    } catch [IO.IOException], [ObjectDisposedException] {
+        if (-not $clientIo) {
+            [Console]::Error.WriteLine("CAP_PEER_FATAL: $($_.Exception)")
+            throw
+        }
+    } catch {
+        [Console]::Error.WriteLine("CAP_PEER_FATAL: $($_.Exception)")
+        throw
     } finally { $pipe.Dispose() }
 }
 '@
@@ -4161,7 +4272,7 @@ Export-ModuleMember -Function @(
     'Get-CapDGeometry',
     'Get-CapDObservation',
     'Get-CapDPeerFrames',
-    'Get-CapDPeerSource',
+    'Get-CapBPeerSource', 'Get-CapDPeerSource',
     'Start-CapJobLauncher',
     'Release-CapJobLauncher',
     'Wait-CapJobTarget',

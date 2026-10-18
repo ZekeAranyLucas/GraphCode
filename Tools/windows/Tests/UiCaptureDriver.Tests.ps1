@@ -1385,7 +1385,285 @@ function New-CapDSceneJob {
     return $Job
 }
 
+function Invoke-CapPeerWireCase {
+    param([string]$Peer, [ValidateSet('clean','early-close','invalid','cold')][string]$Case,
+        [string]$Source, [string]$FixturePath, [string]$CaseRoot, [switch]$Baseline)
+    $null = New-Item -ItemType Directory -Path $CaseRoot
+    $temp = Join-Path $CaseRoot 'temp'
+    $null = New-Item -ItemType Directory -Path $temp
+    $peerPath = Join-Path $CaseRoot 'peer.ps1'
+    [IO.File]::WriteAllText($peerPath,$Source,[Text.UTF8Encoding]::new($false))
+    $fixtureCopy = Join-Path $CaseRoot 'fixture.json'
+    [IO.File]::Copy($FixturePath,$fixtureCopy)
+    $fixture = Get-Content -LiteralPath $fixtureCopy -Raw | ConvertFrom-Json -DateKind String
+    $events = Join-Path $CaseRoot 'wire.jsonl'
+    $record = {
+        param($Kind,$Value)
+        [IO.File]::AppendAllText($events,((@{kind=$Kind;utc=[DateTime]::UtcNow.ToString('o')
+            ticks=[Diagnostics.Stopwatch]::GetTimestamp();value=$Value} | ConvertTo-Json -Depth 40 -Compress)+"`n"))
+    }
+    $pipeName = 'gc-peer-contract-' + [guid]::NewGuid().ToString('N')
+    $connect = {
+        $client = [IO.Pipes.NamedPipeClientStream]::new('.',$pipeName,[IO.Pipes.PipeDirection]::InOut,[IO.Pipes.PipeOptions]::Asynchronous)
+        try { $client.ConnectAsync(5000).GetAwaiter().GetResult(); & $record 'connected' $pipeName; return $client }
+        catch { $client.Dispose(); throw }
+    }
+    $write = {
+        param($Client,[string]$Json,[byte[]]$Raw)
+        if ($null -eq $Raw) {
+            $body = [Text.Encoding]::UTF8.GetBytes($Json)
+            $n = $body.Length
+            $Raw = [byte[]]@((($n-shr 24)-band 255),(($n-shr 16)-band 255),(($n-shr 8)-band 255),($n-band 255))
+            $Raw += $body
+        }
+        $cancel = [Threading.CancellationTokenSource]::new(5000)
+        try { $Client.WriteAsync($Raw,0,$Raw.Length,$cancel.Token).GetAwaiter().GetResult() }
+        finally { $cancel.Dispose() }
+        & $record 'write' @{base64=[Convert]::ToBase64String($Raw);json=$Json}
+    }
+    $read = {
+        param($Client)
+        $cancel = [Threading.CancellationTokenSource]::new(5000)
+        try {
+            $parts = [Collections.Generic.List[byte]]::new()
+            $length = 4
+            foreach ($part in 0,1) {
+                $bytes = [byte[]]::new($length)
+                $offset = 0
+                while ($offset -lt $length) {
+                    $count = $Client.ReadAsync($bytes,$offset,$length-$offset,$cancel.Token).GetAwaiter().GetResult()
+                    if ($count -eq 0) { throw 'Unexpected peer EOF.' }
+                    $offset += $count
+                }
+                $parts.AddRange($bytes)
+                if ($part -eq 0) {
+                    $length = ([int]$bytes[0]-shl 24)-bor ([int]$bytes[1]-shl 16)-bor ([int]$bytes[2]-shl 8)-bor $bytes[3]
+                    if ($length -le 0 -or $length -gt 2097152) { throw 'Invalid peer reply length.' }
+                }
+            }
+            $json = [Text.UTF8Encoding]::new($false,$true).GetString($bytes)
+            & $record 'read' @{base64=[Convert]::ToBase64String($parts.ToArray());json=$json}
+            return ConvertFrom-Json $json -DateKind String
+        } finally { $cancel.Dispose() }
+    }
+    $hello = '{"version":2,"kind":"hello","supportedVersions":[1,2]}'
+    $valid = {
+        param($Client)
+        & $write $Client $hello $null
+        $reply = & $read $Client
+        if ($reply.kind -cne 'hello' -or $reply.selectedVersion -ne 2) { throw 'Missing v2 hello.' }
+        & $write $Client '{"version":2,"kind":"request","requestID":"peer-contract","command":{"listRecentProjects":{}}}' $null
+        $reply = & $read $Client
+        $expectedNames = @($fixture.graphs | ForEach-Object {$_.project.name})
+        if ($reply.kind -cne 'response' -or $reply.requestID -cne 'peer-contract' -or
+            (@($reply.event.recentProjectsListed | ForEach-Object name) -join ',') -cne ($expectedNames -join ',')) {
+            throw 'Missing positive correlated project list.'
+        }
+        foreach ($graph in $fixture.graphs) {
+            $reply = & $read $Client
+            if ($reply.kind -cne 'event' -or $reply.sequence -le 0 -or
+                -not [Text.Json.Nodes.JsonNode]::DeepEquals(
+                    [Text.Json.Nodes.JsonNode]::Parse(($reply.event.graphChanged | ConvertTo-Json -Depth 40 -Compress)),
+                    [Text.Json.Nodes.JsonNode]::Parse(($graph | ConvertTo-Json -Depth 40 -Compress))) -or
+                @($reply.event.graphChanged.nodes).Count -le 0) { throw 'Graph publish content changed.' }
+        }
+    }
+    $info = [Diagnostics.ProcessStartInfo]::new()
+    $info.FileName = Join-Path $PSHOME 'pwsh.exe'
+    $info.WorkingDirectory = $CaseRoot
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.RedirectStandardInput = $true
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    $quote = {param($Text) "'"+$Text.Replace("'","''")+"'"}
+    $invocation = '[Console]::In.ReadLine() | Out-Null; & ' + (& $quote $peerPath) +
+        ' -PipeName ' + (& $quote $pipeName) + ' -FixturePath ' + (& $quote $fixtureCopy)
+    if ($Peer -ceq 'D') {
+        $invocation += ' -CommandLog ' + (& $quote (Join-Path $CaseRoot 'commands.jsonl')) +
+            ' -ModulePath ' + (& $quote $modulePath) + ' -ModuleSha256 ' + (& $quote ((Get-FileHash $modulePath -Algorithm SHA256).Hash))
+    }
+    foreach ($arg in @('-NoProfile','-NonInteractive','-Command',$invocation)) {$info.ArgumentList.Add($arg)}
+    foreach ($name in @('TEMP','TMP','USERPROFILE','HOME','LOCALAPPDATA','APPDATA')) {$info.Environment[$name]=$temp}
+    foreach ($name in @($info.Environment.Keys | Where-Object {$_ -like 'GRAPHCODE_*' -or $_ -in @('GH_TOKEN','GITHUB_TOKEN')})) {
+        $null=$info.Environment.Remove($name)
+    }
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $info
+    $jobHandle = [CapProcessJob]::Create()
+    $client = $null
+    $stderr = $null
+    $stdout = $null
+    $receipt = [ordered]@{peer=$Peer;case=$Case;baseline=[bool]$Baseline;sourceSha256=(Get-FileHash $peerPath -Algorithm SHA256).Hash
+        fixtureSha256=(Get-FileHash $fixtureCopy -Algorithm SHA256).Hash
+        timerDefinition='monotonic immediately before first hello write through complete validated hello read; strict less than 1000ms'
+        frequency=[Diagnostics.Stopwatch]::Frequency;spawnUtc=[DateTime]::UtcNow.ToString('o');spawnTicks=[Diagnostics.Stopwatch]::GetTimestamp()}
+    try {
+        if (-not $process.Start()) {throw 'Peer did not start.'}
+        $native=[CapNative]::Snapshot($process.Handle,$process.Id)
+        $receipt.pid=$native.ProcessId;$receipt.creationFileTimeUtc=$native.CreationFileTimeUtc
+        $receipt.image=$native.ImagePath;$receipt.heldHandle=$process.Handle.ToInt64()
+        $stderr=$process.StandardError.ReadToEndAsync()
+        [CapProcessJob]::Assign($jobHandle,$process.Handle)
+        $receipt.assignedBeforeGate=[CapProcessJob]::Contains($jobHandle,$process.Handle)
+        $process.StandardInput.WriteLine('GO');$process.StandardInput.Close()
+        if (-not $Baseline) {
+            $readyTask=$process.StandardOutput.ReadLineAsync()
+            if (-not $readyTask.Wait(10000)) {throw 'Peer ready marker deadline.'}
+            $receipt.ready=$readyTask.Result
+            [IO.File]::WriteAllText((Join-Path $CaseRoot 'stdout.log'),$receipt.ready+"`n")
+            if ($receipt.ready -notmatch '^CAP_PEER_READY:(.+):([0-9]+)$') {throw 'Missing warm ready marker.'}
+            $receipt.readyUtc=$Matches[1];$receipt.readyTicks=[long]$Matches[2]
+            $receipt.spawnToWarmReadyMs=1000.0*($receipt.readyTicks-$receipt.spawnTicks)/$receipt.frequency
+        }
+        $stdout=$process.StandardOutput.ReadToEndAsync()
+        $client=& $connect
+        $receipt.firstConnectTicks=[Diagnostics.Stopwatch]::GetTimestamp()
+        if ($Case -ceq 'clean') {
+            & $valid $client
+            $client.Dispose();$client=$null
+        } elseif ($Case -ceq 'early-close') {
+            & $write $client $hello $null
+            $client.Dispose();$client=$null
+            & $record 'close-without-read' @{responseBytesRead=0}
+        } elseif ($Case -ceq 'invalid') {
+            & $write $client '{"command":{"listRecentProjects":{}}}' $null
+            $client.Dispose();$client=$null
+        } else {
+            $receipt.firstWriteUtc=[DateTime]::UtcNow.ToString('o')
+            $receipt.firstWriteTicks=[Diagnostics.Stopwatch]::GetTimestamp()
+            & $write $client $hello $null
+            $reply=& $read $client
+            $receipt.firstReplyTicks=[Diagnostics.Stopwatch]::GetTimestamp()
+            $receipt.firstReplyUtc=[DateTime]::UtcNow.ToString('o')
+            if ($reply.kind -cne 'hello' -or $reply.selectedVersion -ne 2) {throw 'Invalid first hello reply.'}
+            $receipt.firstHelloMs=1000.0*($receipt.firstReplyTicks-$receipt.firstWriteTicks)/$receipt.frequency
+            if ($receipt.firstHelloMs -ge 1000) {throw "Cold first hello $($receipt.firstHelloMs)ms is not under 1000ms."}
+            $client.Dispose();$client=$null
+        }
+        if ($Case -cne 'clean') {
+            $client=& $connect
+            & $valid $client
+            $client.Dispose();$client=$null
+        }
+        if ($Case -ceq 'invalid' -and -not $Baseline) {
+            foreach ($bad in @(
+                @{json='{"version":2,"kind":"unknown"}';raw=$null},
+                @{json='{';raw=$null},
+                @{json='';raw=[byte[]]@(0,32,0,1)},
+                @{json='';raw=[byte[]]@(255,255,255,255)},
+                @{json='';raw=[byte[]]@(0,0)},
+                @{json='';raw=[byte[]]@(0,0,0,5,123)}
+            )) {
+                $client=& $connect
+                & $write $client $bad.json $bad.raw
+                $client.Dispose();$client=$null
+                $client=& $connect
+                & $valid $client
+                $client.Dispose();$client=$null
+            }
+        }
+        if ($process.HasExited) {throw 'Peer exited after recovery.'}
+        $receipt.recovered=$true
+        return $receipt
+    } catch {
+        $receipt.error=$_.Exception.ToString()
+        throw
+    } finally {
+        if ($client) {$client.Dispose()}
+        if ($Baseline -and $Case -ceq 'clean') {$null=$process.WaitForExit(5000)}
+        $receipt.exitedBeforeCleanup=$process.HasExited
+        if ($process.HasExited) {$receipt.naturalExitCode=$process.ExitCode}
+        $receipt.jobActiveBeforeTermination=[CapProcessJob]::Active($jobHandle)
+        $receipt.forcedTermination=$receipt.jobActiveBeforeTermination -gt 0
+        if ($receipt.forcedTermination) {[CapProcessJob]::Terminate($jobHandle)}
+        [CapProcessJob]::WaitForEmpty($jobHandle,5000)
+        $receipt.jobActiveAfterTermination=[CapProcessJob]::Active($jobHandle)
+        $receipt.kernelExit=$process.WaitForExit(5000)
+        $receipt.exitCode=$process.ExitCode
+        if ($stdout) {
+            $receipt.stdoutEof=$stdout.Wait(5000)
+            if ($receipt.stdoutEof) {[IO.File]::AppendAllText((Join-Path $CaseRoot 'stdout.log'),$stdout.Result)}
+        }
+        if ($stderr) {
+            $receipt.stderrEof=$stderr.Wait(5000)
+            if ($receipt.stderrEof) {[IO.File]::WriteAllText((Join-Path $CaseRoot 'stderr.log'),$stderr.Result)}
+        }
+        [IO.File]::WriteAllText((Join-Path $CaseRoot 'receipt.json'),($receipt | ConvertTo-Json -Depth 20))
+        [CapProcessJob]::Close($jobHandle)
+        $process.Dispose()
+        if (-not $Baseline -and $receipt.Contains('recovered')) {
+            if (-not $receipt.stdoutEof -or -not $receipt.stderrEof -or -not $receipt.kernelExit -or
+                $receipt.jobActiveAfterTermination -ne 0) {throw 'Peer cleanup proof is incomplete.'}
+            if ($stderr.Result -match 'CAP_PEER_FATAL:') {throw 'Recovered peer logged an unexpected fatal failure.'}
+            if ($Case -ceq 'invalid' -and
+                [regex]::Matches($stderr.Result,'(?m)^CAP_PEER_PROTOCOL_REFUSAL:').Count -ne 7) {
+                throw 'Every malformed connection must retain a loud protocol refusal.'
+            }
+        }
+    }
+}
+
 function Invoke-CapDContracts {
+    if ($DAdapterCase -ceq 'All') {
+        Invoke-CapTest 'D real pipe clean session answers an empty project-list payload without fault injection' {
+            $fixtureRoot=Join-Path $scratch 'peer-fixture-D-clean'
+            $null=New-Item -ItemType Directory -Path $fixtureRoot
+            $fixture=@{graphs=@(@{project=@{name='Alpha';path=(Join-Path $fixtureRoot 'Alpha')}
+                nodes=@(@{id='Alpha-node'});edges=@()});chats=@()}
+            $fixturePath=Join-Path $fixtureRoot 'fixture.json'
+            $null=Write-CapTestArtifact $fixturePath $fixture
+            Invoke-CapPeerWireCase -Peer D -Case clean -Source (Get-CapDPeerSource) -FixturePath $fixturePath `
+                -CaseRoot (Join-Path $scratch 'peer-D-clean')
+        }
+        foreach ($peer in 'B','D') {
+            foreach ($peerCase in 'early-close','invalid','cold') {
+                Invoke-CapTest "$peer real pipe $peerCase preserves the same peer and full graph publications" {
+                    $fixtureRoot=Join-Path $scratch "peer-fixture-$peer-$peerCase"
+                    $null=New-Item -ItemType Directory -Path $fixtureRoot
+                    $fixture=@{graphs=@('Alpha','Beta' | ForEach-Object {
+                        @{project=@{name=$_;path=(Join-Path $fixtureRoot $_)};nodes=@(@{id="$_-node"});edges=@()}
+                    });chats=@()}
+                    if ($peer -ceq 'D') {$fixture.graphs=@($fixture.graphs[0])}
+                    $fixturePath=Join-Path $fixtureRoot 'fixture.json'
+                    $null=Write-CapTestArtifact $fixturePath $fixture
+                    $source=if ($peer -ceq 'B') {Get-CapBPeerSource} else {Get-CapDPeerSource}
+                    Invoke-CapPeerWireCase -Peer $peer -Case $peerCase -Source $source -FixturePath $fixturePath `
+                        -CaseRoot (Join-Path $scratch "peer-$peer-$peerCase")
+                }
+            }
+        }
+        Invoke-CapTest 'B canonical peer binding accepts exact bytes and refuses hash-rebound altered source' {
+            $owned=Join-Path $scratch 'b-canonical-binding'
+            $original=Join-Path $owned 'original'
+            $null=New-Item -ItemType Directory -Path (Join-Path $owned 'inputs'),(Join-Path $owned 'fixtures'),(Join-Path $owned 'reports')
+            $source=@{graphs=@('Alpha','Beta' | ForEach-Object {
+                @{project=@{name=$_;path=(Join-Path $original $_)};nodes=@(1..5 | ForEach-Object {@{id="node-$_"}})}
+            })}
+            $sourcePath=Join-Path $owned 'inputs\fixture-source.json'
+            $fixturePath=Join-Path $owned 'fixtures\fixture.json'
+            $sourceRef=Write-CapTestArtifact $sourcePath $source
+            $mapped=[IO.File]::ReadAllText($sourcePath).Replace(
+                (($original | ConvertTo-Json -Compress).Trim('"')),
+                (((Join-Path $owned 'fixtures\projects') | ConvertTo-Json -Compress).Trim('"'))) | ConvertFrom-Json
+            $fixtureRef=Write-CapTestArtifact $fixturePath $mapped
+            $mappingRef=Write-CapTestArtifact (Join-Path $owned 'reports\fixture-mapping.json') @{
+                sourcePath=(Join-Path $original 'fixture.json');sourceSha256=$sourceRef.sha256;copiedSourcePath=$sourcePath
+                rewrittenFixturePath=$fixturePath;rewrittenFixtureSha256=$fixtureRef.sha256
+                pathPrefixMap=@{from=$original;to=(Join-Path $owned 'fixtures\projects')};graphs=2;topLevelNodes=10;pathsRewritten=$true
+            }
+            $peerPath=Join-Path $owned 'inputs\offline-peer-source.ps1'
+            [IO.File]::WriteAllText($peerPath,(Get-CapBPeerSource),[Text.UTF8Encoding]::new($false))
+            $parameters=@{Root=$owned;FixturePath=$fixturePath;SourcePath=$sourcePath;MappingPath=$mappingRef.path
+                ExpectedMappingSha256=$mappingRef.sha256;ExpectedSourceSha256=$sourceRef.sha256;OriginalRoot=$original
+                ExpectedPeerSha256=(Get-FileHash $peerPath -Algorithm SHA256).Hash}
+            $null=Assert-CapFixtureMapping @parameters
+            [IO.File]::AppendAllText($peerPath,"`n# changed")
+            $parameters.ExpectedPeerSha256=(Get-FileHash $peerPath -Algorithm SHA256).Hash
+            $null=Assert-CapRejects {Assert-CapFixtureMapping @parameters} 'B peer bytes differ'
+            return 'Canonical B accepted; altered bytes rejected even after the job peer hash was rebound.'
+        }
+    }
     if ($DAdapterCase -in @('All','SceneContract')) {
         Invoke-CapTest 'D declared scene inventory is admitted by the shared scene guard' {
             $job = @{
@@ -1621,7 +1899,7 @@ function Write-CapDContractReport {
         mode=$mode;gui='NotExecuted';images=0;backendTurns=0;cases=@($results);sourceHashesBeforeImport=$sourceHashesBefore}
     $report | ConvertTo-Json -Depth 25 | Set-Content -LiteralPath (Join-Path $scratch 'report.json') -Encoding utf8NoBOM
     $report | Select-Object suite,executed,passed,failed | ConvertTo-Json -Compress
-    $expected = if ($DAdapterCase -ceq 'All') {37} else {1}
+    $expected = if ($DAdapterCase -ceq 'All') {45} else {1}
     if ($results.Count -ne $expected -or $failed -ne 0 -or $passed -ne $expected) { exit 1 }
     exit 0
 }
@@ -4250,6 +4528,9 @@ try {
             $parameters = @{ Root = $owned; FixturePath = $fixturePath; SourcePath = $sourcePath; MappingPath = $mappingPath
                 ExpectedMappingSha256 = (Get-FileHash -LiteralPath $mappingPath -Algorithm SHA256).Hash
                 ExpectedSourceSha256 = $mapping.sourceSha256; OriginalRoot = $originalRoot }
+            $peerPath=Join-Path $owned 'inputs\offline-peer-source.ps1'
+            [IO.File]::WriteAllText($peerPath,(Get-CapBPeerSource),[Text.UTF8Encoding]::new($false))
+            $parameters.ExpectedPeerSha256=(Get-FileHash $peerPath -Algorithm SHA256).Hash
             $proof = Assert-CapFixtureMapping @parameters
             Assert-CapTest ($proof.FixtureSha256 -ceq $mapping.rewrittenFixtureSha256) 'Relocated fixture hash was not obtained from the bound mapping.'
             $staleParameters = $parameters.Clone()
@@ -4741,6 +5022,6 @@ try {
 }
 [ordered]@{ suite = $suiteName; executed = $results.Count; passed = $passed; failed = $failed; artifacts = $scratch } |
     ConvertTo-Json -Compress
-$expectedCount = if ($JournalContractOnly) { 10 } elseif ($LaunchContractOnly) { 2 } elseif ($RequireRealSeed) { 135 } else { 132 }
+$expectedCount = if ($JournalContractOnly) { 10 } elseif ($LaunchContractOnly) { 2 } elseif ($RequireRealSeed) { 143 } else { 140 }
 if ($results.Count -ne $expectedCount -or $failed -ne 0 -or $passed -ne $results.Count) { exit 1 }
 exit 0
