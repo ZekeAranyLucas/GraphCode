@@ -3184,6 +3184,266 @@ public static class CapOptionalRefWindowFixture {
         }
         return $lifecycle
     }
+    function Invoke-CapHiddenActionFixture {
+        param([string]$CaseName, [switch]$Late)
+        if (-not ('CapHiddenActionFixture' -as [type])) {
+            Add-Type -AssemblyName UIAutomationProvider, WindowsBase
+            $frameworkReferences = @(Get-ChildItem -LiteralPath (Join-Path $PSHOME 'ref') -Filter '*.dll' -File |
+                Where-Object Name -NotIn @('UIAutomationProvider.dll','UIAutomationTypes.dll','WindowsBase.dll') |
+                Select-Object -ExpandProperty FullName)
+            Add-Type -ReferencedAssemblies ($frameworkReferences + @(
+                [System.Windows.Automation.Provider.IRawElementProviderSimple].Assembly.Location,
+                [System.Windows.Automation.Provider.IRawElementProviderFragmentRoot].Assembly.Location,
+                [System.Windows.Automation.AutomationElementIdentifiers].Assembly.Location,
+                [System.Windows.Rect].Assembly.Location
+            )) -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Windows;
+using System.Windows.Automation;
+using System.Windows.Automation.Provider;
+[ComVisible(true)]
+public sealed class CapHiddenActionFixture : IRawElementProviderFragmentRoot, IDisposable {
+    private delegate IntPtr WindowProc(IntPtr h, uint m, IntPtr w, IntPtr l);
+    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+    private struct WindowClass {
+        public uint style; public WindowProc procedure; public int classExtra, windowExtra;
+        public IntPtr instance, icon, cursor, background;
+        public string menu, name;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Message { public IntPtr h; public uint m; public UIntPtr w; public IntPtr l;
+        public uint time; public int x, y; public uint extra; }
+    [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    private static extern ushort RegisterClassW(ref WindowClass c);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    private static extern IntPtr CreateWindowExW(uint e, string c, string n, uint s, int x, int y,
+        int width, int height, IntPtr p, IntPtr menu, IntPtr instance, IntPtr argument);
+    [DllImport("user32.dll")] private static extern IntPtr DefWindowProcW(IntPtr h,uint m,IntPtr w,IntPtr l);
+    [DllImport("user32.dll")] private static extern int GetMessageW(out Message m,IntPtr h,uint a,uint b);
+    [DllImport("user32.dll")] private static extern bool TranslateMessage(ref Message m);
+    [DllImport("user32.dll")] private static extern IntPtr DispatchMessageW(ref Message m);
+    [DllImport("user32.dll")] private static extern bool PostMessageW(IntPtr h,uint m,IntPtr w,IntPtr l);
+    [DllImport("user32.dll")] private static extern bool DestroyWindow(IntPtr h);
+    [DllImport("user32.dll")] private static extern void PostQuitMessage(int code);
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)]
+    private static extern bool UnregisterClassW(string c,IntPtr instance);
+    private readonly ManualResetEvent ready = new ManualResetEvent(false);
+    private readonly Thread thread;
+    private readonly WindowProc procedure;
+    private readonly string className = "CapHiddenAction" + Guid.NewGuid().ToString("N");
+    private readonly Child child;
+    private readonly bool late;
+    private Timer timer;
+    private Exception startupError;
+    private int firstRead, available, invokes;
+    public IntPtr Window { get; private set; }
+    public int InitialNameReads { get { return firstRead; } }
+    public int Invokes { get { return invokes; } }
+    public DateTime? InitialReadUtc { get; private set; }
+    public DateTime? AvailableUtc { get; private set; }
+    public bool ThreadClosed { get; private set; }
+    public CapHiddenActionFixture(bool late) {
+        this.late=late; child=new Child(this); procedure=Procedure;
+        thread=new Thread(Run); thread.IsBackground=true; thread.SetApartmentState(ApartmentState.MTA);
+        thread.Start();
+        if (!ready.WaitOne(5000)) throw new TimeoutException("Hidden HWND startup deadline.");
+        if (startupError!=null) throw new InvalidOperationException("Hidden HWND startup failed.",startupError);
+    }
+    private void Run() {
+        try {
+            var c=new WindowClass { procedure=procedure, name=className };
+            if (RegisterClassW(ref c)==0) throw new Win32Exception(Marshal.GetLastWin32Error());
+            Window=CreateWindowExW(0,className,"Hidden action fixture",0x80000000u,0,0,120,30,
+                IntPtr.Zero,IntPtr.Zero,IntPtr.Zero,IntPtr.Zero);
+            if (Window==IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+            ready.Set();
+            Message m; int status;
+            while ((status=GetMessageW(out m,IntPtr.Zero,0,0))>0) {
+                TranslateMessage(ref m); DispatchMessageW(ref m);
+            }
+            if (status<0) throw new Win32Exception(Marshal.GetLastWin32Error());
+        } catch(Exception e) { startupError=e; ready.Set(); }
+        finally { UnregisterClassW(className,IntPtr.Zero); }
+    }
+    private IntPtr Procedure(IntPtr h,uint m,IntPtr w,IntPtr l) {
+        if (m==0x003d && l.ToInt64()==AutomationInteropProvider.RootObjectId)
+            return AutomationInteropProvider.ReturnRawElementProvider(h,w,l,this);
+        if (m==0x0010) { DestroyWindow(h); return IntPtr.Zero; }
+        if (m==0x0002) { PostQuitMessage(0); return IntPtr.Zero; }
+        return DefWindowProcW(h,m,w,l);
+    }
+    public void Dispose() {
+        if (timer!=null) timer.Dispose();
+        if (IsWindow(Window) && !PostMessageW(Window,0x0010,IntPtr.Zero,IntPtr.Zero))
+            throw new InvalidOperationException("Hidden HWND close post failed.");
+        ThreadClosed=thread.Join(5000);
+        ready.Dispose();
+        if (!ThreadClosed || IsWindow(Window)) throw new InvalidOperationException("Hidden HWND/thread survived cleanup.");
+        if (startupError!=null) throw new InvalidOperationException("Hidden HWND thread failed.",startupError);
+    }
+    public ProviderOptions ProviderOptions { get { return ProviderOptions.ServerSideProvider; } }
+    public IRawElementProviderSimple HostRawElementProvider { get { return AutomationInteropProvider.HostProviderFromHandle(Window); } }
+    public object GetPatternProvider(int id) { return null; }
+    public object GetPropertyValue(int id) {
+        if (id==AutomationElementIdentifiers.NameProperty.Id) return "Hidden action root";
+        if (id==AutomationElementIdentifiers.ProcessIdProperty.Id) return System.Diagnostics.Process.GetCurrentProcess().Id;
+        if (id==AutomationElementIdentifiers.ControlTypeProperty.Id) return ControlType.Window.Id;
+        return null;
+    }
+    public Rect BoundingRectangle { get { return new Rect(0,0,120,30); } }
+    public IRawElementProviderFragmentRoot FragmentRoot { get { return this; } }
+    public IRawElementProviderFragment Navigate(NavigateDirection d) {
+        return d==NavigateDirection.FirstChild || d==NavigateDirection.LastChild ? child : null;
+    }
+    public int[] GetRuntimeId() { return null; }
+    public IRawElementProviderSimple[] GetEmbeddedFragmentRoots() { return null; }
+    public void SetFocus() { throw new InvalidOperationException("Fixture must not receive focus."); }
+    public IRawElementProviderFragment ElementProviderFromPoint(double x,double y) { return child; }
+    public IRawElementProviderFragment GetFocus() { return null; }
+    [ComVisible(true)]
+    private sealed class Child : IRawElementProviderFragment, IInvokeProvider {
+        private readonly CapHiddenActionFixture owner;
+        public Child(CapHiddenActionFixture owner) { this.owner=owner; }
+        public ProviderOptions ProviderOptions { get { return ProviderOptions.ServerSideProvider; } }
+        public IRawElementProviderSimple HostRawElementProvider { get { return null; } }
+        public object GetPatternProvider(int id) { return id==InvokePatternIdentifiers.Pattern.Id ? this : null; }
+        public object GetPropertyValue(int id) {
+            if (id==AutomationElementIdentifiers.NameProperty.Id) {
+                if (Interlocked.CompareExchange(ref owner.firstRead,1,0)==0) {
+                    owner.InitialReadUtc=DateTime.UtcNow;
+                    if (owner.late) owner.timer=new Timer(_ => {
+                        owner.AvailableUtc=DateTime.UtcNow; Volatile.Write(ref owner.available,1);
+                    },null,350,Timeout.Infinite);
+                    return "Beta";
+                }
+                return Volatile.Read(ref owner.available)==1 ? "Alpha" : "Beta";
+            }
+            if (id==AutomationElementIdentifiers.AutomationIdProperty.Id) return "open-project-848";
+            if (id==AutomationElementIdentifiers.ProcessIdProperty.Id) return System.Diagnostics.Process.GetCurrentProcess().Id;
+            if (id==AutomationElementIdentifiers.IsOffscreenProperty.Id) return false;
+            if (id==AutomationElementIdentifiers.IsEnabledProperty.Id) return true;
+            if (id==AutomationElementIdentifiers.ControlTypeProperty.Id) return ControlType.Button.Id;
+            if (id==AutomationElementIdentifiers.IsInvokePatternAvailableProperty.Id) return true;
+            return null;
+        }
+        public Rect BoundingRectangle { get { return new Rect(10,10,100,20); } }
+        public IRawElementProviderFragmentRoot FragmentRoot { get { return owner; } }
+        public IRawElementProviderFragment Navigate(NavigateDirection d) { return d==NavigateDirection.Parent ? owner : null; }
+        public int[] GetRuntimeId() { return new int[] { AutomationInteropProvider.AppendRuntimeId,848 }; }
+        public IRawElementProviderSimple[] GetEmbeddedFragmentRoots() { return null; }
+        public void SetFocus() { throw new InvalidOperationException("Fixture must not receive focus."); }
+        public void Invoke() { Interlocked.Increment(ref owner.invokes); }
+    }
+}
+'@
+        }
+        $path = Join-Path $scratch ("selector-action-$CaseName.jsonl")
+        $snapshotPath = Join-Path $scratch ("selector-action-$CaseName-snapshot.json")
+        Set-CapTracePath $path
+        $self = [Diagnostics.Process]::GetCurrentProcess()
+        $fixture = $null
+        $detail = [ordered]@{
+            mode = 'REAL_WORKER_ACTION_REAL_FIND_REAL_RESOLVER_HIDDEN_OWN_HWND_UIA_NO_INPUT_OR_CAPTURE'
+            pid = $PID; image = $self.MainModule.FileName; startTimeUtc = $self.StartTime.ToUniversalTime().ToString('o')
+            sourceHashes = $sourceHashesBefore; hwnd = $null; creationFileTimeUtc = $null
+            createdUtc = $null; destroyed = $false; threadClosed = $false; fixtureProcesses = 0
+            childExitAndEof = 'No fixture child: HWND/thread belong to current test process.'
+            deadlineUtc = $null; beganUtc = $null; endedUtc = $null; elapsedMilliseconds = $null
+            initialReadUtc = $null; availableUtc = $null; invokes = 0; resolverEntries = 0
+            failure = $null; result = $null; terminalSnapshots = 0; snapshotPath = $snapshotPath
+        }
+        try {
+            $identity = Get-CapProcessIdentity -Process $self -ExpectedImagePath $self.MainModule.FileName -Role 'hidden-action-self'
+            $detail.creationFileTimeUtc = $identity.CreationFileTimeUtc
+            $fixture = [CapHiddenActionFixture]::new($Late.IsPresent)
+            $detail.hwnd = $fixture.Window.ToInt64()
+            $detail.createdUtc = [DateTime]::UtcNow.ToString('o')
+            Assert-CapTest (-not [CapHiddenActionFixture]::IsWindowVisible($fixture.Window)) 'Action fixture must stay hidden.'
+            $ast = [Management.Automation.Language.Parser]::ParseFile($workerPath,[ref]$null,[ref]$null)
+            foreach ($functionName in @('Invoke-CapSceneAction','Assert-CapWorkerDeadline')) {
+                $definitions = @($ast.FindAll({ param($node)
+                    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $functionName
+                },$true))
+                Assert-CapTest ($definitions.Count -eq 1) 'Actual worker action/deadline missing or duplicated.'
+                . ([scriptblock]::Create($definitions[0].Extent.Text))
+            }
+            function Write-CapWorkerLog { param([string]$Message) Write-CapTrace 'HiddenActionWorkerLog' @{ message = $Message } }
+            $leaseDeadlineUtc = [DateTime]::UtcNow.AddSeconds(2)
+            $detail.deadlineUtc = $leaseDeadlineUtc.ToString('o')
+            $detail.beganUtc = [DateTime]::UtcNow.ToString('o')
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            try {
+                Invoke-CapSceneAction -AppRun ([pscustomobject]@{
+                    Window = $fixture.Window; Run = @{ Identity = $identity }; Phase = 'hidden-action'
+                }) -Action open-project -Name Alpha
+                $detail.result = 'Scene action completed'
+            } catch {
+                $detail.failure = [ordered]@{
+                    type = $_.Exception.GetType().FullName; message = $_.Exception.Message
+                    raw = $_.Exception.ToString(); fullyQualifiedErrorId = $_.FullyQualifiedErrorId
+                    stack = $_.ScriptStackTrace
+                }
+            }
+            $detail.elapsedMilliseconds = $watch.Elapsed.TotalMilliseconds
+            $detail.endedUtc = [DateTime]::UtcNow.ToString('o')
+            $detail.initialReadUtc = $fixture.InitialReadUtc
+            $detail.availableUtc = $fixture.AvailableUtc
+            $detail.invokes = $fixture.Invokes
+            $rows = @(Get-Content -LiteralPath $path | ForEach-Object { ConvertFrom-Json $_ -DateKind String })
+            $detail.resolverEntries = @($rows | Where-Object command -CEQ 'Resolve-CapAutomationCandidate').Count
+            $terminal = @($rows | Where-Object command -CEQ 'CapSelectorRefusal' | ForEach-Object {
+                ConvertFrom-Json $_.parameters.diagnosticJson -Depth 20 -DateKind String
+            } | Where-Object evidenceKind -CEQ 'TERMINAL_LAST_POLL_SNAPSHOT')
+            $detail.terminalSnapshots = $terminal.Count
+            if ($terminal.Count -eq 1) { Write-JournalContractJson $snapshotPath $terminal[0] }
+            Assert-CapTest (@(Get-CapTraceFailures).Count -eq 0) 'Hidden action produced an observer failure.'
+        } finally {
+            try {
+                if ($null -ne $fixture) {
+                    $fixture.Dispose()
+                    $detail.destroyed = -not [CapHiddenActionFixture]::IsWindow($fixture.Window)
+                    $detail.threadClosed = $fixture.ThreadClosed
+                }
+            } finally {
+                $self.Dispose()
+                Set-CapTracePath -Path (Join-Path $scratch 'test-calls.jsonl')
+                Write-JournalContractJson (Join-Path $scratch ("selector-action-$CaseName-fields.json")) $detail
+            }
+        }
+        return $detail
+    }
+    Invoke-CapTest 'real worker action polls initial zero until a late hidden UIA element is available' {
+        $detail = Invoke-CapHiddenActionFixture -CaseName late -Late
+        Assert-CapTest ($null -eq $detail.failure -and $detail.invokes -eq 1 -and
+            $detail.resolverEntries -ge 2 -and $null -ne $detail.initialReadUtc -and
+            $null -ne $detail.availableUtc -and $detail.availableUtc -gt $detail.initialReadUtc -and
+            $detail.terminalSnapshots -eq 0 -and $detail.destroyed -and $detail.threadClosed) `
+            'Real action refused initial found=0 instead of waiting for its late native UIA target.' $detail
+        return $detail
+    }
+    Invoke-CapTest 'real worker action terminal refusal persists typed last-poll native UIA candidates' {
+        $detail = Invoke-CapHiddenActionFixture -CaseName terminal
+        Assert-CapTest ($null -ne $detail.failure -and
+            $detail.failure.message -ceq "UIA element 'Alpha' did not become available before the reserved deadline." -and
+            $detail.resolverEntries -ge 2 -and $detail.invokes -eq 0 -and
+            $detail.terminalSnapshots -eq 1 -and (Test-Path -LiteralPath $detail.snapshotPath) -and
+            $detail.destroyed -and $detail.threadClosed) `
+            'Real action refused immediately without retaining its terminal last-poll snapshot.' $detail
+        $snapshot = Read-JournalContractJson $detail.snapshotPath
+        Assert-CapTest ($snapshot.schema -ceq 'CapSelectorRefusal/1' -and $snapshot.candidatesObserved -and
+            $snapshot.stageCounts.total -gt 0 -and $snapshot.candidates[0].Name.value -ceq 'Beta' -and
+            $snapshot.candidates[0].AutomationId.value -ceq 'open-project-848' -and
+            $snapshot.candidates[0].ProcessId.value -eq $PID -and
+            $snapshot.heldContext.identity.CreationFileTimeUtc.value -eq $detail.creationFileTimeUtc -and
+            $snapshot.terminalObservation.waitDeadlineUtc -ceq $detail.deadlineUtc) `
+            'Terminal native candidates lost typed selector, ownership, generation or original deadline.'
+        return $detail
+    }
     Set-CapTracePath -Path (Join-Path $scratch 'test-calls.jsonl')
 }
 
@@ -3394,7 +3654,7 @@ if ($SelectorRefusalContractOnly) {
         mode = 'SYNTHETIC_CANDIDATES_AND_REAL_FIND_HIDDEN_OWN_PROCESS_UIA_NO_DESKTOP_INPUT' }
     $report | ConvertTo-Json -Depth 25 | Set-Content -LiteralPath (Join-Path $scratch 'report.json') -Encoding utf8NoBOM
     $report | Select-Object suite,executed,passed,failed | ConvertTo-Json -Compress
-    if ($results.Count -ne 14 -or $passed -ne 14 -or $failed -ne 0) { exit 1 }
+    if ($results.Count -ne 16 -or $passed -ne 16 -or $failed -ne 0) { exit 1 }
     exit 0
 }
 
@@ -4481,6 +4741,6 @@ try {
 }
 [ordered]@{ suite = $suiteName; executed = $results.Count; passed = $passed; failed = $failed; artifacts = $scratch } |
     ConvertTo-Json -Compress
-$expectedCount = if ($JournalContractOnly) { 10 } elseif ($LaunchContractOnly) { 2 } elseif ($RequireRealSeed) { 133 } else { 130 }
+$expectedCount = if ($JournalContractOnly) { 10 } elseif ($LaunchContractOnly) { 2 } elseif ($RequireRealSeed) { 135 } else { 132 }
 if ($results.Count -ne $expectedCount -or $failed -ne 0 -or $passed -ne $results.Count) { exit 1 }
 exit 0

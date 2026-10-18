@@ -1223,6 +1223,41 @@ function Write-CapTerminalSelectorRefusal {
         })
 }
 
+function Wait-CapAutomationElement {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][IntPtr]$Window,
+        [Parameter(Mandatory)]$ProcessIdentity,
+        [Parameter(Mandatory)][string]$Name,
+        [string]$AutomationId,
+        [string]$AutomationIdPrefix,
+        [switch]$AllowOffscreen,
+        [Parameter(Mandatory)][DateTime]$DeadlineUtc,
+        [Parameter(Mandatory)][scriptblock]$FindElement,
+        [scriptblock]$BeforePoll
+    )
+    $lastSnapshot = $null
+    $lastPollUtc = $null
+    try {
+        while ([DateTime]::UtcNow -lt $DeadlineUtc) {
+            if ($BeforePoll) { & $BeforePoll }
+            $lastPollUtc = [DateTime]::UtcNow
+            try {
+                return & $FindElement ([ref]$lastSnapshot)
+            } catch {
+                if ($_.Exception.Message -notmatch 'found=0\.') { throw }
+                Start-Sleep -Milliseconds 100
+            }
+        }
+        throw "UIA element '$Name' did not become available before the reserved deadline."
+    } catch {
+        Write-CapTerminalSelectorRefusal -Snapshot $lastSnapshot -Refusal $_ -PollUtc $lastPollUtc `
+            -DeadlineUtc $DeadlineUtc -Window $Window -ProcessIdentity $ProcessIdentity `
+            -Name $Name -AutomationId $AutomationId -AutomationIdPrefix $AutomationIdPrefix -AllowOffscreen:$AllowOffscreen
+        throw
+    }
+}
+
 function Resolve-CapAutomationCandidate {
     [CmdletBinding()]
     param(
@@ -1462,7 +1497,9 @@ function Invoke-CapAction {
         [string]$SubjectId,
         [scriptblock]$Invoker,
         [scriptblock]$WindowProcessResolver,
-        [scriptblock]$ElementResolver
+        [scriptblock]$ElementResolver,
+        [DateTime]$DeadlineUtc,
+        [scriptblock]$BeforeElementPoll
     )
     Write-CapTrace -Command $MyInvocation.MyCommand.Name -Parameters $PSBoundParameters
 
@@ -1491,6 +1528,15 @@ function Invoke-CapAction {
         $candidates = @(& $ElementResolver $RootHandle $ProcessIdentity $spec)
         Resolve-CapAutomationCandidate -Candidates $candidates -ExpectedProcessId $ProcessIdentity.Pid `
             -Name $spec.Name -AutomationId $spec.AutomationId -AutomationIdPrefix $spec.AutomationIdPrefix
+    } elseif ($PSBoundParameters.ContainsKey('DeadlineUtc')) {
+        Wait-CapAutomationElement -Window $RootHandle -ProcessIdentity $ProcessIdentity `
+            -Name $spec.Name -AutomationId $spec.AutomationId -AutomationIdPrefix $spec.AutomationIdPrefix `
+            -DeadlineUtc $DeadlineUtc -BeforePoll $BeforeElementPoll -FindElement {
+                param([ref]$Snapshot)
+                Find-CapAutomationElement -RootHandle $RootHandle -ProcessIdentity $ProcessIdentity `
+                    -ExpectedProcessId $ProcessIdentity.Pid -Name $spec.Name -AutomationId $spec.AutomationId `
+                    -AutomationIdPrefix $spec.AutomationIdPrefix -RefusalSnapshot $Snapshot
+            }
     } else {
         Find-CapAutomationElement -RootHandle $RootHandle -ProcessIdentity $ProcessIdentity `
             -ExpectedProcessId $ProcessIdentity.Pid -Name $spec.Name -AutomationId $spec.AutomationId `
@@ -4135,6 +4181,7 @@ Export-ModuleMember -Function @(
     'Set-CapTracePath',
     'Write-CapTrace',
     'Write-CapTerminalSelectorRefusal',
+    'Wait-CapAutomationElement',
     'Get-CapTraceFailures',
     'Assert-CapArtifactPath',
     'Assert-CapZmxLeasePath',

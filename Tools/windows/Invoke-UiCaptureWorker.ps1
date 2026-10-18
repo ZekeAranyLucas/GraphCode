@@ -527,28 +527,15 @@ function Wait-CapVisibleElement {
     )
     Write-CapTrace -Command $MyInvocation.MyCommand.Name -Parameters $PSBoundParameters
 
-    $lastSnapshot = $null
-    $lastPollUtc = $null
-    try {
-    while ([DateTime]::UtcNow -lt $leaseDeadlineUtc) {
-        Assert-CapWorkerDeadline "UIA element $Name"
-        $lastPollUtc = [DateTime]::UtcNow
-        try {
-            return Find-CapAutomationElement -RootHandle $Window -ProcessIdentity $ProcessIdentity `
+    return Wait-CapAutomationElement -Window $Window -ProcessIdentity $ProcessIdentity `
+        -Name $Name -AutomationId $AutomationId -AutomationIdPrefix $AutomationIdPrefix `
+        -AllowOffscreen:$AllowOffscreen -DeadlineUtc $leaseDeadlineUtc `
+        -BeforePoll { Assert-CapWorkerDeadline "UIA element $Name" } -FindElement {
+            param([ref]$Snapshot)
+            Find-CapAutomationElement -RootHandle $Window -ProcessIdentity $ProcessIdentity `
                 -Name $Name -AutomationId $AutomationId -AutomationIdPrefix $AutomationIdPrefix `
-                -AllowOffscreen:$AllowOffscreen -RefusalSnapshot ([ref]$lastSnapshot)
-        } catch {
-            if ($_.Exception.Message -notmatch 'found=0\.') { throw }
-            Start-Sleep -Milliseconds 100
+                -AllowOffscreen:$AllowOffscreen -RefusalSnapshot $Snapshot
         }
-    }
-    throw "UIA element '$Name' did not become available before the reserved deadline."
-    } catch {
-        Write-CapTerminalSelectorRefusal -Snapshot $lastSnapshot -Refusal $_ -PollUtc $lastPollUtc `
-            -DeadlineUtc $leaseDeadlineUtc -Window $Window -ProcessIdentity $ProcessIdentity `
-            -Name $Name -AutomationId $AutomationId -AutomationIdPrefix $AutomationIdPrefix -AllowOffscreen:$AllowOffscreen
-        throw
-    }
 }
 
 function Invoke-CapSceneAction {
@@ -562,7 +549,8 @@ function Invoke-CapSceneAction {
 
     Assert-CapWorkerDeadline "before action $Action"
     $result = Invoke-CapAction -Action $Action -Name $Name -SubjectId $SubjectId -RootHandle $AppRun.Window `
-        -ProcessIdentity $AppRun.Run.Identity
+        -ProcessIdentity $AppRun.Run.Identity -DeadlineUtc $leaseDeadlineUtc `
+        -BeforeElementPoll { Assert-CapWorkerDeadline "UIA element for action $Action" }
     if ($AppRun.PSObject.Properties['DActions']) {$AppRun.DActions.Add($result)}
     Write-CapWorkerLog "ACTION phase=$($AppRun.Phase) action=$Action name=$Name result=$($result | ConvertTo-Json -Compress)"
     Start-Sleep -Milliseconds 250
