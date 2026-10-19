@@ -593,6 +593,17 @@ pub const DaemonClient = struct {
         self.sendCommand(command);
     }
 
+    pub fn sendNodeActionChecked(
+        self: *DaemonClient,
+        project_path: []const u8,
+        node_id: []const u8,
+        action: []const u8,
+        text: ?[]const u8,
+    ) !void {
+        const command = try Wire.commandGraphNodeAction(self.allocator, project_path, node_id, action, text);
+        try self.sendCommandChecked(command);
+    }
+
     pub fn sendDetachTemplate(self: *DaemonClient, project_path: []const u8, node_id: []const u8) void {
         const command = Wire.commandGraphDetachTemplate(self.allocator, project_path, node_id) catch {
             self.publishState(self.connectionState(), "detach template command encoding failed");
@@ -1621,6 +1632,32 @@ test "a request that cannot be encoded leaves nothing pending" {
     client.sendCommandOnWorker("{\"listRecentProjects\":{}}", null, .graph_changed);
     try std.testing.expectEqual(@as(usize, 0), client.pending_request_count);
 }
+
+    test "lane 9 checked node action reports encoding allocation and queue rejection without double freeing" {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var client = try DaemonClient.initForTesting(failing.allocator());
+        defer client.deinit();
+        try std.testing.expectError(error.UnsupportedGraphAction, client.sendNodeActionChecked("A", "loop", "restartEverything", null));
+        try std.testing.expectEqual(@as(usize, 0), client.outbound_count);
+        failing.fail_index = failing.alloc_index;
+        try std.testing.expectError(error.OutOfMemory, client.sendNodeActionChecked("A", "loop", "restartNode", null));
+        try std.testing.expectEqual(@as(usize, 0), client.outbound_count);
+        failing.fail_index = std.math.maxInt(usize);
+        for (0..outbound_capacity) |_| try client.sendNodeActionChecked("A", "loop", "restartNode", null);
+        try std.testing.expectError(error.OutboundQueueRejected, client.sendNodeActionChecked("A", "loop", "restartNode", null));
+        try std.testing.expectEqual(outbound_capacity, client.outbound_count);
+    }
+
+    test "lane 9 checked node action retains the existing composite addressing path" {
+        var client = try DaemonClient.initForTesting(std.testing.allocator);
+        defer client.deinit();
+        client.setSubgraphAddress("group");
+        try client.sendNodeActionChecked("A", "worker", "restartNode", null);
+        try std.testing.expectEqual(@as(usize, 1), client.outbound_count);
+        const command = client.outbound[client.outbound_head];
+        try std.testing.expect(std.mem.indexOf(u8, command, "\"restartNode\":{\"_0\":\"worker\"}") != null);
+        try std.testing.expect(std.mem.indexOf(u8, command, "\"group\"") != null);
+    }
 
 test "an event that merely carries a requestID does not complete a pending request" {
     var client = try DaemonClient.initForTesting(std.testing.allocator);
