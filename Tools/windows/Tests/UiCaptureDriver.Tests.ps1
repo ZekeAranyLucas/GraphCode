@@ -1,5 +1,5 @@
 param(
-    [string]$ScratchRoot = (Join-Path ([IO.Path]::GetTempPath()) ('gc-capture-' + [guid]::NewGuid().ToString('N'))),
+    [string]$ScratchRoot = (Join-Path ([IO.Path]::GetTempPath()) ('g' + [guid]::NewGuid().ToString('N').Substring(0,8))),
     [switch]$LaunchContractOnly,
     [switch]$JournalContractOnly,
     [switch]$ReceiptContractOnly,
@@ -20,6 +20,8 @@ param(
     [switch]$AdvisoryOlderContractOnly,
     [switch]$DAdapterContractOnly,
     [switch]$MatchedScenarioContractOnly,
+    [switch]$SeedPathContractOnly,
+    [ValidateSet('All','ExitWait')][string]$SeedPathCase = 'All',
     [ValidateSet('All','SceneContract','ActualAdmission','FixtureDirectory')][string]$DAdapterCase = 'All',
     [string]$PrebuiltFixtureManifest = '',
     [string]$PrebuiltFixtureManifestSha256 = '',
@@ -2610,6 +2612,480 @@ function Invoke-CapMatchedTabContracts {
     }
     return @{positiveShapes=$positive;negativeMutations=$negative;nativeHover='NotExecuted';paneFocus='NotExecuted'
         evidence='SYNTHETIC_UIA_RECORDS_NOT_NATIVE_OBSERVATION'}
+}
+
+function Invoke-CapSeedScratchContract {
+    $testAst = [Management.Automation.Language.Parser]::ParseFile(
+        (Join-Path $PSScriptRoot 'UiCaptureDriver.Tests.ps1'),[ref]$null,[ref]$null)
+    $parameter = @($testAst.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -ceq 'ScratchRoot' })[0]
+    $defaultRoot = & ([scriptblock]::Create($parameter.DefaultValue.Extent.Text))
+    $null = New-Item -ItemType Directory -Path $defaultRoot
+    $marker = Join-Path $defaultRoot 'keep.txt'
+    [IO.File]::WriteAllText($marker,'EXISTING_OWNED_ROOT_MUST_NOT_BE_REUSED_OR_DELETED')
+    $hash = (Get-FileHash $marker -Algorithm SHA256).Hash
+    $child = Invoke-CapBoundedChild -FilePath (Join-Path $PSHOME 'pwsh.exe') -Arguments @(
+        '-NoProfile','-File',(Join-Path $PSScriptRoot 'UiCaptureDriver.Tests.ps1'),
+        '-SeedPathContractOnly','-ScratchRoot',$defaultRoot
+    ) -Directory $defaultRoot -Role 'seed-scratch-collision'
+    Assert-CapTest ($child.exitCode -ne 0 -and $child.kernelExited -and
+        $child.stderr.Contains('Refusing to replace capture test evidence') -and
+        (Get-FileHash $marker -Algorithm SHA256).Hash -ceq $hash -and
+        @(Get-ChildItem -LiteralPath $defaultRoot -Force).Count -eq 1) `
+        'Actual test entry point reused or deleted an existing default-shaped root.'
+    $registrationAst = [Management.Automation.Language.Parser]::ParseFile(
+        (Join-Path $PSScriptRoot 'ValidationRunner.Tests.ps1'),[ref]$null,[ref]$null)
+    $allocation = @($registrationAst.EndBlock.Statements | Where-Object {
+        $_ -is [Management.Automation.Language.AssignmentStatementAst] -and
+        $_.Left -is [Management.Automation.Language.VariableExpressionAst] -and
+        $_.Left.VariablePath.UserPath -ceq 'uiCaptureRoot'
+    })
+    $creation = @($registrationAst.FindAll({param($node)
+        $node -is [Management.Automation.Language.CommandAst] -and
+        $node.Extent.Text -ceq 'New-Item -ItemType Directory -Path $uiCaptureRoot'
+    },$true))
+    Assert-CapTest ($allocation.Count -eq 1 -and $creation.Count -eq 1) 'Registered root allocator is missing or ambiguous.'
+    $uiCaptureRoot = & ([scriptblock]::Create($allocation[0].Right.Extent.Text))
+    $null = & ([scriptblock]::Create($creation[0].Extent.Text))
+    $registeredMarker = Join-Path $uiCaptureRoot 'keep.txt'
+    [IO.File]::WriteAllText($registeredMarker,'REGISTERED_ROOT_MUST_REFUSE_COLLISION')
+    $registeredHash = (Get-FileHash $registeredMarker -Algorithm SHA256).Hash
+    $null = Assert-CapRejects { & ([scriptblock]::Create($creation[0].Extent.Text)) } 'already exists'
+    Assert-CapTest ((Get-FileHash $registeredMarker -Algorithm SHA256).Hash -ceq $registeredHash -and
+        @(Get-ChildItem -LiteralPath $uiCaptureRoot -Force).Count -eq 1) 'Registered allocator reused or deleted its collision marker.'
+    return @{ defaultRoot = $defaultRoot; registeredRoot = $uiCaptureRoot; existingRootRefusals = 2
+        markerSha256 = $hash; registeredMarkerSha256 = $registeredHash; actualEntryPoint = $child }
+}
+
+function Invoke-CapSeedPathCase {
+    param([string]$Phase, [string]$Scene, [switch]$BlockFirstWrite)
+    $caseRoot = Join-Path $scratch ('sp-' + [guid]::NewGuid().ToString('N').Substring(0,8))
+    $null = New-Item -ItemType Directory -Path (Join-Path $caseRoot 'runtime'),(Join-Path $caseRoot 'output'),
+        (Join-Path $caseRoot 'journal'),(Join-Path $caseRoot 'fixtures')
+    Copy-Item -LiteralPath $target.executable -Destination (Join-Path $caseRoot 'runtime\zmx.exe')
+    . $workerPath -OwnedRoot $caseRoot -DefinitionsOnly
+    $runDirectory = Join-Path $caseRoot 'runs'
+    $outputDirectory = Join-Path $caseRoot 'output'
+    $job = New-CapMatchedTestJob
+    $leaseDeadlineUtc = [DateTime]::UtcNow.AddMinutes(2)
+    $fixturePath = Join-Path $caseRoot 'fixtures\fixture.json'
+    $text = [IO.File]::ReadAllText((Join-Path $driverDirectory 'fixtures\matched-v12.json')).Replace(
+        'C:\\fixture',((Join-Path $root 'fixtures\projects' | ConvertTo-Json -Compress).Trim('"')))
+    [IO.File]::WriteAllText($fixturePath,$text)
+    # Only journal payload construction is narrowed; seed launch, writer and cleanup stay production functions.
+    function Write-CapWorkerJournalSnapshot {
+        param([string]$Kind)
+        $null = Publish-CapJournalSnapshot -State $journalState -Kind $Kind -Value ([pscustomobject]@{
+            entries = @($journalEntries.ToArray())
+        })
+    }
+    $self = [Diagnostics.Process]::GetCurrentProcess()
+    $failure = $null
+    $closeFailures = [Collections.Generic.List[string]]::new()
+    $detail = [ordered]@{ phase = $Phase; scene = $Scene; firstWriteBlocked = $BlockFirstWrite.IsPresent
+        evidence = 'ACTUAL_WORKER_HARMLESS_TARGET_EXIT23_NO_DAEMON_NO_GUI'; sceneRemoved = $false }
+    $oldBehavior = [Environment]::GetEnvironmentVariable('CAP_REHEARSAL_BEHAVIOR')
+    try {
+        $identity = Get-CapProcessIdentity -Process $self -ExpectedImagePath $self.MainModule.FileName -Role 'seed-path-contract-owner'
+        $binding = New-CapJournalBinding -RunId ([guid]::NewGuid().ToString()) -LeaseId ([guid]::NewGuid().ToString()) `
+            -JobSha256 ('A' * 64) -ModuleSha256 $sourceHashesBefore[$modulePath] `
+            -WorkerSha256 $sourceHashesBefore[$workerPath] -SupervisorSha256 $sourceHashesBefore[$supervisorPath] -Identity $identity
+        $journalState = New-CapJournalState -Root $caseRoot -Directory (Join-Path $caseRoot 'journal') `
+            -Binding $binding -DeadlineUtc $leaseDeadlineUtc
+        $phaseRoot = Join-Path $runDirectory "phases\$Phase\$Scene"
+        $roots = Initialize-CapPhaseRoot -PhaseRoot $phaseRoot
+        $sibling = Join-Path (Split-Path -Parent $phaseRoot) 'sibling-sentinel'
+        $null = New-Item -ItemType Directory -Path $sibling
+        [IO.File]::WriteAllText((Join-Path $sibling 'keep.txt'),'KEEP_OTHER_SCENE')
+        $expectedPath = Join-Path $roots.Root 'zmx-seed.json'
+        if ($BlockFirstWrite) { $null = New-Item -ItemType Directory -Path "$expectedPath.tmp" }
+        $env:CAP_REHEARSAL_BEHAVIOR = 'nonzero'
+        try {
+            $null = Start-CapOfflineSeed -Roots $roots -Phase "$Phase-$Scene" `
+                -SessionName 'graphcode-10000000-0000-4000-8000-000000000001'
+        } catch { $failure = $_ }
+        finally {
+            foreach ($seedRun in $seedRuns) {
+                try {
+                    if ($BlockFirstWrite -and $null -eq $seedRun.TargetExit) {
+                        $fixtureExit = Wait-CapJobTarget -Run $seedRun -DeadlineUtc $leaseDeadlineUtc
+                        Assert-CapTest ($fixtureExit.exitCode -eq 23 -and $fixtureExit.kernelExited) `
+                            'Blocked-write fixture did not reach its intentional normal exit.'
+                    }
+                    $null = Close-CapOfflineSeed -SeedRun $seedRun
+                }
+                catch { $closeFailures.Add($_.Exception.ToString()) }
+            }
+        }
+        $detail.primary = if ($failure) {$failure.Exception.ToString()} else {$null}
+        $detail.cleanupFailures = @($cleanupFailures.ToArray()) + @($closeFailures.ToArray())
+        $detail.seeds = @($zmxSeedReceipts.ToArray())
+        $detail.actualSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $detail.jobs = @($seedRuns | ForEach-Object OutputProof)
+        $detailPath = Join-Path $caseRoot 'evidence.json'
+        Write-JournalContractJson $detailPath $detail
+        Assert-CapTest ($seedRuns.Count -eq 1 -and $detail.jobs.Count -eq 1) 'Actual seed launcher did not execute exactly once.' $detail
+        $seedRun = $seedRuns[0]
+        $proof = $seedRun.OutputProof
+        Assert-CapTest ($proof.jobActive0 -and $proof.activeProcesses -eq 0 -and $proof.censusProven -and
+            $proof.launcherStdoutEof -and $proof.launcherStderrEof -and
+            [CapNative]::IsExited($seedRun.Identity.Process.Handle,$seedRun.Identity.Pid)) `
+            'Actual seed job/root/EOF closure is incomplete.' $detail
+        if (-not $BlockFirstWrite -and $failure -and -not $failure.Exception.Message.Contains('Pinned zmx seed exit code was 23')) {
+            $failure.Exception.Data['CapTestDetail'] = $detail
+            throw $failure
+        }
+        Assert-CapTest ($closeFailures.Count -eq 0) 'Actual seed final cleanup threw.' $detail
+        $cleanupCount = $cleanupReceipts.Count
+        $null = Close-CapOfflineSeed -SeedRun $seedRun
+        Assert-CapTest ($cleanupReceipts.Count -eq $cleanupCount) 'Repeated seed cleanup duplicated its receipt.' $detail
+        if ($BlockFirstWrite) {
+            Assert-CapTest ($null -ne $failure -and -not [IO.File]::Exists($expectedPath) -and
+                $seedRun.SeedReceipt.receiptPublicationStatus -ceq 'NOT_CREATED' -and
+                $seedRun.SeedReceipt.cleanupStatus -ceq 'CLEANUP_UNPROVEN' -and
+                $cleanupFailures.Count -eq 1 -and $cleanupFailures[0].Contains('Seed receipt not created')) `
+                'Never-created seed receipt was fabricated or reported clean.' $detail
+        } else {
+            Assert-CapTest ($null -ne $failure -and [IO.File]::Exists($expectedPath) -and
+                $seedRun.SeedReceiptPath -ceq $expectedPath -and $cleanupFailures.Count -eq 0) `
+                'Actual worker did not use its initialized scene root.' $detail
+            $receipt = Get-Content -LiteralPath $expectedPath -Raw | ConvertFrom-Json -DateKind String
+            Assert-CapTest ($receipt.phase -ceq "$Phase-$Scene" -and $receipt.exitCode -eq 23 -and
+                -not $receipt.daemonReady -and $receipt.receiptPublicationStatus -ceq 'CREATED' -and
+                $receipt.cleanupStatus -ceq 'CLEAN_ZERO_SURVIVORS_FILES_CLOSED' -and
+                $receipt.outputProof.jobActive0 -and $receipt.cleanup.Count -gt 0 -and
+                $receipt.launcherExitWait.kind -ceq 'POST_TERMINATION_HELD_HANDLE_EXIT_WAIT' -and
+                $receipt.launcherExitWait.signalled -and
+                $receipt.launcherExitWait.terminationToSignalledMilliseconds -ge
+                    $receipt.outputProof.jobEmptyObservedElapsedMilliseconds) `
+                'Actual initial/exit/final receipt writes or job cleanup were lost.' $detail
+            $detail.nativeBudget = Assert-CapSeedWaitBudget -Wait $receipt.launcherExitWait `
+                -TerminationStartedTimestamp $receipt.outputProof.terminationStartedTimestamp
+            Assert-CapTest (-not (Test-Path -LiteralPath (Join-Path $runDirectory "phases\$Phase-$Scene"))) `
+                'Seed writer recreated the flattened legacy directory.' $detail
+        }
+        Assert-CapTest ([IO.File]::ReadAllText((Join-Path $sibling 'keep.txt')) -ceq 'KEEP_OTHER_SCENE') `
+            'Seed cleanup touched another scene.' $detail
+        foreach ($pin in @($seedRun.OutputPins) + @($seedRun.ClosedOutputPins)) { $pin.Dispose() }
+        Remove-Item -LiteralPath $phaseRoot -Recurse
+        Assert-CapTest (-not (Test-Path -LiteralPath $phaseRoot) -and
+            [IO.File]::ReadAllText((Join-Path $sibling 'keep.txt')) -ceq 'KEEP_OTHER_SCENE') `
+            'Scene filesystem cleanup removed its shared parent or sibling.' $detail
+        $detail.sceneRemoved = $true
+        Write-JournalContractJson (Join-Path $caseRoot 'closure.json') $detail
+        return $detail
+    } finally {
+        if ($null -eq $oldBehavior) { Remove-Item Env:CAP_REHEARSAL_BEHAVIOR }
+        else { $env:CAP_REHEARSAL_BEHAVIOR = $oldBehavior }
+        foreach ($seedRun in $seedRuns) {
+            if (-not $seedRun.CleanupComplete) { $null = Close-CapJobLauncher -Run $seedRun }
+            foreach ($member in $seedRun.Members) { $member.Process.Dispose() }
+            foreach ($pin in @($seedRun.OutputPins) + @($seedRun.ClosedOutputPins)) { $pin.Dispose() }
+            $seedRun.Identity.Process.Dispose()
+        }
+        $self.Dispose()
+    }
+}
+
+function Read-CapSeedArtifactPatterns {
+    param([string]$Source)
+    $patterns = @([regex]::Matches($Source,'(?m)^[ \t]+(?<exclude>!)?\$\{\{ steps\.capture_temp\.outputs\.root \}\}\\(?<relative>[^\r\n]+)\r?$'))
+    $suffixes = @('suite\**\*.json','suite\**\*.jsonl','suite\**\*.log',
+        'prebuilt\fixtures.json','prebuilt\**\provenance.json','prebuilt\**\compile*.log')
+    $expected = @(foreach ($rootPattern in @('gc-ui-capture-*',('g' + ('[0-9a-f]' * 8)))) {
+        foreach ($suffix in $suffixes) { "$rootPattern\$suffix" }
+        "!$rootPattern\suite\**\.git\**"
+    })
+    $actual = @($patterns | ForEach-Object {
+        $(if ($_.Groups['exclude'].Success) {'!'} else {''}) + $_.Groups['relative'].Value
+    })
+    $detail = @{ expected = $expected; actual = $actual; expectedCount = $expected.Count; actualCount = $actual.Count }
+    Assert-CapTest ($actual.Count -eq $expected.Count) 'Capture artifact exact pattern count differs.' $detail
+    foreach ($pattern in $expected) {
+        Assert-CapTest (@($actual | Where-Object { $_ -ceq $pattern }).Count -eq 1) `
+            'Capture artifact exact inclusion/exclusion set differs.' $detail
+    }
+    return $actual
+}
+
+function Invoke-CapSeedArtifactSelectionContract {
+    param([string]$WorkflowDirectory = (Join-Path (Split-Path -Parent (Split-Path -Parent $driverDirectory)) '.github\workflows'))
+    $artifactRoot = Join-Path $scratch ('artifacts-' + [guid]::NewGuid().ToString('N').Substring(0,8))
+    $positiveRoots = @('g0123abcd','gc-ui-capture-legacy')
+    $negativeRoots = @('gnothexzz','g0123abcdextra','unrelated')
+    $includedFiles = @('suite\case\report.json','suite\case\calls.jsonl','suite\case\output.log',
+        'prebuilt\fixtures.json','prebuilt\case\provenance.json','prebuilt\case\compile-stdout.log')
+    $privateFiles = @('suite\.git\private.json','suite\case\.git\private.log')
+    $manifest = [Collections.Generic.List[object]]::new()
+    foreach ($name in @($positiveRoots) + @($negativeRoots)) {
+        foreach ($relative in @($includedFiles) + @($privateFiles)) {
+            $path = Join-Path $artifactRoot "$name\$relative"
+            $null = New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force
+            [IO.File]::WriteAllText($path,'SYNTHETIC_ARTIFACT_SELECTION_FIXTURE')
+            $manifest.Add([pscustomobject]@{ relativePath = "$name\$relative"; root = $name
+                private = $relative -cin $privateFiles; intended = $name -cin $positiveRoots -and $relative -cin $includedFiles })
+        }
+    }
+    $results = @(foreach ($workflow in @('windows-hardening.yml','windows-port-validation.yml')) {
+        $source = [IO.File]::ReadAllText((Join-Path $WorkflowDirectory $workflow))
+        $variants = @(foreach ($ending in @('LF','CRLF')) {
+            $text = $source.Replace("`r`n","`n")
+            if ($ending -ceq 'CRLF') { $text = $text.Replace("`n","`r`n") }
+            $patterns = @(Read-CapSeedArtifactPatterns -Source $text)
+            foreach ($mutation in @('duplicate','private-extra','missing-exclusion','path-space')) {
+                $changed = switch ($mutation) {
+                    'duplicate' { $text + "`n            " + '${{ steps.capture_temp.outputs.root }}\gc-ui-capture-*\suite\**\*.json' }
+                    'private-extra' { $text.Replace('\suite\**\*.json','\suite\**\*.private') }
+                    'missing-exclusion' { $text.Replace('!${{ steps.capture_temp.outputs.root }}','${{ steps.capture_temp.outputs.root }}') }
+                    'path-space' { $text.Replace('\suite\**\.git\**',('\suite\**\.git\**' + ' ')) }
+                }
+                $null = Assert-CapRejects { Read-CapSeedArtifactPatterns -Source $changed } 'Capture artifact exact'
+            }
+            @{ lineEnding = $ending; exactPatternCount = $patterns.Count; mutationRefusals = 4 }
+        })
+        $patterns = @(Read-CapSeedArtifactPatterns -Source $source)
+        $rootPatterns = @($patterns | Where-Object { -not $_.StartsWith('!') } |
+            ForEach-Object { $_.Split('\')[0] } | Select-Object -Unique)
+        foreach ($rootPattern in $rootPatterns) {
+            Assert-CapTest (@($patterns | Where-Object { $_ -ceq "!$rootPattern\suite\**\.git\**" }).Count -eq 1) `
+                'Exact privacy exclusion was lost before fixture partition.'
+        }
+        $selected = @(Get-ChildItem -LiteralPath $artifactRoot -Directory | Where-Object {
+            $name = $_.Name
+            @($rootPatterns | Where-Object { $name -like $_ }).Count -eq 1
+        })
+        $files = @($selected | ForEach-Object { Get-ChildItem -LiteralPath $_.FullName -File -Force -Recurse } |
+            ForEach-Object { [IO.Path]::GetRelativePath($artifactRoot,$_.FullName) })
+        $excluded = @($files | Where-Object { $_.Split('\') -ccontains '.git' })
+        $included = @($files | Where-Object { -not ($_.Split('\') -ccontains '.git') })
+        $expectedIncluded = @($manifest | Where-Object intended | ForEach-Object relativePath)
+        $expectedExcluded = @($manifest | Where-Object { $_.root -cin $positiveRoots -and $_.private } | ForEach-Object relativePath)
+        $detail = @{ selected = $files; included = $included; excluded = $excluded
+            expectedIncluded = $expectedIncluded; expectedExcluded = $expectedExcluded }
+        Assert-CapTest ($expectedIncluded.Count -gt 0 -and $expectedExcluded.Count -gt 0 -and
+            $included.Count -eq $expectedIncluded.Count -and $excluded.Count -eq $expectedExcluded.Count -and
+            @($included | Where-Object { $_ -cnotin $expectedIncluded }).Count -eq 0 -and
+            @($expectedIncluded | Where-Object { $_ -cnotin $included }).Count -eq 0 -and
+            @($excluded | Where-Object { $_ -cnotin $expectedExcluded }).Count -eq 0 -and
+            @($expectedExcluded | Where-Object { $_ -cnotin $excluded }).Count -eq 0) `
+            'Fixture artifact inclusion/privacy inventory differs from its explicit writes.' $detail
+        Assert-CapTest ($selected.Count -eq $positiveRoots.Count -and
+            @($selected | Where-Object { $_.Name -cin $negativeRoots }).Count -eq 0 -and
+            @($selected | Where-Object { $_.Name -cin $positiveRoots }).Count -eq $positiveRoots.Count) `
+            'Actual workflow root patterns lost current/legacy evidence or selected an unrelated root.'
+        @{ workflow = $workflow; selectedRoots = @($selected.Name); includedFiles = $included; excludedFiles = $excluded
+            selectedFiles = $included.Count; privateFilesExcluded = $excluded.Count; unrelatedRootsRefused = $negativeRoots.Count
+            variants = $variants; fixtureManifest = @($manifest.ToArray())
+            evidence = 'EXACT_LITERAL_PATTERNS_POWERSHELL_ROOT_WILDCARDS_AND_EXPLICIT_GIT_PARTITION_NOT_ACTIONS_GLOB_UPLOAD' }
+    })
+    return $results
+}
+
+function Assert-CapSeedWaitBudget {
+    param($Wait, [long]$TerminationStartedTimestamp)
+    $frequency = [Diagnostics.Stopwatch]::Frequency
+    Assert-CapTest ($Wait.stopwatchFrequency -eq $frequency -and $TerminationStartedTimestamp -gt 0 -and
+        $Wait.terminationStartedTimestamp -eq $TerminationStartedTimestamp -and
+        $Wait.deadlineTimestamp -eq ($TerminationStartedTimestamp + 5L * $frequency) -and
+        $Wait.waitConfiguredTimestamp -ge $TerminationStartedTimestamp) 'Native wait restarted its original termination window.'
+    $expected = [int][Math]::Max(0,[Math]::Floor(
+        ($Wait.deadlineTimestamp-$Wait.waitConfiguredTimestamp) * 1000.0 / $frequency))
+    Assert-CapTest ($Wait.waitBudgetRemainingMilliseconds -eq $expected -and
+        $Wait.waitBudgetRemainingMilliseconds -ge 0 -and $Wait.waitBudgetRemainingMilliseconds -le 5000) `
+        'Native wait argument exceeds or differs from its original remaining budget.'
+    return [pscustomobject]@{
+        elapsedBeforeConfigurationMilliseconds = ($Wait.waitConfiguredTimestamp-$TerminationStartedTimestamp) * 1000.0 / $frequency
+        expectedSuppliedMilliseconds = $expected
+        actualSuppliedMilliseconds = $Wait.waitBudgetRemainingMilliseconds
+        originalDeadlineTimestamp = $Wait.deadlineTimestamp
+    }
+}
+
+function Invoke-CapSeedExitWaitControl {
+    param([switch]$PastBudget, [int]$ObservationDelayMilliseconds = 0)
+    $caseRoot = Join-Path $scratch ('exit-' + [guid]::NewGuid().ToString('N').Substring(0,8))
+    $null = New-Item -ItemType Directory -Path $caseRoot
+    . $workerPath -OwnedRoot $caseRoot -DefinitionsOnly
+    $outputDirectory = $caseRoot
+    if (-not ('CapSeedDelayedExit' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
+public static class CapSeedDelayedExit {
+    public static Task Start(StreamWriter input, int delay, ManualResetEventSlim gate, CancellationToken token) {
+        return Task.Run(async () => {
+            try {
+                gate.Wait(token);
+                await Task.Delay(delay, token);
+                input.Close();
+            } catch (OperationCanceledException) when (token.IsCancellationRequested) {}
+        });
+    }
+}
+'@
+    }
+    $run = $null
+    $jobHandle = [CapProcessJob]::Create()
+    $gate = [Threading.ManualResetEventSlim]::new($false)
+    $cancel = [Threading.CancellationTokenSource]::new()
+    $delayedExit = $null
+    $state = [pscustomobject]@{ stamp = 0L }
+    $detail = [ordered]@{
+        evidence = 'INJECTED_CLOSE_JOB_RETURN_BOUNDARY_REAL_HELD_PROCESS_NOT_NATIVE_JOB_TERMINATION_PROOF'
+        pastBudget = $PastBudget.IsPresent; nativeSafetyJobEmpty = $false; actualStdoutEof = $false; actualStderrEof = $false
+        injectedObservationDelayMilliseconds = $ObservationDelayMilliseconds
+    }
+    try {
+        $run = Start-CapManagedProcess -FilePath $target.executable -ArgumentList @() `
+            -WorkingDirectory $caseRoot -Role 'seed-held-exit-control' -HoldStdin `
+            -Environment @{ CAP_REHEARSAL_BEHAVIOR = 'normal' }
+        [CapProcessJob]::Assign($jobHandle,$run.Identity.Process.Handle)
+        Assert-CapTest ([CapProcessJob]::Contains($jobHandle,$run.Identity.Process.Handle)) 'Exit control lacks its owned safety job.'
+        foreach ($pair in @(
+            @('JobId',[guid]::NewGuid().ToString()),@('Phase','controlled-held-launcher'),
+            @('Members',[Collections.Generic.List[object]]::new()),@('CleanupComplete',$false),@('SeedCleanupComplete',$false),
+            @('SeedReceiptPath',(Join-Path $caseRoot 'seed.json'))
+        )) { $run | Add-Member -NotePropertyName $pair[0] -NotePropertyValue $pair[1] }
+        $run | Add-Member -NotePropertyName SeedReceipt -NotePropertyValue ([pscustomobject]@{
+            cleanup = @(); cleanupStatus = 'PENDING'; outputProof = $null
+            stdoutEof = $false; stderrEof = $false; receiptPublicationStatus = 'CREATED'; launcherExitWait = $null
+        })
+        $snapshot = [CapNative]::Snapshot($run.Identity.Process.Handle,$run.Identity.Pid)
+        $run | Add-Member -NotePropertyName LauncherImageAttestation -NotePropertyValue ([pscustomobject]@{
+            pid = $snapshot.ProcessId; creationFileTimeUtc = $snapshot.CreationFileTimeUtc
+            imagePath = $snapshot.ImagePath; heldHandle = $run.Identity.Process.Handle.ToInt64()
+        })
+        $delayedExit = [CapSeedDelayedExit]::Start($run.Identity.Process.StandardInput,
+            $(if ($PastBudget) {60000} else {400}),$gate,$cancel.Token)
+        # Only the close-job return is injected. The original held process and worker kernel checks are real.
+        function Close-CapJobLauncher {
+            param($Run)
+            $state.stamp = [Diagnostics.Stopwatch]::GetTimestamp()
+            $gate.Set()
+            if ($PastBudget) { Start-Sleep -Milliseconds 4900 }
+            return [pscustomobject]@{
+                kind = 'INJECTED_CLOSED_JOB_BOUNDARY_NOT_NATIVE_TERMINATION_PROOF'
+                terminationStartedTimestamp = $state.stamp; terminationBudgetMilliseconds = 5000L
+                jobEmptyObservedElapsedMilliseconds = ([Diagnostics.Stopwatch]::GetTimestamp()-$state.stamp) * 1000.0 /
+                    [Diagnostics.Stopwatch]::Frequency
+            }
+        }
+        $failure = $null
+        try { $null = Close-CapOfflineSeed -SeedRun $run }
+        catch { $failure = $_ }
+        if ($ObservationDelayMilliseconds -gt 0) { Start-Sleep -Milliseconds $ObservationDelayMilliseconds }
+        $detail.workerElapsedMilliseconds = ([Diagnostics.Stopwatch]::GetTimestamp()-$state.stamp) * 1000.0 /
+            [Diagnostics.Stopwatch]::Frequency
+        $detail.identity = [pscustomobject]@{ pid = $run.Identity.Pid; creationFileTimeUtc = $run.Identity.CreationFileTimeUtc
+            image = $run.Identity.ExpectedImagePath; heldHandle = $run.Identity.Process.Handle.ToInt64() }
+        $detail.receipt = $run.SeedReceipt
+        $detail.nativeBudget = Assert-CapSeedWaitBudget -Wait $run.SeedReceipt.launcherExitWait `
+            -TerminationStartedTimestamp $state.stamp
+        foreach ($mutation in @('fresh-window','fresh-argument','overspend','changed-origin')) {
+            $changed = $run.SeedReceipt.launcherExitWait.PSObject.Copy()
+            switch ($mutation) {
+                'fresh-window' { $changed.deadlineTimestamp = $changed.waitConfiguredTimestamp + 5L * [Diagnostics.Stopwatch]::Frequency }
+                'fresh-argument' { $changed.waitBudgetRemainingMilliseconds = 5000 }
+                'overspend' { $changed.waitBudgetRemainingMilliseconds++ }
+                'changed-origin' { $changed.terminationStartedTimestamp = $changed.waitConfiguredTimestamp }
+            }
+            $null = Assert-CapRejects {
+                Assert-CapSeedWaitBudget -Wait $changed -TerminationStartedTimestamp $state.stamp
+            } $(if ($mutation -in @('fresh-window','changed-origin')) {'original termination window'} else {'remaining budget'})
+        }
+        $detail.budgetMutationRefusals = 4
+        $detail.failure = if ($failure) { [pscustomobject]@{
+            exception = $failure.Exception.ToString(); scriptStackTrace = $failure.ScriptStackTrace
+            fullyQualifiedErrorId = $failure.FullyQualifiedErrorId; category = $failure.CategoryInfo.ToString()
+        } } else { $null }
+        if ($PastBudget) {
+            Assert-CapTest ($null -ne $failure -and $failure.Exception.Message.Contains('Job member remains kernel-live') -and
+                -not [CapNative]::IsExited($run.Identity.Process.Handle,$run.Identity.Pid)) `
+                'A held launcher still live past the original window was accepted.' $detail
+            Assert-CapTest ($run.SeedReceipt.launcherExitWait.signalled -eq $false -and
+                $null -eq $run.SeedReceipt.launcherExitWait.terminationToSignalledMilliseconds -and
+                $run.SeedReceipt.launcherExitWait.waitBudgetRemainingMilliseconds -le 100) `
+                'Spent-window native wait did not preserve its supplied remaining budget.' $detail
+            $detail.observationalSchedulingToleranceMilliseconds = 5000
+            $detail.observationalLimitMilliseconds = 5000 + $ObservationDelayMilliseconds +
+                $detail.observationalSchedulingToleranceMilliseconds
+            Assert-CapTest ($detail.workerElapsedMilliseconds -lt $detail.observationalLimitMilliseconds) `
+                'Budget-control wall observation exceeded its separate scheduling tolerance.' $detail
+        } else {
+            if ($failure) { $failure.Exception.Data['CapTestDetail'] = $detail; throw $failure }
+            Assert-CapTest ([CapNative]::IsExited($run.Identity.Process.Handle,$run.Identity.Pid) -and
+                $run.SeedReceipt.launcherExitWait.signalled -and
+                $run.SeedReceipt.launcherExitWait.terminationToSignalledMilliseconds -ge 300 -and
+                $run.SeedReceipt.launcherExitWait.terminationToSignalledMilliseconds -lt 5000) `
+                'Actual worker did not wait for the delayed held-handle signal.' $detail
+            $nativeRemaining = 0
+            $deadlineTimestamp = $state.stamp + 5L * [Diagnostics.Stopwatch]::Frequency
+            $null = Assert-CapRejects {
+                [CapNative]::WaitForExit($run.Identity.Process.Handle,($run.Identity.Pid+1),
+                    $run.Identity.CreationFileTimeUtc,$deadlineTimestamp,[ref]$nativeRemaining)
+            } 'Process handle/PID mismatch'
+            $null = Assert-CapRejects {
+                [CapNative]::WaitForExit($run.Identity.Process.Handle,$run.Identity.Pid,
+                    ($run.Identity.CreationFileTimeUtc+1L),$deadlineTimestamp,[ref]$nativeRemaining)
+            } 'Process handle/generation mismatch'
+            $unattested = $run.PSObject.Copy()
+            $unattested.PSObject.Properties.Remove('LauncherImageAttestation')
+            $null = Assert-CapRejects {
+                Wait-CapSeedLauncherExit -SeedRun $unattested -Proof $run.SeedReceipt.outputProof
+            } 'original image attestation is missing'
+            $detail.identityRefusals = 3
+        }
+        return $detail
+    } finally {
+        $cancel.Cancel()
+        $gate.Set()
+        [CapProcessJob]::Terminate($jobHandle)
+        [CapProcessJob]::WaitForEmpty($jobHandle,5000)
+        $detail.nativeSafetyJobEmpty = [CapProcessJob]::Active($jobHandle) -eq 0
+        [CapProcessJob]::Close($jobHandle)
+        if ($delayedExit -and -not $delayedExit.Wait(2000)) { throw 'Exit-control delay task did not close.' }
+        if ($run) {
+            $detail.actualStdoutEof = $run.StdoutTask.Wait(2000)
+            $detail.actualStderrEof = $run.StderrTask.Wait(2000)
+            $run.Identity.Process.Dispose()
+        }
+        $gate.Dispose(); $cancel.Dispose()
+        Write-JournalContractJson (Join-Path $caseRoot 'evidence.json') $detail
+        Assert-CapTest ($detail.nativeSafetyJobEmpty -and $detail.actualStdoutEof -and $detail.actualStderrEof) `
+            'Deterministic exit control left its real owned fixture or streams open.' $detail
+    }
+}
+
+function Invoke-CapSeedPathContracts {
+    param([switch]$ExitWaitOnly)
+    Invoke-CapTest 'matched S tab actual worker seed write preserves scene path and not-created cleanup' {
+        if ($ExitWaitOnly) {
+            return @(Invoke-CapSeedExitWaitControl; Invoke-CapSeedExitWaitControl -PastBudget -ObservationDelayMilliseconds 1500)
+        }
+        return @{ scratch = (Invoke-CapSeedScratchContract)
+            artifactSelection = @(Invoke-CapSeedArtifactSelectionContract)
+            postTerminationControls = @(Invoke-CapSeedExitWaitControl
+                Invoke-CapSeedExitWaitControl -PastBudget -ObservationDelayMilliseconds 1500)
+            lifecycles = @(
+            Invoke-CapSeedPathCase -Phase before -Scene s-tabs-goal-needs-you
+            Invoke-CapSeedPathCase -Phase before -Scene s-tabs-goal-needs-you -BlockFirstWrite
+        ) }
+    }
+    if ($ExitWaitOnly) { return }
+    Invoke-CapTest 'matched all eighteen scenes across both phases create write and clean isolated seed paths' {
+        $names = @(Get-CapMatchedSceneNames)
+        $phases = @('before','after')
+        Assert-CapTest ($names.Count -eq 18 -and @($names | Select-Object -Unique).Count -eq 18 -and
+            $phases.Count -eq 2) 'Exact positive seed-path scene/phase inventory differs.'
+        $cases = @(foreach ($phase in $phases) {
+            foreach ($scene in $names) { Invoke-CapSeedPathCase -Phase $phase -Scene $scene }
+        })
+        Assert-CapTest ($cases.Count -eq 36 -and @($cases | Where-Object sceneRemoved -EQ $true).Count -eq 36 -and
+            @($cases | Where-Object phase -CEQ before).Count -eq 18 -and
+            @($cases | Where-Object phase -CEQ after).Count -eq 18) 'All36 seed paths did not execute and clean.'
+        return @{ scenes = $names.Count; phases = $phases.Count; executed = $cases.Count; cases = $cases }
+    }
 }
 
 function Invoke-CapMatchedSceneRoutingContract {
@@ -5413,6 +5889,18 @@ $target = $null
 try {
     $prebuilt = Read-CapPrebuiltFixtures $PrebuiltFixtureManifest $PrebuiltFixtureManifestSha256
     $target = $prebuilt.Target
+    if ($SeedPathContractOnly) {
+        Invoke-CapSeedPathContracts -ExitWaitOnly:($SeedPathCase -ceq 'ExitWait')
+        $passed = @($results | Where-Object passed -EQ $true).Count
+        $failed = @($results | Where-Object passed -EQ $false).Count
+        $report = [pscustomobject]@{ suite = 'UiCaptureSeedPaths'; executed = $results.Count; passed = $passed; failed = $failed
+            cases = @($results); gui = 'NotExecuted'; images = 0; realDaemonRestart = 'NotExecuted' }
+        $report | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath (Join-Path $scratch 'report.json') -Encoding utf8NoBOM
+        $report | Select-Object suite,executed,passed,failed | ConvertTo-Json -Compress
+        $expected = if ($SeedPathCase -ceq 'ExitWait') {1} else {2}
+        if ($results.Count -ne $expected -or $passed -ne $expected -or $failed -ne 0) { exit 1 }
+        exit 0
+    }
     if ($AppChildContractOnly) {
         Invoke-CapAppChildContracts
         $passed = @($results | Where-Object passed -EQ $true).Count
@@ -5448,6 +5936,7 @@ try {
         Invoke-CapAppChildContracts
         Invoke-CapDContracts
         Invoke-CapMatchedContracts
+        Invoke-CapSeedPathContracts
         Invoke-CapIdentityContracts
         Invoke-CapSelectorRefusalContracts
         Invoke-CapTest 'prebuilt fixture binder accepts exact artifacts and refuses missing or tampered bytes' { Invoke-CapPrebuiltFixtureContract }
@@ -6502,6 +6991,6 @@ try {
 }
 [ordered]@{ suite = $suiteName; executed = $results.Count; passed = $passed; failed = $failed; skipped = 0; artifacts = $scratch } |
     ConvertTo-Json -Compress
-$expectedCount = if ($JournalContractOnly) { 10 } elseif ($LaunchContractOnly) { 2 } elseif ($RequireRealSeed) { 178 } else { 175 }
+$expectedCount = if ($JournalContractOnly) { 10 } elseif ($LaunchContractOnly) { 2 } elseif ($RequireRealSeed) { 180 } else { 177 }
 if ($results.Count -ne $expectedCount -or $failed -ne 0 -or $passed -ne $results.Count) { exit 1 }
 exit 0
