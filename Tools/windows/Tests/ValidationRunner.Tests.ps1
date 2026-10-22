@@ -4242,14 +4242,120 @@ Start-Sleep -Seconds 60
       $uiaLiveGateSource -notmatch 'reasonClearedOnTypeChange = ' -or
       $uiaLiveGateSource -notmatch 'SendKeyInput\(' -or
       $uiaLiveGateSource -notmatch 'ComboSelection\(' -or
-      $uiaLiveGateSource -notmatch 'graphCommand\.command\.createNode\._0' -or
+      $uiaLiveGateSource -notmatch '\$wireNode\s*=\s*\$nodeSheetDispatchedCommand\.command\.createNode\._0' -or
       $uiaLiveGateSource -notmatch 'node creation dispatched modelTier' -or
       $uiaLiveGateSource -notmatch 'appliedCreates' -or
+      $uiaLiveGateSource -match 'Test-NodeCreationLogHasCreate' -or
+      $uiaLiveGateSource -match '(?s)for \(\$index = 0; \$index -lt 100 -and \$null -eq \$nodeSheetDispatchedCommand; \$index\+\+\).*?Start-Sleep -Milliseconds 50' -or
+      $uiaLiveGateSource -notmatch '\$nodeSheetReceivedCommands\s*=\s*@\(\$nodeSheetStubAfter\.receivedGraphCommands\s*\|\s*Where-Object' -or
+      $uiaLiveGateSource -notmatch '\$nodeSheetReceivedCommands\.Count -eq 1' -or
+      $uiaLiveGateSource -notmatch '\$nodeSheetReceivedCommands\[0\]\.command\s*\|\s*ConvertFrom-Json' -or
+      $uiaLiveGateSource -notmatch '\[double\]\$wireNode\.heartbeatIntervalSeconds -eq \$expectedHeartbeatIntervalSeconds' -or
+      $uiaLiveGateSource -notmatch '(?s)UIA_NODE_CREATION_SHEET_EVIDENCE=.*?\$postCreateWorkspaceId = Get-MultiProjectAutomationId "workspace-loop-bar" \$createdNodeId.*?\$postCreateWorkspace = Wait-ForGraphChildren \$renameRoot \$rawWalker.*?\^workspace-\(loop-bar\|show-graph\)-.*?AutomationId -ceq \$postCreateWorkspaceId.*?Selected loop workspace.*?\^workspace-show-graph-.*?Show in Graph.*?\$postCreateShowGraph = @\(.*?workspace-show-graph-.*?Show in Graph.*?GetCurrentPattern\(\[System\.Windows\.Automation\.InvokePattern\]::Pattern\)\.Invoke\(\).*?\$postCreateOverview = Wait-ForGraphChildren \$renameRoot \$rawWalker.*?\^workspace-\(loop-bar\|show-graph\)-.*?Count -eq 0.*?\^canvas-card-.*?Count -gt 0.*?New Loop exact-ID workspace did not settle on an active graph before sketch/custody.*?# --- Connected sketch promotion and custody child' -or
       $uiaLiveGateSource -notmatch 'afterTileClick = ' -or
       $uiaLiveGateSource -notmatch 'afterEdit = ' -or
       $uiaLiveGateSource -notmatch 'renderedSidebarCount -gt 0' -or
       $uiaLiveGateSource -notmatch 'renderedCardCount -gt 0') {
     throw "RED: UIA live gate does not drive the node creation sheet through conditional fields, rejected input, and a daemon-rendered create"
+  }
+  $retainedNodeHistory = @(
+    [pscustomobject]@{
+      requestID = "create-request"
+      command = '{"projectPath":"graphcode://stub/project","command":{"createNode":{"_0":{"id":"11111111-1111-4111-8111-111111111111","title":"UIA created timed loop","loopType":"timeBased","triggerPrompt":"Summarize new commits","heartbeatIntervalSeconds":3600,"backend":"copilotCLI","modelTier":"capable"}}}}'
+    },
+    [pscustomobject]@{
+      requestID = "outcome-request"
+      command = '{"projectPath":"graphcode://stub/project","command":{"openNode":{"_0":"11111111-1111-4111-8111-111111111111"}}}'
+    }
+  )
+  $retainedCreate = @($retainedNodeHistory | Where-Object { $_.requestID -ceq "create-request" })
+  $retainedCreateCommand = $retainedCreate[0].command | ConvertFrom-Json
+  $retainedCreateNode = $retainedCreateCommand.command.createNode._0
+  if ($retainedCreate.Count -ne 1 -or
+      [string]$retainedCreateCommand.projectPath -cne "graphcode://stub/project" -or
+      [string]$retainedCreateNode.triggerPrompt -cne "Summarize new commits" -or
+      [double]$retainedCreateNode.heartbeatIntervalSeconds -ne 3600) {
+    throw "RED: retained New Loop request history cannot select the create after a later outcome command"
+  }
+  $firstCustodyOpen = $uiaLiveGateSource.IndexOf(
+    '$custodyMenuClick = Sketch-ClickMenu $custodyParent 5119',
+    [StringComparison]::Ordinal)
+  $firstCustodyCancel = $uiaLiveGateSource.IndexOf(
+    '$custodyCancel = Sketch-Cancel "New Child"',
+    [Math]::Max(0, $firstCustodyOpen), [StringComparison]::Ordinal)
+  $secondCustodyOpen = $uiaLiveGateSource.IndexOf(
+    '$custodyParent = Open-SketchNodeMenu $renameFinalTitle',
+    [Math]::Max(0, $firstCustodyCancel + 1), [StringComparison]::Ordinal)
+  $custodyTurnSelection = $uiaLiveGateSource.IndexOf(
+    '$custodyTurnTile = Assert-SketchControl 9600',
+    [StringComparison]::Ordinal)
+  $custodyInstructionType = $uiaLiveGateSource.IndexOf(
+    'Sketch-Type 9104 $custodyFirstInstruction',
+    [Math]::Max(0, $custodyTurnSelection), [StringComparison]::Ordinal)
+  $custodyBackendChange = $uiaLiveGateSource.IndexOf(
+    '$null = Sketch-Combo 9112 1 "Claude Code"',
+    [Math]::Max(0, $custodyInstructionType), [StringComparison]::Ordinal)
+  $custodyInstructionReadback = $uiaLiveGateSource.IndexOf(
+    '$custodyInstructionAfterBackend = Sketch-Field 9104',
+    [Math]::Max(0, $custodyBackendChange), [StringComparison]::Ordinal)
+  $custodyCountIndex = $uiaLiveGateSource.IndexOf(
+    '(Edge-GraphCount $custodyAfter) -eq (Edge-GraphCount $custodyBefore) + 2',
+    [Math]::Max(0, $custodyInstructionReadback), [StringComparison]::Ordinal)
+  $custodyNewCommandsIndex = $uiaLiveGateSource.IndexOf(
+    '$custodyNewCommands = @($custodyAfter.receivedGraphCommands |',
+    [Math]::Max(0, $custodyCountIndex), [StringComparison]::Ordinal)
+  $custodyExpectedOutcomeIndex = $uiaLiveGateSource.IndexOf(
+    '$custodyExpectedOutcome = [ordered]@{',
+    [Math]::Max(0, $custodyNewCommandsIndex), [StringComparison]::Ordinal)
+  $custodyOutcomeSelectionIndex = $uiaLiveGateSource.IndexOf(
+    '$custodyOutcomes = @($custodyNewCommands | Where-Object {',
+    [Math]::Max(0, $custodyExpectedOutcomeIndex), [StringComparison]::Ordinal)
+  $custodyOutcomeRequireIndex = $uiaLiveGateSource.IndexOf(
+    '[string]$custodyOutcomes[0].requestID -cne $custodyRequest -and',
+    [Math]::Max(0, $custodyOutcomeSelectionIndex), [StringComparison]::Ordinal)
+  $custodyOutcomeAnsweredIndex = $uiaLiveGateSource.IndexOf(
+    '@($custodyAfter.unansweredRequests) -notcontains [string]$custodyOutcomes[0].requestID -and',
+    [Math]::Max(0, $custodyOutcomeRequireIndex), [StringComparison]::Ordinal)
+  $custodyRenderWaitIndex = $uiaLiveGateSource.IndexOf(
+    '$custodyRenderWait = Wait-SketchGraphCard',
+    [Math]::Max(0, $custodyOutcomeAnsweredIndex), [StringComparison]::Ordinal)
+  $custodyWorkspaceIdIndex = $uiaLiveGateSource.IndexOf(
+    '$custodyWorkspaceId = Get-MultiProjectAutomationId "workspace-loop-bar" $custodyId',
+    [Math]::Max(0, $custodyRenderWaitIndex), [StringComparison]::Ordinal)
+  $custodyWorkspaceWaitIndex = $uiaLiveGateSource.IndexOf(
+    '$custodyWorkspace = Wait-ForGraphChildren $renameRoot $rawWalker',
+    [Math]::Max(0, $custodyWorkspaceIdIndex), [StringComparison]::Ordinal)
+  $custodyShowGraphInvokeIndex = $uiaLiveGateSource.IndexOf(
+    '$custodyShowGraph.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()',
+    [Math]::Max(0, $custodyWorkspaceWaitIndex), [StringComparison]::Ordinal)
+  $custodyGraphReturnIndex = $uiaLiveGateSource.IndexOf(
+    '$custodyGraphReturn = Wait-ForGraphChildren $renameRoot $rawWalker',
+    [Math]::Max(0, $custodyShowGraphInvokeIndex), [StringComparison]::Ordinal)
+  $custodyFinalMenuIndex = $uiaLiveGateSource.IndexOf(
+    '$custodyRendered = Open-SketchNodeMenu "UIA custody child"',
+    [Math]::Max(0, $custodyGraphReturnIndex), [StringComparison]::Ordinal)
+  if ($firstCustodyOpen -lt 0 -or $firstCustodyCancel -le $firstCustodyOpen -or
+      $secondCustodyOpen -le $firstCustodyCancel -or
+      $custodyTurnSelection -le $secondCustodyOpen -or
+      $custodyInstructionType -le $custodyTurnSelection -or
+      $custodyBackendChange -le $custodyInstructionType -or
+      $custodyInstructionReadback -le $custodyBackendChange -or
+      $custodyCountIndex -le $custodyInstructionReadback -or
+      $custodyNewCommandsIndex -le $custodyCountIndex -or
+      $custodyExpectedOutcomeIndex -le $custodyNewCommandsIndex -or
+      $custodyOutcomeSelectionIndex -le $custodyExpectedOutcomeIndex -or
+      $custodyOutcomeRequireIndex -le $custodyOutcomeSelectionIndex -or
+      $custodyOutcomeAnsweredIndex -le $custodyOutcomeRequireIndex -or
+      $custodyRenderWaitIndex -le $custodyOutcomeAnsweredIndex -or
+      $custodyWorkspaceIdIndex -le $custodyRenderWaitIndex -or
+      $custodyWorkspaceWaitIndex -le $custodyWorkspaceIdIndex -or
+      $custodyShowGraphInvokeIndex -le $custodyWorkspaceWaitIndex -or
+      $custodyGraphReturnIndex -le $custodyShowGraphInvokeIndex -or
+      $custodyFinalMenuIndex -le $custodyGraphReturnIndex -or
+      $uiaLiveGateSource.IndexOf(
+        '$custodyTurnTile = Assert-SketchControl 9600',
+        $custodyTurnSelection + 1, [StringComparison]::Ordinal) -ge 0) {
+    throw "RED: custody reopened path must select Turn once, type instruction, change backend and prove unchanged instruction"
   }
   if ($uiaLiveGateSource -notmatch '(?s)nodeCreationSheet = \$nodeCreationSheetEvidence.*?\}\s*\|\s*ConvertTo-Json -Depth 8 -Compress') {
     throw "RED: UIA final summary omits the parsable node creation sheet evidence"
@@ -4287,14 +4393,37 @@ Start-Sleep -Seconds 60
       $uiaLiveGateSource -notmatch 'function Test-SketchPromotionReceipt' -or
       $uiaLiveGateSource -notmatch 'Test-SketchPromotionReceipt \$after \$request \$expectedWire' -or
       $uiaLiveGateSource -notmatch 'receivedWireRaw = \$receivedWireRaw' -or
-      $uiaLiveGateSource -notmatch '\$custodyFirstInstruction = Sketch-Field 9104' -or
+      $uiaLiveGateSource -notmatch '\$custodyFirstInstruction = "Work on the requested Windows shell task\."' -or
+      $uiaLiveGateSource -notmatch 'Sketch-Type 9104 \$custodyFirstInstruction' -or
       $uiaLiveGateSource -notmatch '\$custodyInstructionAfterBackend = Sketch-Field 9104' -or
+      $uiaLiveGateSource -notmatch '\$custodyReceived = @\(\$custodyAfter\.receivedGraphCommands \| Where-Object \{ \$_.requestID -ceq \$custodyRequest \}\)' -or
+      $uiaLiveGateSource -notmatch '\$custodyReceived\.Count -eq 1' -or
+      $uiaLiveGateSource -notmatch '\$custodyCommand = \[string\]\$custodyReceived\[0\]\.command \| ConvertFrom-Json' -or
+      $uiaLiveGateSource -notmatch '\$custodyWire = \$custodyCommand\.command\.createNode\._0' -or
+      $uiaLiveGateSource -notmatch '\[int\]\$custodyAfter\.requestCount -eq \[int\]\$custodyBefore\.requestCount \+ 2' -or
+      $uiaLiveGateSource -notmatch '\[int\]\$custodyAfter\.responseCount -eq \[int\]\$custodyBefore\.responseCount \+ 2' -or
+      $uiaLiveGateSource -notmatch '\$custodyNewCommands\.Count -eq 2' -or
+      $uiaLiveGateSource -notmatch 'Select-Object -Skip @\(\$custodyBefore\.receivedGraphCommands\)\.Count' -or
+      $uiaLiveGateSource -notmatch '\$custodyExpectedOutcomeJson = ConvertTo-SketchCanonicalJson \$custodyExpectedOutcome' -or
+      $uiaLiveGateSource -notmatch '\$custodyOutcomes\.Count -eq 1' -or
+      $uiaLiveGateSource -notmatch '\(ConvertTo-SketchCanonicalJson \$custodyOutcomeCommand\) -ceq \$custodyExpectedOutcomeJson' -or
+      $uiaLiveGateSource -notmatch '-not \[string\]::IsNullOrWhiteSpace\(\[string\]\$custodyOutcomes\[0\]\.requestID\)' -or
+      $uiaLiveGateSource -notmatch 'exactIdOutcome = @\{' -or
+      $uiaLiveGateSource -notmatch '\$custodyCommand\.projectPath -ceq "graphcode://stub/project"' -or
+      $uiaLiveGateSource -match '\$custodyLogged = \(Read-DaemonCommandLog' -or
+      $uiaLiveGateSource -match '\(\$custodyLogged \| ConvertTo-Json' -or
+      $uiaLiveGateSource -notmatch '\$custodyWorkspaceId = Get-MultiProjectAutomationId "workspace-loop-bar" \$custodyId' -or
+      $uiaLiveGateSource -notmatch '\$custodyWorkspace = Wait-ForGraphChildren \$renameRoot \$rawWalker' -or
+      $uiaLiveGateSource -notmatch '\$custodyShowGraph\.GetCurrentPattern\(\[System\.Windows\.Automation\.InvokePattern\]::Pattern\)\.Invoke\(\)' -or
+      $uiaLiveGateSource -notmatch '\$custodyGraphReturn = Wait-ForGraphChildren \$renameRoot \$rawWalker' -or
+      $uiaLiveGateSource -notmatch '\$custodyRendered = Open-SketchNodeMenu "UIA custody child"' -or
       $uiaLiveGateSource -notmatch 'instructionUnchanged = \(\$custodySubmitFields\.firstInstruction -ceq \$custodyFirstInstruction\)' -or
       $uiaLiveGateSource -notmatch 'firstInstruction -ceq \$custodyFirstInstruction' -or
       $uiaLiveGateSource -notmatch 'daemonCountsBefore = \$beforeCounts; daemonCountsAfter = \$afterCounts' -or
       $uiaLiveGateSource -notmatch 'appliedPromotionRequests = @\(\$before\.appliedPromotionRequests\)\.Count' -or
       $uiaLiveGateSource -notmatch 'requestCount = \[int\]\$before\.requestCount' -or
-      $uiaLiveGateSource -notmatch 'instructionEditing = "not validated;' -or
+      $uiaLiveGateSource -notmatch 'instructionEditing = "validated by native Sketch-Type exact readback before and after backend change"' -or
+      $uiaLiveGateSource -match 'editing is not validated and that result does not establish a dropped key' -or
       $uiaLiveGateSource -notmatch 'rejected/cancelled no-dispatch evidence combines unchanged UIA-recorder bytes with unchanged stub received/applied/request/response/graph counts' -or
       $stubDaemonSource -notmatch 'appliedPromotions' -or
       $stubDaemonSource -notmatch 'appliedPromotionRequests' -or

@@ -10006,11 +10006,6 @@ try {
     if ($null -eq $stubResult) { return -1 }
     return @(@($stubResult.commands) | Where-Object { $_ -eq "graphCommand" }).Count
   }
-  function Test-NodeCreationLogHasCreate {
-    if (-not (Test-Path -LiteralPath $renameCommandLogPath)) { return $false }
-    $logText = Read-DaemonCommandLog $renameCommandLogPath
-    return ($logText -match '"createNode"')
-  }
   $nodeSheetTitle = "Create or edit node"
   $nodeSheetFieldLabels = @{
     9100 = "Name (optional)"; 9102 = "What are you checking for? (optional)"
@@ -10037,6 +10032,7 @@ try {
   $nodeSheetTimedReason = "Say what to do each time to continue."
   $nodeSheetCreatedTitle = "UIA created timed loop"
   $nodeSheetTriggerPrompt = "Summarize new commits"
+  $expectedHeartbeatIntervalSeconds = 3600
   $expectedCreateLoopType = "timeBased"
   $expectedCreateBackend = "copilotCLI"
   $expectedModelTier = "capable"
@@ -10410,14 +10406,6 @@ try {
      ([GraphCodeUiaGateState]::WindowTextOf($nodeSheetWindow)) + "'; visible text: " +
      (@([GraphCodeUiaGateState]::VisibleStaticTexts($nodeSheetWindow)) -join " | "))
 
-  $nodeSheetDispatchedCommand = $null
-  for ($index = 0; $index -lt 100 -and $null -eq $nodeSheetDispatchedCommand; $index++) {
-    if (Test-NodeCreationLogHasCreate) {
-      $nodeSheetDispatchedCommand = ConvertFrom-Json -InputObject (Read-DaemonCommandLog $renameCommandLogPath)
-    } else {
-      Start-Sleep -Milliseconds 50
-    }
-  }
   $nodeSheetStubAfter = $null
   $nodeSheetAppliedCreate = $null
   for ($index = 0; $index -lt 100 -and $null -eq $nodeSheetAppliedCreate; $index++) {
@@ -10428,8 +10416,8 @@ try {
     if ($null -eq $nodeSheetAppliedCreate) { Start-Sleep -Milliseconds 100 }
   }
   Require ($null -ne $nodeSheetAppliedCreate) `
-    ("stub daemon never received and applied the created node '$nodeSheetCreatedTitle'; command log createNode=" +
-     "$($null -ne $nodeSheetDispatchedCommand); stub result: " + (Read-UiaTextFile $renameStubResultPath) +
+    ("stub daemon never received and applied the created node '$nodeSheetCreatedTitle'; stub result: " +
+     (Read-UiaTextFile $renameStubResultPath) +
      "; stub stderr: " + (Read-UiaTextFile $renameStubErrorPath))
   $appliedParts = ([string]$nodeSheetAppliedCreate).Split("|")
   $createdNodeId = $appliedParts[0]
@@ -10437,10 +10425,19 @@ try {
   $createdRequestId = [string](@($nodeSheetStubAfter.appliedCreateRequests)[$createdPosition])
   $createdRequestAnswered = (-not [string]::IsNullOrEmpty($createdRequestId)) -and
     -not (@($nodeSheetStubAfter.unansweredRequests) -contains $createdRequestId)
+  $nodeSheetReceivedCommands = @($nodeSheetStubAfter.receivedGraphCommands | Where-Object {
+    $_.requestID -ceq $createdRequestId
+  })
+  Require ($nodeSheetReceivedCommands.Count -eq 1) `
+    "stub daemon retained $($nodeSheetReceivedCommands.Count) commands for createNode request '$createdRequestId'"
+  $nodeSheetDispatchedCommand = $nodeSheetReceivedCommands[0].command | ConvertFrom-Json
+  $wireNode = $nodeSheetDispatchedCommand.command.createNode._0
+  Require ($null -ne $wireNode) `
+    "retained request '$createdRequestId' was not the expected createNode command"
   Write-Host ("UIA_NODE_CREATION_DISPATCH nodeId=$createdNodeId title='$($appliedParts[1])' " +
     "loopType=$($appliedParts[2]) backend=$($appliedParts[3]) modelTier=$($appliedParts[4]) " +
     "triggerPrompt='$($appliedParts[5])' requestID=$createdRequestId answered=$createdRequestAnswered " +
-    "commandLogCreateNode=$($null -ne $nodeSheetDispatchedCommand)")
+    "retainedCreateNode=$($null -ne $wireNode) heartbeatIntervalSeconds=$($wireNode.heartbeatIntervalSeconds)")
   Require ($createdNodeId -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') `
     "node creation dispatched a non-UUID node id '$createdNodeId'"
   Require ($appliedParts[2] -eq $expectedCreateLoopType) `
@@ -10453,20 +10450,28 @@ try {
     "node creation dispatched triggerPrompt '$($appliedParts[5])', expected '$nodeSheetTriggerPrompt'"
   Require $createdRequestAnswered `
     "stub daemon did not answer the createNode request '$createdRequestId'"
-  $nodeSheetDispatched = $null
-  if ($null -ne $nodeSheetDispatchedCommand) {
-    $wireNode = $nodeSheetDispatchedCommand.graphCommand.command.createNode._0
-    Require ([string]$wireNode.id -eq $createdNodeId) `
-      "command log createNode id '$($wireNode.id)' differs from the daemon-applied id '$createdNodeId'"
-    $nodeSheetDispatched = [ordered]@{
-      nodeId = [string]$wireNode.id
-      projectPath = [string]$nodeSheetDispatchedCommand.graphCommand.projectPath
-      title = [string]$wireNode.title
-      loopType = [string]$wireNode.loopType
-      triggerPrompt = [string]$wireNode.triggerPrompt
-      backend = [string]$wireNode.backend
-      modelTier = [string]$wireNode.modelTier
-    }
+  Require ([string]$wireNode.id -eq $createdNodeId) `
+    "retained createNode id '$($wireNode.id)' differs from the daemon-applied id '$createdNodeId'"
+  Require ([string]$nodeSheetDispatchedCommand.projectPath -ceq "graphcode://stub/project" -and
+    [string]$wireNode.title -ceq $nodeSheetCreatedTitle -and
+    [string]$wireNode.loopType -ceq $expectedCreateLoopType -and
+    [string]$wireNode.backend -ceq $expectedCreateBackend -and
+    [string]$wireNode.modelTier -ceq $expectedModelTier -and
+    [string]$wireNode.triggerPrompt -ceq $nodeSheetTriggerPrompt -and
+    [double]$wireNode.heartbeatIntervalSeconds -eq $expectedHeartbeatIntervalSeconds) `
+    ("retained createNode Time wire differs: projectPath='$($nodeSheetDispatchedCommand.projectPath)' " +
+     "title='$($wireNode.title)' loopType='$($wireNode.loopType)' backend='$($wireNode.backend)' " +
+     "modelTier='$($wireNode.modelTier)' triggerPrompt='$($wireNode.triggerPrompt)' " +
+     "heartbeatIntervalSeconds='$($wireNode.heartbeatIntervalSeconds)'")
+  $nodeSheetDispatched = [ordered]@{
+    nodeId = [string]$wireNode.id
+    projectPath = [string]$nodeSheetDispatchedCommand.projectPath
+    title = [string]$wireNode.title
+    loopType = [string]$wireNode.loopType
+    triggerPrompt = [string]$wireNode.triggerPrompt
+    heartbeatIntervalSeconds = [double]$wireNode.heartbeatIntervalSeconds
+    backend = [string]$wireNode.backend
+    modelTier = [string]$wireNode.modelTier
   }
 
   $renderedSidebar = @()
@@ -10548,6 +10553,43 @@ try {
     }
   }
   Write-Host ("UIA_NODE_CREATION_SHEET_EVIDENCE=" + ($nodeCreationSheetEvidence | ConvertTo-Json -Compress -Depth 8))
+  $postCreateWorkspaceId = Get-MultiProjectAutomationId "workspace-loop-bar" $createdNodeId
+  $postCreateWorkspace = Wait-ForGraphChildren $renameRoot $rawWalker `
+    { $_.Current.AutomationId -match '^workspace-(loop-bar|show-graph)-' } `
+    { param($items)
+      (@($items | Where-Object {
+        $_.Current.AutomationId -ceq $postCreateWorkspaceId -and
+        $_.Current.Name -ceq "Selected loop workspace"
+      }).Count -eq 1) -and
+      (@($items | Where-Object {
+        $_.Current.AutomationId -match '^workspace-show-graph-' -and
+        $_.Current.Name -ceq "Show in Graph"
+      }).Count -eq 1) }
+  Require (@($postCreateWorkspace.Items | Where-Object {
+    $_.Current.AutomationId -ceq $postCreateWorkspaceId -and
+    $_.Current.Name -ceq "Selected loop workspace"
+  }).Count -eq 1) `
+    "New Loop exact-ID open outcome did not activate exactly one created-loop workspace"
+  $postCreateShowGraph = @($postCreateWorkspace.Items | Where-Object {
+    $_.Current.AutomationId -match '^workspace-show-graph-' -and
+    $_.Current.Name -ceq "Show in Graph"
+  }) | Select-Object -First 1
+  Require ($null -ne $postCreateShowGraph) `
+    "New Loop exact-ID workspace omitted its native Show in Graph action"
+  $postCreateShowGraph.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+  $postCreateOverview = Wait-ForGraphChildren $renameRoot $rawWalker `
+    { $_.Current.AutomationId -match '^(workspace-loop-bar-|workspace-show-graph-|canvas-card-)' } `
+    { param($items)
+      (@($items | Where-Object { $_.Current.AutomationId -match '^workspace-(loop-bar|show-graph)-' }).Count -eq 0) -and
+      (@($items | Where-Object { $_.Current.AutomationId -match '^canvas-card-' }).Count -gt 0) }
+  Require ($null -ne $postCreateOverview.Graph -and
+    @($postCreateOverview.Items | Where-Object {
+      $_.Current.AutomationId -match '^workspace-(loop-bar|show-graph)-'
+    }).Count -eq 0 -and
+    @($postCreateOverview.Items | Where-Object {
+      $_.Current.AutomationId -match '^canvas-card-'
+    }).Count -gt 0) `
+    "New Loop exact-ID workspace did not settle on an active graph before sketch/custody"
 
   # --- Connected sketch promotion and custody child (ledger rows 100, 94) ---
   function Read-SketchStub {
@@ -11274,9 +11316,32 @@ try {
   $custodyModal = Assert-SketchModal "Create or edit node"
   Require ([GraphCodeUiaGateState]::ComboSelection($script:edgeWorkflowWindow, 9112) -ceq
     "2|GitHub Copilot CLI") "reopened custody child lost inherited backend"
-  $custodyFirstInstruction = Sketch-Field 9104 "custody instruction inherited baseline"
-  Require (-not [string]::IsNullOrWhiteSpace($custodyFirstInstruction)) `
-    "custody child form exposed no default first instruction"
+  $custodyTurnTile = Assert-SketchControl 9600
+  Require ([GraphCodeUiaGateState]::WindowTextOf($custodyTurnTile) -ceq "Turn-based") `
+    "reopened custody child stable tile 9600 was not Turn-based"
+  Require (Ensure-ShellForeground $script:edgeWorkflowWindow "custody Turn tile") `
+    "reopened custody child lost foreground before selecting Turn"
+  $custodyTurnHit = [GraphCodeUiaGateState]::ClickScreenPoint($custodyTurnTile)
+  Require ($null -ne $custodyTurnHit -and -not $custodyTurnHit.VisibleEmpty) `
+    "reopened custody child Turn tile has no visible native rectangle"
+  if (-not $custodyTurnHit.HitTarget) {
+    Require ([GraphCodeUiaGateState]::ClickButton($custodyTurnTile)) `
+      "reopened custody child Turn tile direct button fallback failed"
+  }
+  $custodyTurnReady = $false
+  for ($attempt = 0; $attempt -lt 40 -and -not $custodyTurnReady; $attempt++) {
+    $instruction = [GraphCodeUiaGateState]::ControlById($script:edgeWorkflowWindow, 9104)
+    $custodyTurnReady = $instruction -ne [IntPtr]::Zero -and
+      [GraphCodeUiaGateState]::IsControlOwnedBy($script:edgeWorkflowWindow, $instruction, 9104) -and
+      [GraphCodeUiaGateState]::HasVisibleBounds($instruction) -and
+      (@([GraphCodeUiaGateState]::VisibleStaticTexts($script:edgeWorkflowWindow)) -contains "First instruction")
+    if (-not $custodyTurnReady) { Start-Sleep -Milliseconds 50 }
+  }
+  Require $custodyTurnReady `
+    "reopened custody child did not expose Turn field 9104 with exact First instruction label"
+  $custodyFirstInstruction = "Work on the requested Windows shell task."
+  Require ((Sketch-Type 9104 $custodyFirstInstruction) -ceq $custodyFirstInstruction) `
+    "custody child Turn field did not retain the typed first instruction"
   $null = Sketch-Type 9100 "UIA custody child"
   $null = Sketch-Combo 9112 1 "Claude Code"
   $custodyInstructionAfterBackend = Sketch-Field 9104 "custody instruction after backend selection"
@@ -11297,14 +11362,17 @@ try {
   $custodyAfter = $null
   for ($retry = 0; $retry -lt 100; $retry++) {
     $custodyAfter = Read-SketchStub
-    if (@($custodyAfter.appliedCreates).Count -eq 2) { break }
+    if (@($custodyAfter.appliedCreates).Count -eq 2 -and
+        (Edge-GraphCount $custodyAfter) -ge (Edge-GraphCount $custodyBefore) + 2 -and
+        [int]$custodyAfter.requestCount -ge [int]$custodyBefore.requestCount + 2 -and
+        [int]$custodyAfter.responseCount -ge [int]$custodyBefore.responseCount + 2) { break }
     Start-Sleep -Milliseconds 100
   }
   Require (@($custodyAfter.appliedCreates).Count -eq 2 -and
-    (Edge-GraphCount $custodyAfter) -eq (Edge-GraphCount $custodyBefore) + 1 -and
-    [int]$custodyAfter.requestCount -eq [int]$custodyBefore.requestCount + 1 -and
-    [int]$custodyAfter.responseCount -eq [int]$custodyBefore.responseCount + 1 -and
-    @($custodyAfter.receivedGraphCommands).Count -eq @($custodyBefore.receivedGraphCommands).Count + 1 -and
+    (Edge-GraphCount $custodyAfter) -eq (Edge-GraphCount $custodyBefore) + 2 -and
+    [int]$custodyAfter.requestCount -eq [int]$custodyBefore.requestCount + 2 -and
+    [int]$custodyAfter.responseCount -eq [int]$custodyBefore.responseCount + 2 -and
+    @($custodyAfter.receivedGraphCommands).Count -eq @($custodyBefore.receivedGraphCommands).Count + 2 -and
     [int]$custodyAfter.graphSequence -eq [int]$custodyBefore.graphSequence + 1 -and
     [bool]$custodyAfter.correlatedRequests) `
     "custody child not applied exactly once"
@@ -11317,13 +11385,37 @@ try {
     -not [string]::IsNullOrWhiteSpace($custodyRequest) -and
     @($custodyAfter.unansweredRequests) -notcontains $custodyRequest) `
     "custody applied fields or correlated response differ from submitted native form"
-  $custodyLogged = (Read-DaemonCommandLog $renameCommandLogPath | ConvertFrom-Json).graphCommand
   $custodyReceived = @($custodyAfter.receivedGraphCommands | Where-Object { $_.requestID -ceq $custodyRequest })
-  $custodyWire = $custodyLogged.command.createNode._0
-  Require ($custodyReceived.Count -eq 1 -and
-    ($custodyLogged | ConvertTo-Json -Depth 16 -Compress) -ceq
-    (($custodyReceived[0].command | ConvertFrom-Json) | ConvertTo-Json -Depth 16 -Compress) -and
-    $custodyLogged.projectPath -ceq "graphcode://stub/project" -and
+  Require ($custodyReceived.Count -eq 1) `
+    "stub daemon retained $($custodyReceived.Count) commands for custody request '$custodyRequest'"
+  $custodyCommand = [string]$custodyReceived[0].command | ConvertFrom-Json
+  $custodyWire = $custodyCommand.command.createNode._0
+  $custodyNewCommands = @($custodyAfter.receivedGraphCommands |
+    Select-Object -Skip @($custodyBefore.receivedGraphCommands).Count)
+  $custodyExpectedOutcome = [ordered]@{
+    projectPath = "graphcode://stub/project"
+    command = [ordered]@{ resumeSession = [ordered]@{ _0 = $custodyId } }
+  }
+  $custodyExpectedOutcomeJson = ConvertTo-SketchCanonicalJson $custodyExpectedOutcome
+  $custodyOutcomes = @($custodyNewCommands | Where-Object {
+    if ([string]$_.requestID -ceq $custodyRequest) {
+      $false
+    } else {
+      $candidate = [string]$_.command | ConvertFrom-Json
+      (ConvertTo-SketchCanonicalJson $candidate) -ceq $custodyExpectedOutcomeJson
+    }
+  })
+  $custodyOutcomeCommand = if ($custodyOutcomes.Count -eq 1) {
+    [string]$custodyOutcomes[0].command | ConvertFrom-Json
+  } else { $null }
+  Require ($null -ne $custodyWire -and
+    $custodyNewCommands.Count -eq 2 -and
+    $custodyOutcomes.Count -eq 1 -and
+    [string]$custodyOutcomes[0].requestID -cne $custodyRequest -and
+    (ConvertTo-SketchCanonicalJson $custodyOutcomeCommand) -ceq $custodyExpectedOutcomeJson -and
+    -not [string]::IsNullOrWhiteSpace([string]$custodyOutcomes[0].requestID) -and
+    @($custodyAfter.unansweredRequests) -notcontains [string]$custodyOutcomes[0].requestID -and
+    $custodyCommand.projectPath -ceq "graphcode://stub/project" -and
     $custodyWire.id -ceq $custodyId -and $custodyWire.title -ceq "UIA custody child" -and
     $custodyWire.createdBy -ceq $renameNodeId -and $custodyWire.backend -ceq "claudeCode" -and
     $custodyWire.loopType -ceq "turnBased" -and
@@ -11344,6 +11436,40 @@ try {
   $custodyExpectedAutomationId = Get-SketchCardAutomationId $custodyId
   $custodyRenderWait = Wait-SketchGraphCard "UIA custody child" $custodyId `
     ([int]$custodyAfter.graphSequence)
+  $custodyWorkspaceId = Get-MultiProjectAutomationId "workspace-loop-bar" $custodyId
+  $custodyWorkspace = Wait-ForGraphChildren $renameRoot $rawWalker `
+    { $_.Current.AutomationId -match '^workspace-(loop-bar|show-graph)-' } `
+    { param($items)
+      (@($items | Where-Object {
+        $_.Current.AutomationId -ceq $custodyWorkspaceId -and
+        $_.Current.Name -ceq "Selected loop workspace"
+      }).Count -eq 1) -and
+      (@($items | Where-Object {
+        $_.Current.AutomationId -match '^workspace-show-graph-' -and
+        $_.Current.Name -ceq "Show in Graph"
+      }).Count -eq 1) }
+  $custodyShowGraph = @($custodyWorkspace.Items | Where-Object {
+    $_.Current.AutomationId -match '^workspace-show-graph-' -and
+    $_.Current.Name -ceq "Show in Graph"
+  }) | Select-Object -First 1
+  Require ($null -ne $custodyShowGraph) `
+    "custody exact-ID workspace omitted its native Show in Graph action"
+  $custodyShowGraph.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+  $custodyGraphReturn = Wait-ForGraphChildren $renameRoot $rawWalker `
+    { $_.Current.AutomationId -match '^(workspace-loop-bar-|workspace-show-graph-|canvas-card-)' } `
+    { param($items)
+      (@($items | Where-Object {
+        $_.Current.AutomationId -match '^workspace-(loop-bar|show-graph)-'
+      }).Count -eq 0) -and
+      (@($items | Where-Object {
+        $_.Current.AutomationId -ceq $custodyExpectedAutomationId -and
+        $_.Current.Name -ceq "UIA custody child"
+      }).Count -eq 1) }
+  Require (@($custodyGraphReturn.Items | Where-Object {
+    $_.Current.AutomationId -ceq $custodyExpectedAutomationId -and
+    $_.Current.Name -ceq "UIA custody child"
+  }).Count -eq 1) `
+    "custody exact-ID workspace did not return to the rendered child graph card"
   $custodyRendered = Open-SketchNodeMenu "UIA custody child" -SkipActualSize -ExpectedCardId $custodyExpectedAutomationId
   Require (@($custodyRendered.items | Where-Object { $_.Id -eq 5119 -and $_.Enabled }).Count -eq 1) `
     "republished custody child was not hit-tested as an unresolved node"
@@ -11360,7 +11486,7 @@ try {
       instructionBaseline = $custodyFirstInstruction
       instructionAfterBackend = $custodyInstructionAfterBackend
       instructionUnchanged = ($custodySubmitFields.firstInstruction -ceq $custodyFirstInstruction)
-      instructionEditing = "not validated; hosted entry attempt reported zero expected and sent text events after the field clear, so this does not establish a dropped key"
+      instructionEditing = "validated by native Sketch-Type exact readback before and after backend change"
       submitFields = $custodySubmitFields
       childId = $custodyId; createdBy = [string]$custodyWire.createdBy
       parentUnchanged = @{
@@ -11373,7 +11499,12 @@ try {
       }
       backend = [string]$custodyWire.backend; requestId = $custodyRequest
       requestAnswered = $true
-      receivedWire = ($custodyReceived[0].command | ConvertFrom-Json)
+      exactIdOutcome = @{
+        requestId = [string]$custodyOutcomes[0].requestID
+        requestAnswered = $true
+        wire = $custodyOutcomeCommand
+      }
+      receivedWire = $custodyCommand
       recorderSnapshotBase64 = Edge-LogBytes
       appliedCount = @($custodyAfter.appliedCreates).Count
       graphSequence = [int]$custodyAfter.graphSequence
@@ -11385,7 +11516,7 @@ try {
         pans = $custodyRendered.pans }
     }
     renderedHitTests = 4
-    limit = "The promoteNode path bypasses the UIA command recorder, so exact accepted wire is compared against the correlated stub request; rejected/cancelled no-dispatch evidence combines unchanged UIA-recorder bytes with unchanged stub received/applied/request/response/graph counts. The recorder covers only commands on its recorded path. The hosted first-instruction entry attempt reported zero expected and sent text events after clearing the field, so editing is not validated and that result does not establish a dropped key. Stub graphChanged and live node-card hit tests do not establish a production daemon session, active session preservation, glyph rendering, or macOS runtime parity."
+    limit = "The promoteNode path bypasses the UIA command recorder, so exact accepted wire is compared against the correlated stub request; rejected/cancelled no-dispatch evidence combines unchanged UIA-recorder bytes with unchanged stub received/applied/request/response/graph counts. The recorder covers only commands on its recorded path. Stub graphChanged and live node-card hit tests do not establish a production daemon session, active session preservation, glyph rendering, or macOS runtime parity."
   }
   Require ([GraphCodeUiaGateState]::PostCommand($renameShellWindow, 0x5002)) `
     "connected-daemon shell rejected the tray Exit command"
