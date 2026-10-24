@@ -4544,9 +4544,22 @@ function Get-MultiProjectLaneGeometry([double[]] $canvas, [double[]] $card, [dou
   if ($card[1] -lt $canvas[1] -or $card[3] -gt $canvas[3]) {
     throw "MULTIPROJECT_BOUNDS: vertically clipped card cannot establish scale"
   }
-  $scale = ($card[3] - $card[1]) / 96
-  if ([Math]::Abs(($card[2] - $card[0]) / $scale - 250) -gt 1) {
+  $pixelWidth = $card[2] - $card[0]
+  $pixelHeight = $card[3] - $card[1]
+  $scaleSource = if ([Math]::Abs($pixelHeight - 96) -le 1) { "card-height-exact" } else { "card-width-rounded" }
+  $scale = if ($scaleSource -ceq "card-height-exact") { $pixelHeight / 96 } else { $pixelWidth / 250 }
+  $normalizedWidth = $pixelWidth / $scale
+  $normalizedHeight = $pixelHeight / $scale
+  $widthTolerance = 1
+  $heightTolerance = if ($scaleSource -ceq "card-width-rounded" -and $scale -lt 1) {
+    250 * (1 + [Math]::Abs($normalizedHeight / 250)) /
+      [Math]::Max(1, $pixelWidth - 1) + 0.01
+  } else { 1 }
+  if ([Math]::Abs($normalizedWidth - 250) -gt $widthTolerance) {
     throw "MULTIPROJECT_BOUNDS: overview-card scale differs from source geometry"
+  }
+  if ([Math]::Abs($normalizedHeight - 96) -gt $heightTolerance) {
+    throw "MULTIPROJECT_BOUNDS: overview-card aspect differs from source geometry"
   }
   $minimumLaneWidth = 1522
   $laneCardInset = 82
@@ -4566,6 +4579,13 @@ function Get-MultiProjectLaneGeometry([double[]] $canvas, [double[]] $card, [dou
       "GraphCanvas one-root producer contract with caller-supplied summary anchor; not independent native proof"
     } else { "Source-only one-root producer geometry; no native summary supplied" })
     scale = $scale
+    scaleSource = $scaleSource
+    pixelWidth = $pixelWidth
+    pixelHeight = $pixelHeight
+    normalizedWidth = $normalizedWidth
+    normalizedHeight = $normalizedHeight
+    widthTolerance = $widthTolerance
+    heightTolerance = $heightTolerance
     band = @($laneLeft, $laneTop, $laneRight, ($laneTop + $oneRowLaneHeight * $scale))
     open = @(($anchor[2] + 8 * $scale), $anchor[1], ($anchor[2] + 64 * $scale), $anchor[3])
     summary = $expectedSummary
@@ -6312,6 +6332,24 @@ try {
   }
   Write-Host ("UIA_COMPOSITE_NAVIGATION_EVIDENCE=" + ($compositeNavigationEvidence | ConvertTo-Json -Compress))
 
+  # Opening-fit settles asynchronously after the Back navigation. Connector
+  # evidence is about native hover/drag routing, not opening-fit geometry, so
+  # put the live project canvas at its identity transform and reacquire its
+  # fragments before deriving pointer coordinates.
+  $connectorActual = Find-FragmentByIdWithRetry $root "actual-size" $rawWalker
+  Require ($null -ne $connectorActual) `
+    "connector isolation omitted Actual Size after composite navigation"
+  $connectorActual.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+  $connectorProbe = Wait-ForGraphChildren $root $rawWalker `
+    { $_.Current.AutomationId -match '^canvas-card-' -and
+      $_.Current.Name -in @("UIA loop A", "UIA loop B") } `
+    { param($items)
+      (@($items | Where-Object { $_.Current.Name -ceq "UIA loop A" }).Count -eq 1) -and
+      (@($items | Where-Object { $_.Current.Name -ceq "UIA loop B" }).Count -eq 1) -and
+      ($items.Count -eq 2) }
+  $graph = $connectorProbe.Graph
+  $connectorProjectCards = @($connectorProbe.Items)
+
   # Connector handles: GraphCanvas.drawNode paints a circular 14pt handle with a
   # light '+' glyph (RGB 0xE6E6E6) at the outgoing connector position
   # (card.Right, card's vertical midpoint) with no dedicated UIA element, and
@@ -6323,8 +6361,8 @@ try {
   # treats the resulting native "Create or edit edge" dialog's locked From/To fields
   # as the ground truth evidence that the drop routed to the correct source/target
   # loop IDs.
-  $connectorSourceCard = @($restoredProjectCards | Where-Object { $_.Current.Name -eq "UIA loop A" })[0]
-  $connectorTargetCard = @($restoredProjectCards | Where-Object { $_.Current.Name -eq "UIA loop B" })[0]
+  $connectorSourceCard = @($connectorProjectCards | Where-Object { $_.Current.Name -ceq "UIA loop A" })[0]
+  $connectorTargetCard = @($connectorProjectCards | Where-Object { $_.Current.Name -ceq "UIA loop B" })[0]
   Require (($null -ne $connectorSourceCard) -and ($null -ne $connectorTargetCard)) `
     "missing project cards before the connector handle check"
   $process.Refresh()
@@ -6429,8 +6467,14 @@ try {
   $readLaneCaption = {
     param($pane)
     $children = @(Get-DirectChildren $pane $rawWalker)
-    $cards = @($children | Where-Object {
+    $unorderedCards = @($children | Where-Object {
       $_.Current.AutomationId -match '^canvas-card-' -and $_.Current.Name -match '^UIA loop '
+    })
+    $cards = @($laneOverviewIds | ForEach-Object {
+      $id = $_
+      $matches = @($unorderedCards | Where-Object { $_.Current.AutomationId -ceq $id })
+      Require ($matches.Count -eq 1) "lane caption requires one exact overview card for $id"
+      $matches[0]
     })
     $summaries = @($children | Where-Object { $_.Current.Name -match $laneSummaryPattern })
     Require ($cards.Count -eq 2) "lane caption snapshot must contain both exact fixture cards"
@@ -6452,6 +6496,74 @@ try {
       WorktreesX = [int][Math]::Round($summary.Right + $laneWorktreesNoticeOffset * $scale)
       ActionsRight = $summary.Right + $laneActionsRightNoticeOffset * $scale
       Y = [int][Math]::Round(($summary.Top + $summary.Bottom) / 2)
+    }
+  }
+  $readNormalizedLaneGeometry = {
+    param([object[]] $cardBounds)
+    Require ($cardBounds.Count -eq 2) "normalized lane geometry requires exactly two cards"
+    $scale = $cardBounds[0].Width / 250.0
+    Require ($scale -gt 0) "normalized lane geometry has a non-positive scale"
+    $sizeTolerance = 1 / $scale + 0.01
+    $normalized = @($cardBounds | ForEach-Object {
+      [pscustomobject]@{
+        Width = $_.Width / $scale
+        Height = $_.Height / $scale
+      }
+    })
+    Require (([Math]::Abs($normalized[0].Width - 250) -le 0.01) -and
+      ([Math]::Abs($normalized[1].Width - 250) -le $sizeTolerance) -and
+      ([Math]::Abs($normalized[0].Height - 96) -le $sizeTolerance) -and
+      ([Math]::Abs($normalized[1].Height - 96) -le $sizeTolerance)) `
+      "lane cards do not normalize to the shared 250x96 geometry"
+    return [pscustomobject]@{
+      Scale = $scale
+      PixelWidth = [double]$cardBounds[0].Width
+      SizeTolerance = $sizeTolerance
+      Widths = @($normalized | ForEach-Object { $_.Width })
+      Heights = @($normalized | ForEach-Object { $_.Height })
+      DeltaX = ($cardBounds[1].Left - $cardBounds[0].Left) / $scale
+      DeltaY = ($cardBounds[1].Top - $cardBounds[0].Top) / $scale
+      XOrder = [Math]::Sign($cardBounds[1].Left - $cardBounds[0].Left)
+      YOrder = [Math]::Sign($cardBounds[1].Top - $cardBounds[0].Top)
+    }
+  }
+  $sameNormalizedLaneGeometry = {
+    param($actual, $expected)
+    Require ($actual.Scale -gt 0 -and $expected.Scale -gt 0) `
+      "normalized lane comparison requires positive scales"
+    $deltaXError = [Math]::Abs($actual.DeltaX - $expected.DeltaX)
+    $deltaYError = [Math]::Abs($actual.DeltaY - $expected.DeltaY)
+    Require ($actual.PixelWidth -gt 0 -and $expected.PixelWidth -gt 0) `
+      "normalized lane comparison requires positive pixel widths"
+    # Both the screen-space delta and the card width used as the scale
+    # denominator are differences of integer-rounded UIA coordinates.
+    $actualDeltaXBudget = 250 *
+      (1 + [Math]::Abs($actual.DeltaX / 250)) /
+      [Math]::Max(1, $actual.PixelWidth - 1)
+    $expectedDeltaXBudget = 250 *
+      (1 + [Math]::Abs($expected.DeltaX / 250)) /
+      [Math]::Max(1, $expected.PixelWidth - 1)
+    $actualDeltaYBudget = 250 *
+      (1 + [Math]::Abs($actual.DeltaY / 250)) /
+      [Math]::Max(1, $actual.PixelWidth - 1)
+    $expectedDeltaYBudget = 250 *
+      (1 + [Math]::Abs($expected.DeltaY / 250)) /
+      [Math]::Max(1, $expected.PixelWidth - 1)
+    $deltaXTolerance = $actualDeltaXBudget + $expectedDeltaXBudget + 0.01
+    $deltaYTolerance = $actualDeltaYBudget + $expectedDeltaYBudget + 0.01
+    return [pscustomobject]@{
+      Equal = ($deltaXError -le $deltaXTolerance) -and
+        ($deltaYError -le $deltaYTolerance) -and
+        ($actual.XOrder -eq $expected.XOrder) -and
+        ($actual.YOrder -eq $expected.YOrder)
+      DeltaXTolerance = $deltaXTolerance
+      DeltaYTolerance = $deltaYTolerance
+      ActualDeltaXBudget = $actualDeltaXBudget
+      ExpectedDeltaXBudget = $expectedDeltaXBudget
+      ActualDeltaYBudget = $actualDeltaYBudget
+      ExpectedDeltaYBudget = $expectedDeltaYBudget
+      DeltaXError = $deltaXError
+      DeltaYError = $deltaYError
     }
   }
   $process.Refresh()
@@ -6485,6 +6597,7 @@ try {
     Start-Sleep -Milliseconds 150
     $laneSnapshot = & $readLaneCaption $graph
   }
+  $laneSnapshotGeometry = & $readNormalizedLaneGeometry $laneSnapshot.CardBounds
   Require ($laneSnapshot.OpenX -gt $laneSnapshot.GraphBounds.Left -and
     $laneSnapshot.ActionsRight -lt $laneSnapshot.GraphBounds.Right -and
     $laneSnapshot.Y -gt $laneSnapshot.GraphBounds.Top -and
@@ -6500,39 +6613,106 @@ try {
   $null = Ensure-ShellForeground $shellWindow "before-lane-open-click"
   Require ([GraphCodeUiaGateState]::PostMouseClickAt($shellWindow, $laneOpenClientX, $laneOpenClientY)) `
     "overview lane Open click was rejected"
-  for ($attempt = 0; $attempt -lt 40; $attempt++) {
-    Start-Sleep -Milliseconds 100
-    $laneOpenedCards = @(Get-DirectChildren $graph $rawWalker | Where-Object {
-      $_.Current.AutomationId -match '^canvas-card-' -and $_.Current.Name -match '^UIA loop '
-    })
-    $remainingSummaries = @(Get-DirectChildren $graph $rawWalker | Where-Object {
-      $_.Current.Name -match $laneSummaryPattern
-    })
-    if (($laneOpenedCards.Count -eq 2) -and $remainingSummaries.Count -eq 0) { break }
+  $laneOpenedProbe = Wait-ForGraphChildren $root $rawWalker `
+    { $_.Current.AutomationId -cin $laneProjectIds -and $_.Current.Name -match '^UIA loop ' } `
+    { param($items) $items.Count -eq 2 }
+  $graph = $laneOpenedProbe.Graph
+  $laneOpenedCards = @($laneProjectIds | ForEach-Object {
+    $id = $_
+    $matches = @($laneOpenedProbe.Items | Where-Object { $_.Current.AutomationId -ceq $id })
+    Require ($matches.Count -eq 1) "opened project requires one exact card for $id"
+    $matches[0]
+  })
+  $remainingSummaries = @(Get-DirectChildren $graph $rawWalker | Where-Object {
+    $_.Current.Name -match $laneSummaryPattern
+  })
+  $laneOpenedGeometry = & $readNormalizedLaneGeometry `
+    @($laneOpenedCards | ForEach-Object { $_.Current.BoundingRectangle })
+  $laneGraphBoundsEqual = $graph.Current.BoundingRectangle.Equals($laneSnapshot.GraphBounds)
+  $laneNormalizedComparison = & $sameNormalizedLaneGeometry $laneOpenedGeometry $laneSnapshotGeometry
+  $laneNormalizedEqual = $laneNormalizedComparison.Equal
+  $laneNonOverlap = -not $laneOpenedCards[0].Current.BoundingRectangle.IntersectsWith(
+    $laneOpenedCards[1].Current.BoundingRectangle)
+  $laneOpenNormalizedEvidence = [ordered]@{
+    names = @($laneOpenedCards | ForEach-Object { [string]$_.Current.Name })
+    automationIds = @($laneOpenedCards | ForEach-Object { [string]$_.Current.AutomationId })
+    summaryCount = $remainingSummaries.Count
+    graphBoundsEqual = $laneGraphBoundsEqual
+    normalizedActual = $laneOpenedGeometry
+    normalizedExpected = $laneSnapshotGeometry
+    normalizedEqual = $laneNormalizedEqual
+    normalizedDeltaXTolerance = $laneNormalizedComparison.DeltaXTolerance
+    normalizedDeltaYTolerance = $laneNormalizedComparison.DeltaYTolerance
+    normalizedActualDeltaXBudget = $laneNormalizedComparison.ActualDeltaXBudget
+    normalizedExpectedDeltaXBudget = $laneNormalizedComparison.ExpectedDeltaXBudget
+    normalizedActualDeltaYBudget = $laneNormalizedComparison.ActualDeltaYBudget
+    normalizedExpectedDeltaYBudget = $laneNormalizedComparison.ExpectedDeltaYBudget
+    normalizedDeltaXError = $laneNormalizedComparison.DeltaXError
+    normalizedDeltaYError = $laneNormalizedComparison.DeltaYError
+    nonOverlap = $laneNonOverlap
   }
+  Write-Host ("UIA_LANE_OPEN_NORMALIZED_EVIDENCE=" +
+    ($laneOpenNormalizedEvidence | ConvertTo-Json -Compress -Depth 4))
   $laneOpenSucceeded = ($laneOpenedCards.Count -eq 2) -and
            ((@($laneOpenedCards | ForEach-Object { $_.Current.Name }) -join "|") -eq "UIA loop A|UIA loop B") -and
            ($laneOpenedCards[0].Current.AutomationId -ceq $laneProjectIds[0]) -and
            ($laneOpenedCards[1].Current.AutomationId -ceq $laneProjectIds[1]) -and
            ($remainingSummaries.Count -eq 0) -and
-           ($graph.Current.BoundingRectangle.Equals($laneSnapshot.GraphBounds)) -and
-           ($laneOpenedCards[0].Current.BoundingRectangle.Equals($laneSnapshot.CardBounds[0])) -and
-           ($laneOpenedCards[1].Current.BoundingRectangle.Equals($laneSnapshot.CardBounds[1])) -and
-           (-not $laneOpenedCards[0].Current.BoundingRectangle.IntersectsWith($laneOpenedCards[1].Current.BoundingRectangle))
+           $laneGraphBoundsEqual -and
+           $laneNormalizedEqual -and
+           $laneNonOverlap
   Require $laneOpenSucceeded "overview lane Open click did not route to the project canvas layout"
   Require (@(Get-DirectChildren $graph $rawWalker | Where-Object {
     $_.Current.AutomationId -cin $laneOverviewIds
   }).Count -eq 0) "project canvas retained the old overview node identities"
   Start-Sleep -Milliseconds 200
   $surfaceActionPatterns["overview-destination"].Invoke()
-  Start-Sleep -Milliseconds 250
-  $graph = Find-FragmentByIdWithRetry $root "graph" $rawWalker
-  Require ($null -ne $graph) "missing graph fragment after returning from the project canvas layout"
+  $restoredLaneProbe = Wait-ForGraphChildren $root $rawWalker `
+    { $_.Current.AutomationId -cin $laneOverviewIds -and $_.Current.Name -match '^UIA loop ' } `
+    { param($items) $items.Count -eq 2 }
+  $graph = $restoredLaneProbe.Graph
   $restoredLane = & $readLaneCaption $graph
-  Require ($restoredLane.CardBounds[0].Equals($laneSnapshot.CardBounds[0]) -and
-    $restoredLane.CardBounds[1].Equals($laneSnapshot.CardBounds[1])) `
-    "overview did not restore its exact shared card geometry and summary"
-  Require ($restoredLane.ActionsRight -lt $restoredLane.GraphBounds.Right) `
+  if ($restoredLane.ActionsRight -gt $restoredLane.GraphBounds.Right - 20 * $restoredLane.Scale) {
+    $delta = [int][Math]::Floor($restoredLane.GraphBounds.Right -
+      20 * $restoredLane.Scale - $restoredLane.ActionsRight)
+    $blankX = [int]$restoredLane.GraphBounds.Right - 24
+    $blankY = [int]$restoredLane.GraphBounds.Bottom - 120
+    $occupied = @(Get-DirectChildren $graph $rawWalker | Where-Object {
+      $_.Current.BoundingRectangle.Contains([double]$blankX, [double]$blankY)
+    })
+    Require ($occupied.Count -eq 0 -and $blankX + $delta -gt $restoredLane.GraphBounds.Left) `
+      "restored lane actions need a pan but no safe blank-canvas gesture fits"
+    $panClientX = 0
+    $panClientY = 0
+    Require ([GraphCodeUiaGateState]::ScreenToClientPoint(
+      $shellWindow, $blankX, $blankY, [ref]$panClientX, [ref]$panClientY
+    )) "could not map the restored lane sheet pan to client coordinates"
+    $null = Ensure-ShellForeground $shellWindow "before-restored-lane-sheet-pan"
+    Require ([GraphCodeUiaGateState]::PostMouseButtonAt($shellWindow, 0x0201, $panClientX, $panClientY)) `
+      "restored lane sheet pan down was rejected"
+    Require ([GraphCodeUiaGateState]::PostMouseMoveAt($shellWindow, $panClientX + $delta, $panClientY)) `
+      "restored lane sheet pan move was rejected"
+    Require ([GraphCodeUiaGateState]::PostMouseButtonAt($shellWindow, 0x0202, $panClientX + $delta, $panClientY)) `
+      "restored lane sheet pan up was rejected"
+    Start-Sleep -Milliseconds 150
+    $restoredLane = & $readLaneCaption $graph
+  }
+  $restoredLaneGeometry = & $readNormalizedLaneGeometry $restoredLane.CardBounds
+  $restoredLaneComparison = & $sameNormalizedLaneGeometry $restoredLaneGeometry $laneSnapshotGeometry
+  $restoredLaneNormalizedEvidence = [ordered]@{
+    automationIds = $laneOverviewIds
+    normalizedActual = $restoredLaneGeometry
+    normalizedExpected = $laneSnapshotGeometry
+    comparison = $restoredLaneComparison
+  }
+  Write-Host ("UIA_RESTORED_LANE_NORMALIZED_EVIDENCE=" +
+    ($restoredLaneNormalizedEvidence | ConvertTo-Json -Compress -Depth 4))
+  Require $restoredLaneComparison.Equal `
+    "overview did not restore its shared normalized card geometry and summary"
+  Require ($restoredLane.OpenX -gt $restoredLane.GraphBounds.Left -and
+    $restoredLane.ActionsRight -lt $restoredLane.GraphBounds.Right -and
+    $restoredLane.Y -gt $restoredLane.GraphBounds.Top -and
+    $restoredLane.Y -lt $restoredLane.GraphBounds.Bottom) `
     "restored overview Worktrees action is outside the viewport"
   $laneWorktreesScreenX = $restoredLane.WorktreesX
   $laneWorktreesScreenY = $restoredLane.Y

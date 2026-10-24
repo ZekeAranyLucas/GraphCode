@@ -63,6 +63,13 @@ function Test-MultiProjectProtocolContracts([string] $stubSource, [string] $gate
     }
     return "Literal narrow/wide and once-only 144-DPI source geometry"
   }
+  Invoke-MultiCase "compact overview fitted rounding retains source geometry" {
+    $geometry = Get-MultiProjectLaneGeometry @(228,85,1036,780) @(390,185,500,227)
+    Assert-MultiCase ($geometry.scale -eq 0.44 -and $geometry.scaleSource -ceq "card-width-rounded" -and
+      [Math]::Abs($geometry.normalizedHeight - 95.45454545454545) -lt $geometry.heightTolerance) `
+      "sub-100% integer-rounded card height did not retain its source geometry"
+    return "Sub-100% UIA height rounding bounded from the longer observed width denominator"
+  }
   Invoke-MultiCase "compact overview rejects obsolete 220x86 card geometry" -Negative {
     $null = Reject-MultiCase { Get-MultiProjectLaneGeometry @(220,34,1200,900) @(262,118,482,204) } "MULTIPROJECT_BOUNDS"
     $null = Reject-MultiCase { Get-MultiProjectLaneGeometry @(358,215,1402,942) @(19,210,268,306) } "MULTIPROJECT_BOUNDS"
@@ -1646,7 +1653,15 @@ function Test-MultiProjectProtocolContracts([string] $stubSource, [string] $gate
     $compactProjection.cards[3].bounds = @(390,363,640,459)
     Assert-MultiCase (Test-MultiProjectObservedRoster "overview" $compactProjection $retainedOwners $null 3140) `
       "compact geometry rejected the same exact two-node/two-summary identities and names"
-    return "Original hosted bounds remain unchanged and are rejected; synthetic current-geometry projection of the same four identities is accepted, not a new native capture"
+    $projection = Copy-MultiProjectValue $retainedProjection
+    $projection.canvasBounds = @(228,85,1036,780)
+    $projection.cards[0].bounds = @(900,307,1129,323)
+    $projection.cards[1].bounds = @(88,330,288,406)
+    $projection.cards[2].bounds = @(900,450,1129,466)
+    $projection.cards[3].bounds = @(88,472,288,548)
+    Assert-MultiCase (Test-MultiProjectObservedRoster "overview" $projection $retainedOwners $null 3140) `
+      "complete admitted 80 percent roster was rejected because rounded card height displaced summary geometry"
+    return "Historical 220x86 bounds rejected; synthetic source geometry and exact admitted 80 percent 200x76 node/229x16 summary roster accepted"
   }
   Invoke-MultiCase "source summary identity independent fixture and hosted goldens" {
     Assert-MultiCase ((Get-MultiProjectAutomationId "overview-worktree-notice" "A") -ceq
@@ -3986,6 +4001,15 @@ Start-Sleep -Seconds 60
       "workspace navigation was not requested", 'Get-MultiProjectLaneGeometry $overview.canvasBounds $row.card.bounds (@($overview.canvasFragmentClasses | Where-Object { $_.classification -ceq "source-summary" -and $_.projectPath -ceq $owner.path })[0].bounds)')) {
     if (-not $uiaLiveGateSource.Contains($required)) { throw "RED: explicit complete overview taxonomy lacks $required" }
   }
+  foreach ($required in @('$pixelWidth = $card[2] - $card[0]', '$pixelHeight = $card[3] - $card[1]',
+      '$scaleSource = if ([Math]::Abs($pixelHeight - 96) -le 1)', '$pixelWidth / 250',
+      '$normalizedHeight = $pixelHeight / $scale', '$heightTolerance = if ($scaleSource -ceq "card-width-rounded" -and $scale -lt 1)',
+      '[Math]::Max(1, $pixelWidth - 1) + 0.01', 'scaleSource = $scaleSource',
+      'normalizedHeight = $normalizedHeight', 'heightTolerance = $heightTolerance')) {
+    if (-not $uiaLiveGateSource.Contains($required)) {
+      throw "RED: multi-project fitted card geometry lacks denominator-derived rounding budget: $required"
+    }
+  }
   $metadataObserverAst = [Management.Automation.Language.Parser]::ParseInput($uiaLiveGateSource,[ref]$null,[ref]$null)
   $metadataObserver = $metadataObserverAst.Find({
     param($node)
@@ -4688,6 +4712,88 @@ Start-Sleep -Seconds 60
       $stubDaemonSource -notmatch 'appliedEdgeUpdateRequests' -or
       $stubDaemonSource -notmatch 'if \(\$renameApplied -or \$createApplied -or \$edgeApplied(?: -or \$promotionApplied)?\)') {
     throw "RED: edge workflow does not use unique connector dragging and locked endpoints while preserving edit/CAS and no-mutation proofs"
+  }
+  $compositeEvidenceIndex = $uiaLiveGateSource.IndexOf(
+    'UIA_COMPOSITE_NAVIGATION_EVIDENCE=', [StringComparison]::Ordinal)
+  $connectorActualIndex = $uiaLiveGateSource.IndexOf(
+    '$connectorActual = Find-FragmentByIdWithRetry $root "actual-size" $rawWalker',
+    [Math]::Max(0, $compositeEvidenceIndex), [StringComparison]::Ordinal)
+  $connectorActualInvokeIndex = $uiaLiveGateSource.IndexOf(
+    '$connectorActual.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()',
+    [Math]::Max(0, $connectorActualIndex), [StringComparison]::Ordinal)
+  $connectorReacquireIndex = $uiaLiveGateSource.IndexOf(
+    '$connectorProbe = Wait-ForGraphChildren $root $rawWalker',
+    [Math]::Max(0, $connectorActualInvokeIndex), [StringComparison]::Ordinal)
+  $connectorSourceIndex = $uiaLiveGateSource.IndexOf(
+    '$connectorSourceCard = @($connectorProjectCards',
+    [Math]::Max(0, $connectorReacquireIndex), [StringComparison]::Ordinal)
+  if ($compositeEvidenceIndex -lt 0 -or
+      $connectorActualIndex -le $compositeEvidenceIndex -or
+      $connectorActualInvokeIndex -le $connectorActualIndex -or
+      $connectorReacquireIndex -le $connectorActualInvokeIndex -or
+      $connectorSourceIndex -le $connectorReacquireIndex -or
+      $uiaLiveGateSource -notmatch '(?s)\$connectorProbe = Wait-ForGraphChildren \$root \$rawWalker.*?UIA loop A.*?UIA loop B.*?\$items\.Count -eq 2' -or
+      $uiaLiveGateSource -notmatch '\$connectorTargetCard = @\(\$connectorProjectCards') {
+    throw "RED: connector evidence does not reset Actual Size and reacquire the exact parent cards after composite navigation"
+  }
+  if ($uiaLiveGateSource -notmatch '\$readNormalizedLaneGeometry\s*=\s*\{' -or
+      $uiaLiveGateSource -notmatch 'lane cards do not normalize to the shared 250x96 geometry' -or
+      $uiaLiveGateSource -notmatch '\$sameNormalizedLaneGeometry\s*=\s*\{' -or
+      $uiaLiveGateSource -notmatch 'Scale = \$scale' -or
+      $uiaLiveGateSource -notmatch 'PixelWidth = \[double\]\$cardBounds\[0\]\.Width' -or
+      $uiaLiveGateSource -notmatch '\$sizeTolerance = 1 / \$scale \+ 0\.01' -or
+      $uiaLiveGateSource -notmatch 'SizeTolerance = \$sizeTolerance' -or
+      $uiaLiveGateSource -notmatch 'Widths = @\(\$normalized \| ForEach-Object' -or
+      $uiaLiveGateSource -notmatch 'Heights = @\(\$normalized \| ForEach-Object' -or
+      $uiaLiveGateSource -notmatch '\[Math\]::Abs\(\$normalized\[0\]\.Width - 250\) -le 0\.01' -or
+      $uiaLiveGateSource -notmatch '\[Math\]::Abs\(\$normalized\[1\]\.Width - 250\) -le \$sizeTolerance' -or
+      $uiaLiveGateSource -notmatch '\[Math\]::Abs\(\$normalized\[0\]\.Height - 96\) -le \$sizeTolerance' -or
+      $uiaLiveGateSource -notmatch '\[Math\]::Abs\(\$normalized\[1\]\.Height - 96\) -le \$sizeTolerance' -or
+      $uiaLiveGateSource -notmatch '\$actualDeltaXBudget = 250 \*' -or
+      $uiaLiveGateSource -notmatch '\$expectedDeltaXBudget = 250 \*' -or
+      $uiaLiveGateSource -notmatch '\$actualDeltaYBudget = 250 \*' -or
+      $uiaLiveGateSource -notmatch '\$expectedDeltaYBudget = 250 \*' -or
+      $uiaLiveGateSource -notmatch '\[Math\]::Max\(1, \$actual\.PixelWidth - 1\)' -or
+      $uiaLiveGateSource -notmatch '\[Math\]::Max\(1, \$expected\.PixelWidth - 1\)' -or
+      $uiaLiveGateSource -notmatch '\$deltaXTolerance = \$actualDeltaXBudget \+ \$expectedDeltaXBudget \+ 0\.01' -or
+      $uiaLiveGateSource -notmatch '\$deltaYTolerance = \$actualDeltaYBudget \+ \$expectedDeltaYBudget \+ 0\.01' -or
+      $uiaLiveGateSource -notmatch 'normalized lane comparison requires positive pixel widths' -or
+      $uiaLiveGateSource -notmatch 'normalized lane comparison requires positive scales' -or
+      $uiaLiveGateSource -notmatch '\$cards = @\(\$laneOverviewIds \| ForEach-Object' -or
+      $uiaLiveGateSource -notmatch '\$laneOpenedProbe = Wait-ForGraphChildren \$root \$rawWalker' -or
+      $uiaLiveGateSource -notmatch '\$_.Current\.AutomationId -cin \$laneProjectIds' -or
+      $uiaLiveGateSource -notmatch '\$laneOpenedCards = @\(\$laneProjectIds \| ForEach-Object' -or
+      $uiaLiveGateSource -notmatch 'opened project requires one exact card for \$id' -or
+      $uiaLiveGateSource -notmatch '\$restoredLaneProbe = Wait-ForGraphChildren \$root \$rawWalker' -or
+      $uiaLiveGateSource -notmatch '\$_.Current\.AutomationId -cin \$laneOverviewIds' -or
+      $uiaLiveGateSource -notmatch 'UIA_LANE_OPEN_NORMALIZED_EVIDENCE=' -or
+      $uiaLiveGateSource -notmatch 'normalizedActual = \$laneOpenedGeometry' -or
+      $uiaLiveGateSource -notmatch 'normalizedExpected = \$laneSnapshotGeometry' -or
+      $uiaLiveGateSource -notmatch 'normalizedEqual = \$laneNormalizedEqual' -or
+      $uiaLiveGateSource -notmatch 'normalizedDeltaXTolerance = \$laneNormalizedComparison\.DeltaXTolerance' -or
+      $uiaLiveGateSource -notmatch 'normalizedDeltaYTolerance = \$laneNormalizedComparison\.DeltaYTolerance' -or
+      $uiaLiveGateSource -notmatch 'normalizedActualDeltaXBudget = \$laneNormalizedComparison\.ActualDeltaXBudget' -or
+      $uiaLiveGateSource -notmatch 'normalizedExpectedDeltaXBudget = \$laneNormalizedComparison\.ExpectedDeltaXBudget' -or
+      $uiaLiveGateSource -notmatch 'normalizedActualDeltaYBudget = \$laneNormalizedComparison\.ActualDeltaYBudget' -or
+      $uiaLiveGateSource -notmatch 'normalizedExpectedDeltaYBudget = \$laneNormalizedComparison\.ExpectedDeltaYBudget' -or
+      $uiaLiveGateSource -notmatch 'ActualDeltaXBudget = \$actualDeltaXBudget' -or
+      $uiaLiveGateSource -notmatch 'ExpectedDeltaXBudget = \$expectedDeltaXBudget' -or
+      $uiaLiveGateSource -notmatch 'ActualDeltaYBudget = \$actualDeltaYBudget' -or
+      $uiaLiveGateSource -notmatch 'ExpectedDeltaYBudget = \$expectedDeltaYBudget' -or
+      $uiaLiveGateSource -notmatch 'normalizedDeltaXError = \$laneNormalizedComparison\.DeltaXError' -or
+      $uiaLiveGateSource -notmatch 'normalizedDeltaYError = \$laneNormalizedComparison\.DeltaYError' -or
+      $uiaLiveGateSource -notmatch 'nonOverlap = \$laneNonOverlap' -or
+      $uiaLiveGateSource -notmatch 'before-restored-lane-sheet-pan' -or
+      $uiaLiveGateSource -notmatch 'restored lane sheet pan down was rejected' -or
+      $uiaLiveGateSource -notmatch 'restored lane sheet pan move was rejected' -or
+      $uiaLiveGateSource -notmatch 'restored lane sheet pan up was rejected' -or
+      $uiaLiveGateSource -notmatch '\$restoredLaneComparison = & \$sameNormalizedLaneGeometry \$restoredLaneGeometry \$laneSnapshotGeometry' -or
+      $uiaLiveGateSource -notmatch 'UIA_RESTORED_LANE_NORMALIZED_EVIDENCE=' -or
+      $uiaLiveGateSource -notmatch 'normalizedActual = \$restoredLaneGeometry' -or
+      $uiaLiveGateSource -notmatch 'normalizedExpected = \$laneSnapshotGeometry' -or
+      $uiaLiveGateSource -notmatch 'Require \$restoredLaneComparison\.Equal' -or
+      $uiaLiveGateSource -match '\.Equals\(\$laneSnapshot\.CardBounds\[') {
+    throw "RED: overview/project navigation evidence depends on absolute fitted card coordinates instead of normalized shared geometry"
   }
   $connectorCardSelectorAst = $edgeTextGateAst.Find({
       param($node)
