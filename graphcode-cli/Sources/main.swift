@@ -47,6 +47,13 @@ if case .help = command {
   exit(0)
 }
 
+// Before the daemon too: the list is read from disk, and the daemon this would dial
+// belongs to just one of the workspaces it lists.
+if case .listWorkspaces = command {
+  print(GraphcodeCommand.render(Workspace.all(), current: .current))
+  exit(0)
+}
+
 // Also before the daemon: reap reads graphs from disk and talks to zmx directly, and
 // the machine that needs it most — out of PTYs, daemon flailing — may not have a
 // daemon to dial.
@@ -588,7 +595,7 @@ do {
       print("stopped watching")
     }
 
-  case .reap:
+  case .reap, .listWorkspaces:
     break  // handled before the daemon dial above
 
   case .usage(let projectPath):

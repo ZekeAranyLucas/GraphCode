@@ -14,6 +14,9 @@ import MailroomKit
 public enum GraphcodeCommand: Equatable, Sendable {
   case help
   case listProjects
+  /// The support directories `GRAPHCODE_SUPPORT_DIR` can point every other verb at, read
+  /// from disk by `Workspace.all()` — no daemon, since each workspace has its own.
+  case listWorkspaces
   case status(projectPath: String)
   /// `into` is the composite whose sub-graph the loop belongs in, when one was named —
   /// the command is the same, addressed at a nested graph instead of this one.
@@ -88,6 +91,8 @@ public enum GraphcodeCommand: Equatable, Sendable {
 
     USAGE
       graphcode projects
+      graphcode workspaces         every workspace on this machine, * marking the current
+                           one; point GRAPHCODE_SUPPORT_DIR at a path to use it
       graphcode status <project-path>
       graphcode node create <project-path> --title <t> --type <main|turn|goal|time|composite> [options]
       graphcode node stop <project-path> <node-id>
@@ -149,8 +154,9 @@ public enum GraphcodeCommand: Equatable, Sendable {
     RECOVERY AND SAFETY
       Use `graphcode projects` to discover project paths and `status` to inspect state
       before retrying a command. `GRAPHCODE_SUPPORT_DIR` selects the workspace for
-      ordinary commands; `reap` is the exception: it reads every discovered workspace
-      on this machine and queries zmx directly, so it also works when graphcoded is down.
+      ordinary commands (`graphcode workspaces` lists them); `reap` is the exception:
+      it reads every discovered workspace on this machine and queries zmx directly, so
+      it also works when graphcoded is down.
       `graphcode reap --dry-run` is read-only and must be run first. Plain `reap` kills
       sessions that have no owner in any persisted graph, quick-chat store, or terminal
       layout; attached sessions are protected. Do not use reap for ordinary cleanup.
@@ -308,6 +314,11 @@ public enum GraphcodeCommand: Equatable, Sendable {
     case "projects":
       try validateFlags(arguments, allowed: [])
       return .listProjects
+
+    case "workspaces":
+      if arguments.contains(where: isHelpFlag) { throw HelpRequested() }
+      try validateFlags(arguments, allowed: [])
+      return .listWorkspaces
 
     case "status":
       let path = try take(&arguments, name: "project-path")
@@ -865,6 +876,11 @@ extension GraphcodeCommand {
   public static func render(_ projects: [ProjectRef]) -> String {
     guard !projects.isEmpty else { return "no projects yet" }
     return projects.map { "\($0.name)  \($0.path)" }.joined(separator: "\n")
+  }
+
+  public static func render(_ workspaces: [Workspace], current: Workspace) -> String {
+    workspaces.map { "\($0.id == current.id ? "*" : " ") \($0.name)  \($0.url.path)" }
+      .joined(separator: "\n")
   }
 
   /// The room for a terminal, from the mailbox the daemon answered
