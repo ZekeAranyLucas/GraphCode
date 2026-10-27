@@ -22,6 +22,7 @@ param(
     [switch]$AdvisoryOlderContractOnly,
     [switch]$DAdapterContractOnly,
     [switch]$MatchedScenarioContractOnly,
+    [switch]$LiveTransitionRehearsalContractOnly,
     [switch]$MatchedDpiContractOnly,
     [string]$Schema3JobPath = '',
     [switch]$SeedPathContractOnly,
@@ -399,6 +400,7 @@ function Assert-CapRejects {
         if ($InvalidJobContract) {
             $manifest | Add-Member -NotePropertyMembers @{
                 leaseId = $context.Binding.leaseId; leaseReceiptSha256 = ('B' * 64)
+                authorityId = $context.Binding.leaseId; authoritySha256 = ('B' * 64)
                 jobManifestSha256 = $context.Binding.jobSha256
                 moduleSha256 = $context.Binding.moduleSha256
                 workerSha256 = $context.Binding.workerSha256
@@ -646,6 +648,7 @@ function Assert-CapRejects {
                 $journalProof = Read-CapJournalFinalProof $fixture.Context.State $fixture.Context.Root $fixture.Record
                 $boundWorkerManifest = $journalProof.Manifest
                 $rehearsal = $true
+                $transitionRehearsal = $false
                 $ExecutionMode = 'NO_DESKTOP_REAL_LAUNCH_REHEARSAL'
                 $ast = [Management.Automation.Language.Parser]::ParseInput(
                     [IO.File]::ReadAllText($supervisorPath), [ref]$null, [ref]$null)
@@ -2975,6 +2978,10 @@ function Invoke-CapMatchedContracts {
             event=$responseGraph.rows[3].frame.event}
         $responseGraph.rows[5].frame.requestID=$responseGraph.rows[5].frame.requestID.ToUpperInvariant()
         $null=Assert-CapRestartEvidence -Evidence $responseGraph -ExpectedDaemonSha256 ('e'*64)
+        $wrappedGraph=New-CapRestartTestEvidence
+        $wrappedGraph.rows[0].frame.event.graphChanged=[pscustomobject]@{_0=$wrappedGraph.rows[0].frame.event.graphChanged}
+        $wrappedGraph.rows[3].frame.event.nodesChanged.nodes[0].state=[pscustomobject]@{idle=[pscustomobject]@{}}
+        $null=Assert-CapRestartEvidence -Evidence $wrappedGraph -ExpectedDaemonSha256 ('E'*64)
         $cases=@('ack-only','wrong-owner','connection','generation','duplicate','unrelated-counter','error','timeout',
             'resume-error','no-resume','old-attach','unowned-attach','no-daemon-session','no-pane','stop','early-resume','counter-type',
             'old-backend','untyped-ownership')
@@ -3003,7 +3010,7 @@ function Invoke-CapMatchedContracts {
             }
             $null=Assert-CapRejects {Assert-CapRestartEvidence -Evidence $e -ExpectedDaemonSha256 ('E'*64)} 'Restart evidence'
         }
-        return @{positive=2;negative=$cases.Count;mutations=$cases;evidence='SIMULATED_TRANSCRIPT_NOT_DAEMON_EXECUTION'}
+        return @{positive=3;negative=$cases.Count;mutations=$cases;evidence='SIMULATED_TRANSCRIPT_NOT_DAEMON_EXECUTION'}
     }
     Invoke-CapTest 'real restart scene invokes existing UIA route and refuses offline peer authority' {
         return @{route=(Invoke-CapMatchedRestartRouteContract);pending=(Invoke-CapMatchedPendingContract)}
@@ -3012,7 +3019,10 @@ function Invoke-CapMatchedContracts {
         Invoke-CapMatchedProxyContract
     }
     Invoke-CapTest 'matched manifest seals scene inventory and refuses premature restart success' {
-        Invoke-CapMatchedManifestContract
+        return @{
+            capture = Invoke-CapMatchedManifestContract
+            liveTransitionRehearsal = Invoke-CapLiveTransitionRehearsalManifestContract
+        }
     }
 }
 
@@ -4142,10 +4152,76 @@ function Invoke-CapMatchedPersistenceContract {
             $recent.Count -eq 1 -and $recent[0].lastOpenedAt -eq $graph.project.lastOpenedAt -and
             $recent[0].path -ceq $graph.project.path -and $recent[0].name -ceq $graph.project.name -and
             $graph.nodes.Count -eq 1 -and $graph.nodes[0].id -ceq '11111111-1111-4111-8111-000000000001' -and
-            $graph.edges.Count -eq 0) 'Actual restart persistence lost required ProjectRef fields or isolated node ownership.'
+            $graph.nodes[0].state -is [pscustomobject] -and
+            $null -ne $graph.nodes[0].state.PSObject.Properties['idle'] -and
+            $graph.edges.Count -eq 0) 'Actual restart persistence is not a real Swift LoopGraph with the isolated Restart node.'
         return @{graphPath=$store.graphPath;recentPath=$store.recentPath;projects=1;nodes=1
             lastOpenedAt=$graph.project.lastOpenedAt;dateEncoding='SWIFT_REFERENCE_SECONDS'
             evidence='ACTUAL_WORKER_PERSISTENCE_FILE_IO_NOT_DAEMON_EXECUTION'}
+    }
+}
+
+function Invoke-CapLiveTransitionRehearsalManifestContract {
+    $workerSource=[IO.File]::ReadAllText($workerPath)
+    $supervisorSource=[IO.File]::ReadAllText($supervisorPath)
+    foreach ($source in @($workerSource,$supervisorSource)) {
+        Assert-CapTest ($source.Contains('LIVE_TRANSITION_REHEARSAL')) 'Live transition rehearsal execution mode is missing.'
+        Assert-CapTest ($source.Contains('LIVE_TRANSITION_REHEARSAL_NOT_CAPTURE_EVIDENCE')) 'Live transition evidence refusal classification is missing.'
+    }
+    Assert-CapTest ($workerSource.Contains('Save-CapTransitionCheckpoint')) 'Worker has no typed transition checkpoint writer.'
+    Assert-CapTest ($workerSource.Contains('Assert-CapNoPngArtifacts')) 'Worker does not refuse PNG creation or retention.'
+    Assert-CapTest ($workerSource.Contains('function ConvertTo-CapWorkerImagePath') -and
+        -not $workerSource.Contains('ConvertTo-CapImagePath (')) 'Restart path normalization still depends on a module-private helper.'
+    Assert-CapTest ($workerSource.Contains('$sameConnectionRows=@($rows | Where-Object connection -EQ $restartConnection)') -and
+        $supervisorSource.Contains('$connectionRows=@($rows | Where-Object connection -EQ $restart.evidence.connection)')) `
+        'Restart evidence does not isolate and rebind the exact Restart connection.'
+    $moduleSource=[IO.File]::ReadAllText($modulePath)
+    Assert-CapTest ($moduleSource.Contains('function Get-CapJobMemberProcess') -and
+        $moduleSource.Contains('after bounded recheck') -and
+        $moduleSource.Contains('for ($attempt=0;$attempt -lt 8;$attempt++)')) `
+        'Job census does not bound the listed-but-unavailable member race.'
+    Assert-CapTest ($moduleSource.Contains('($process.parentPid -le 0 -and -not $fileOutput)')) `
+        'Final journal still treats contained-job members as dependent on advisory parent metadata.'
+    Assert-CapTest ($workerSource.Contains('checkpointCount') -and
+        $workerSource.Contains('captures = if ($transitionRehearsal) { 0L }')) 'Worker manifest does not seal checkpoint and zero-capture counts.'
+    Assert-CapTest ($workerSource.Contains('$progressManifest=if ($transitionRehearsal)') -and
+        $workerSource.Contains('phaseTransitionCount=[long]$phaseTransitions.Count') -and
+        $workerSource.Contains('$transitionRehearsal -and $images.Count -eq 0 -and $checkpoints.Count -eq 36')) `
+        'Transition journal progress or final completion still depends on the full image manifest.'
+    Assert-CapTest ($supervisorSource.Contains('RehearsalAuthorizationPath') -and
+        $supervisorSource.Contains('RehearsalAuthorizationSha256')) 'Supervisor still requires a capture lease for live transition rehearsal.'
+    Assert-CapTest ($supervisorSource.Contains('Assert-CapDataRecord $checkpoint.reference @{name=[string];length=[long];sha256=[string]}') -and
+        $supervisorSource.Contains("Join-Path (Join-Path `$outputDirectory 'checkpoints') `$checkpoint.reference.name")) `
+        'Supervisor does not bind immutable checkpoint names, lengths, and hashes to the authorized directory.'
+    Assert-CapTest ($supervisorSource.Contains('function Invoke-CapTransitionGit') -and
+        -not $supervisorSource.Contains('Invoke-CapAdmissionGit $repository')) 'Live transition admission depends on a module-private Git helper.'
+    $job=New-CapMatchedDpiTestJob
+    $manifest=[pscustomobject]@{
+        sceneAdapter=$job.sceneAdapter;lane='S';status='COMPLETE'
+        executionMode='LIVE_TRANSITION_REHEARSAL'
+        evidenceClassification='LIVE_TRANSITION_REHEARSAL_NOT_CAPTURE_EVIDENCE'
+        images=@();realRestarts=@();g11Qualification='ASSESSABLE_SOURCE_CAPABILITY_NOT_RUNTIME_VALIDATED'
+        backendTurns=0
+    }
+    $reportRefusal=Assert-CapRejects {Assert-CapMatchedManifest -Manifest $manifest -Job $job} 'Matched manifest'
+    return @{
+        classification='LIVE_TRANSITION_REHEARSAL_NOT_CAPTURE_EVIDENCE'
+        checkpoints=36
+        seeds=22
+        restarts=2
+        captures=0
+        captureReportRefusal=$reportRefusal
+        evidence='SOURCE_CONTRACT_ONLY_NO_DESKTOP'
+    }
+}
+
+function Invoke-CapLiveTransitionRehearsalContracts {
+    Invoke-CapTest 'matched v12 fixture binds exact node type wiring reason and outcome fields' {
+        $fixture=Get-Content (Join-Path $driverDirectory 'fixtures\matched-v12.json') -Raw | ConvertFrom-Json -DateKind String
+        return @{persistence=(Invoke-CapMatchedPersistenceContract);nodes=$fixture.graphs[0].nodes.Count}
+    }
+    Invoke-CapTest 'matched manifest seals scene inventory and refuses premature restart success' {
+        Invoke-CapLiveTransitionRehearsalManifestContract
     }
 }
 
@@ -4659,7 +4735,18 @@ function Invoke-CapReceiptReadControl {
         if ($null -ne $PublishValue) {
             $temporary = "$Path.publish"
             [IO.File]::WriteAllText($temporary, (ConvertTo-Json $PublishValue -Compress), [Text.UTF8Encoding]::new($false))
-            [IO.File]::Move($temporary, $Path, $true)
+            $publishDeadline=[DateTime]::UtcNow.AddSeconds(2)
+            while ($true) {
+                try {[IO.File]::Move($temporary,$Path,$true);break}
+                catch [UnauthorizedAccessException] {
+                    if ([DateTime]::UtcNow -ge $publishDeadline) {throw}
+                    Start-Sleep -Milliseconds 25
+                }
+                catch [IO.IOException] {
+                    if ([DateTime]::UtcNow -ge $publishDeadline) {throw}
+                    Start-Sleep -Milliseconds 25
+                }
+            }
         }
         if (-not $pending.AsyncWaitHandle.WaitOne(5000)) {
             throw 'RECEIPT_HARNESS_MECHANICAL: production reader exceeded its bounded deadline.'
@@ -6870,6 +6957,19 @@ if ($MatchedScenarioContractOnly) {
     exit 0
 }
 
+if ($LiveTransitionRehearsalContractOnly) {
+    Invoke-CapLiveTransitionRehearsalContracts
+    $passed=@($results | Where-Object passed -EQ $true).Count
+    $failed=@($results | Where-Object passed -EQ $false).Count
+    $report=[pscustomobject][ordered]@{suite='UiCaptureLiveTransitionRehearsal';executed=$results.Count
+        passed=$passed;failed=$failed;skipped=0;gui='NotExecuted';images=0;cases=@($results)
+    }
+    $report | ConvertTo-Json -Depth 25 | Set-Content -LiteralPath (Join-Path $scratch 'live-transition-rehearsal-report.json') -Encoding utf8NoBOM
+    $report | Select-Object suite,executed,passed,failed | ConvertTo-Json -Compress
+    if ($results.Count -ne 2 -or $passed -ne 2 -or $failed -ne 0) {exit 1}
+    exit 0
+}
+
 if ($MatchedDpiContractOnly) {
     Invoke-CapMatchedDpiContracts
     $passed=@($results | Where-Object passed -EQ $true).Count
@@ -7606,7 +7706,8 @@ try {
             . ([scriptblock]::Create($function.Extent.Text))
             $preflight = [ordered]@{
                 suite = 'UiCaptureDriver'; executed = $results.Count; passed = $results.Count; failed = 0
-                mode = $mode; gui = 'NotExecuted'; images = 0; backendTurns = 0; fixture = $target
+                mode = $mode; gui = 'NotExecuted'; images = 0; backendTurns = 0
+                fixture = [pscustomobject]@{ compilerExitCode = 0L }
                 controls = [pscustomobject]@{ moduleSha256 = $sourceHashesBefore[$modulePath]
                     workerSha256 = $sourceHashesBefore[$workerPath]; supervisorSha256 = $sourceHashesBefore[$supervisorPath] }
                 cases = @($results)

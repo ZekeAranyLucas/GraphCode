@@ -780,6 +780,19 @@ function Wait-CapJobTarget {
     return $record
 }
 
+function Get-CapJobMemberProcess {
+    param($Run,[int]$MemberPid)
+    for ($attempt=0;$attempt -lt 8;$attempt++) {
+        try { return [Diagnostics.Process]::GetProcessById($MemberPid) }
+        catch [ArgumentException] {
+            if ($MemberPid -notin [CapProcessJob]::Members($Run.Job)) {return $null}
+            if ($attempt -eq 7) {throw 'Job member identity unavailable while still listed after bounded recheck.'}
+            Start-Sleep -Milliseconds 25
+        }
+    }
+    throw 'Unreachable job-member process retry state.'
+}
+
 function Get-CapJobMembers {
     [CmdletBinding()]
     param($Run)
@@ -787,11 +800,8 @@ function Get-CapJobMembers {
     foreach ($memberPid in [CapProcessJob]::Members($Run.Job)) {
         if ($memberPid -eq $Run.Identity.Pid) { continue }
         $process = $null
-        try { $process = [Diagnostics.Process]::GetProcessById($memberPid) }
-        catch [ArgumentException] {
-            if ($memberPid -in [CapProcessJob]::Members($Run.Job)) { throw 'Job member identity unavailable while still listed.' }
-            continue
-        }
+        $process = Get-CapJobMemberProcess -Run $Run -MemberPid $memberPid
+        if ($null -eq $process) {continue}
         $retained = $false
         try {
             $access = Read-CapProcessAccess -Process $process -Role 'job-member' `
@@ -3764,6 +3774,7 @@ function Assert-CapRestartEvidence {
         $after.backendCreationFileTimeUtc -isnot [long] -or
         $after.backendCreationFileTimeUtc -le $after.oldBackendCreationFileTimeUtc) {& $fail 'offline backend generation was not replaced'}
     $restart=$null;$restartResponse=$null;$advance=$null;$resume=$null;$resumeResponse=$null;$baseline=$false
+    $counterAfter=$null
     $ordinal=0L;$elapsed=0L
     foreach ($row in $Evidence.rows) {
         if ($row.ordinal -isnot [long] -or $row.ordinal -le $ordinal -or $row.elapsedMs -isnot [long] -or
@@ -3807,8 +3818,15 @@ function Assert-CapRestartEvidence {
         if ($row.direction -cne 'daemon' -or -not $frame.PSObject.Properties['event']) {continue}
         if ($frame.event.PSObject.Properties['errorOccurred']) {& $fail 'daemon error is not confirmation'}
         $graph=$null;$path=$null
-        if ($frame.event.PSObject.Properties['graphChanged']) {$graph=$frame.event.graphChanged;$path=$graph.project.path}
-        elseif ($frame.event.PSObject.Properties['nodesChanged']) {$graph=$frame.event.nodesChanged;$path=$graph.projectPath}
+        if ($frame.event.PSObject.Properties['graphChanged']) {
+            $graph=$frame.event.graphChanged
+            if ($graph.PSObject.Properties['_0']) {$graph=$graph._0}
+            $path=$graph.project.path
+        } elseif ($frame.event.PSObject.Properties['nodesChanged']) {
+            $graph=$frame.event.nodesChanged
+            if ($graph.PSObject.Properties['_0']) {$graph=$graph._0}
+            $path=$graph.projectPath
+        }
         if ($null -eq $graph -or $path -cne $Evidence.projectPath) {continue}
         $nodes=@($graph.nodes | Where-Object id -CEQ $Evidence.nodeId)
         if ($nodes.Count -gt 1) {& $fail 'ambiguous owner'}
@@ -3817,9 +3835,15 @@ function Assert-CapRestartEvidence {
         if ($counter -isnot [long] -or $counter -lt 0) {& $fail 'malformed owner counter'}
         if (-not $restart -and $counter -eq $Evidence.counter) {$baseline=$true}
         if ($restart -and $counter -gt $Evidence.counter) {
+            $state=$nodes[0].state
+            $stateProperties=@()
+            if ($state -is [pscustomobject]) {$stateProperties=@($state.PSObject.Properties)}
+            $stateName=if ($state -is [string]) {$state} elseif ($stateProperties.Count -eq 1) {
+                [string]$stateProperties[0].Name
+            } else {$null}
             if ($row.elapsedMs-$restart.elapsedMs -gt 30000 -or
-                $nodes[0].state -cnotin @('idle','running','awaitingInput','blocked','waiting')) {& $fail 'counter confirmation timed out or loop is not unresolved'}
-            if (-not $advance) {$advance=$row}
+                $stateName -cnotin @('idle','running','awaitingInput','blocked','waiting')) {& $fail 'counter confirmation timed out or loop is not unresolved'}
+            if (-not $advance) {$advance=$row;$counterAfter=[long]$counter}
         }
     }
     if (-not $restart -or -not $restartResponse -or -not $advance -or -not $resume -or -not $resumeResponse -or
@@ -3827,9 +3851,7 @@ function Assert-CapRestartEvidence {
         & $fail 'complete correlated restart, counter advance, checked resume and subsequent attach required'
     }
     return [pscustomobject]@{restartRequestId=$restart.frame.requestID;resumeRequestId=$resume.frame.requestID
-        connection=$Evidence.connection;counterBefore=$Evidence.counter;counterAfter=($advance.frame.event.PSObject.Properties |
-            Where-Object {$_.Name -cin @('graphChanged','nodesChanged')} | ForEach-Object {$_.Value.nodes |
-                Where-Object id -CEQ $Evidence.nodeId | ForEach-Object sessionRestarts})
+        connection=$Evidence.connection;counterBefore=$Evidence.counter;counterAfter=$counterAfter
         status='CONFIRMED_DAEMON_ROUNDTRIP_AND_OWNED_REATTACH';backend='OFFLINE_FIXTURE_NOT_AUTHENTICATED_AGENT'}
 }
 
@@ -5499,7 +5521,8 @@ function Read-CapJournalFinalProof {
                 ($fileOutput -and ($process.stdoutEof -or $process.stderrEof))) {
                 throw (New-CapJournalFailure 'JournalCleanupUnproven' 'Kernel exit or owning-stream EOF is unproved.')
             }
-            if ($process.pid -le 0 -or $process.creationFileTimeUtc -le 0 -or $process.parentPid -le 0 -or
+            if ($process.pid -le 0 -or $process.creationFileTimeUtc -le 0 -or
+                ($process.parentPid -le 0 -and -not $fileOutput) -or
                 $process.sessionId -lt 0 -or $process.streamOwnerPid -le 0 -or
                 $process.streamOwnerCreationFileTimeUtc -le 0 -or -not [IO.Path]::IsPathFullyQualified($process.expectedImagePath)) {
                 throw (New-CapJournalFailure 'JournalIdentity' 'Invalid cleanup generation identity.')
